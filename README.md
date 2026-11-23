@@ -56,3 +56,6 @@ make dist
 `make build`는 포함된 웹 번들을 사용합니다. `make dist`는 Node.js/npm으로 웹을 다시 빌드한 뒤 설치 묶음을 만듭니다. 시험 범위는 [개발 시험](docs/development/testing.md)에 있습니다. 가짜 도구 시험과 실제 커널·펌웨어 검증은 구분합니다.
 
 전체 문서는 [목차](docs/README.md)에 있고, 구현 위치는 [코드 지도](docs/development/code-map.md)에서 찾을 수 있습니다.
+
+# 라이센스
+라이센스는 요즘 AI의 무분별한 사용과 상업적 사용을 막기위해 `PolyForm Noncommercial License`을 채택을 합니다. 비상업적이나 개인의 사용은 허용됨니다.
