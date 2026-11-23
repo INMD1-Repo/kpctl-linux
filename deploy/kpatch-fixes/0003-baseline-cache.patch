@@ -1,0 +1,24 @@
+--- a/kpatch-build/kpatch-build
++++ b/kpatch-build/kpatch-build
+@@ -898,7 +898,7 @@
+ 	shift
+ done
+ 
+-if [[ ${#PATCH_LIST[@]} -eq 0 ]]; then
++if [[ ${#PATCH_LIST[@]} -eq 0 && "${KPCTL_BASELINE_ONLY:-0}" != 1 ]]; then
+ 	warn "no patch file(s) specified"
+ 	usage
+ 	exit 1
+@@ -1353,6 +1353,12 @@
+ # $TARGETS used as list, no quotes.
+ # shellcheck disable=SC2086
+ make "${ARCH_MAKEVARS[@]}" "${MAKEVARS[@]}" "-j$CPUS" $TARGETS 2>&1 | logger || die
++
++# Baseline cache warmup never applies a security patch or emits a module.
++if [[ "${KPCTL_BASELINE_ONLY:-0}" = 1 ]]; then
++	echo "kpctl baseline build complete"
++	exit 0
++fi
+ 
+ # Save original module symvers
+ cp -f "$BUILDDIR/Module.symvers" "$TEMPDIR/Module.symvers" || die

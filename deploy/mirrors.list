@@ -1,0 +1,18 @@
+# kpctl Ubuntu 패키지 미러 목록 — 설치 스크립트, 커널 준비 도우미, 설치 전 점검이 모두 이 파일을 씁니다.
+#
+# 위에서부터 차례로 시도하고, 처음으로 색인을 받는 미러를 씁니다. 공식 저장소를 맨 위에 두세요.
+# 모든 미러의 패키지는 Ubuntu 서명 키(ubuntu-archive-keyring.gpg)로 검증하므로 미러를 더해도 신뢰 기준은 같습니다.
+# Launchpad에 등록된 공식 미러만 넣으세요: https://launchpad.net/ubuntu/+archivemirrors
+#
+# 형식: 이름  아키텍처(amd64|arm64)  저장소-주소  [보안-주소(없으면 저장소-주소)]
+# 바꾼 뒤: make dist → 컨트롤러 묶음 갱신 → kpctl install 로 호스트에 다시 배포
+# (운영 중인 컨트롤러에서는 /usr/local/share/kpctl/agent/mirrors.list 를 고쳐도 됩니다)
+
+official  amd64  http://archive.ubuntu.com/ubuntu       http://security.ubuntu.com/ubuntu
+official  arm64  http://ports.ubuntu.com/ubuntu-ports
+
+# 한국 공식 미러 (2026-11-18 확인: Launchpad "Up to date")
+kaist     amd64  http://ftp.kaist.ac.kr/ubuntu
+kaist     arm64  http://ftp.kaist.ac.kr/ubuntu-ports
+kakao     amd64  http://mirror.kakao.com/ubuntu
+# 카카오는 ubuntu-ports(arm64)를 제공하지 않습니다

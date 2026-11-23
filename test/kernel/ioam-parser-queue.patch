@@ -1,0 +1,16 @@
+--- a/ioam6_parser.c
++++ b/ioam6_parser.c
+@@ -239,8 +239,12 @@
+ 		*p += sizeof(__u32);
+ 	}
+ 
+-	if (ioam6h->type.bit6)
++	if (ioam6h->type.bit6) {
++		if (getenv("KPCTL_QUEUE_GUARD") && cnf.id == 2 &&
++		    __be32_to_cpu(*((__u32 *)*p)) != 0xffffffff)
++			return 1;
+ 		*p += sizeof(__u32);
++	}
+ 
+ 	if (ioam6h->type.bit7) {
+ 		if (__be32_to_cpu(*((__u32 *)*p)) != 0xffffffff)

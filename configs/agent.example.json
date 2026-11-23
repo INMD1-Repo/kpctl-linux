@@ -1,0 +1,7 @@
+{
+  "controller_url": "https://kpatch.internal:8443",
+  "enroll_token": "컨트롤러의-enroll_tokens-중-하나",
+  "ca_file": "/etc/kpctl/tls/ca.crt",
+  "interval_seconds": 60,
+  "reboot_hook": "/etc/kpctl/reboot-hook.sh"
+}

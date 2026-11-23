@@ -1,0 +1,14 @@
+[Unit]
+Description=kpctl client auto-enrollment (DHCP leases + /etc/kpctl/autoenroll-hosts)
+After=network-online.target kpctl-controller.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 클라이언트 키(컨트롤러 SSH 키·빌드 서버 전용이 아닌 저장 키)로 로그인되는 호스트에만 질문 없이 설치합니다
+# (키가 없으면 '키 대기' 로 건너뜀). 대상: DHCP 임대 + /etc/kpctl/autoenroll-hosts.
+# SSH 키를 호스트에 등록한 키와 다르게 쓰려면 drop-in 으로 Environment=KPCTL_SSH_KEY=... 를 넣으세요.
+ExecStart=/usr/local/bin/kpctl autoenroll -log-dir /var/log/kpctl-autoenroll
+LogsDirectory=kpctl-autoenroll
+LogsDirectoryMode=0700
+TimeoutStartSec=1h

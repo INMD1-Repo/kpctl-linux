@@ -1,0 +1,18 @@
+[Unit]
+Description=kpctl live patch controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=kpctl
+Group=kpctl
+ExecStart=/usr/local/bin/kpctl-controller -config /etc/kpctl/controller.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kpctl
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

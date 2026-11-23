@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+[ "$#" = 1 ] && [ "$1" = indextargets ] || exit 64
+cat <<EOF
+Origin: Ubuntu
+Label: Ubuntu
+Trusted: yes
+Codename: ${KPCTL_TEST_APT_SERIES:?}
+Suite: ${KPCTL_TEST_APT_SERIES}-updates
+Architecture: $(dpkg --print-architecture)
+Component: main
+Identifier: Packages
+Filename: ${KPCTL_TEST_APT_PACKAGES:?}
+
+EOF

@@ -1,0 +1,25 @@
+[Unit]
+Description=kpctl live patch builder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# kpatch-build 는 root 가 아닌 일반 사용자로 돌립니다 (캐시는 ~kpbuild/.kpatch)
+User=kpbuild
+Group=kpbuild
+# 자동 업데이트: 빌드 서버가 컨트롤러에서 받은 새 실행 파일을 여기에 두고 종료(75)하면,
+# 다시 시작할 때 ExecStartPre 가 root(+)로 /usr/local/bin 에 설치합니다. 받은 파일을 root 로 실행하지는 않습니다.
+# kpbuild 소유의 일반 파일일 때만 설치합니다 (심볼릭·하드 링크로 다른 파일을 복사시키지 못하도록).
+Environment=KPCTL_BUILDER_UPDATE_PATH=/var/lib/kpctl-builder/update/kpctl-builder
+ExecStartPre=+/bin/sh -c 'u=/var/lib/kpctl-builder/update/kpctl-builder; [ -e "$$u" ] || exit 0; if [ -f "$$u" ] && [ ! -L "$$u" ] && [ "$$(stat -c %%U:%%h "$$u")" = kpbuild:1 ]; then install -m 0755 -o root -g root "$$u" /usr/local/bin/kpctl-builder && echo "kpctl-builder 업데이트 설치"; else echo "업데이트 파일이 이상해 설치하지 않음: $$u"; fi; rm -f "$$u"'
+ExecStart=/usr/local/bin/kpctl-builder -config /etc/kpctl/builder.json
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=200min
+Delegate=yes
+MemoryMax=12G
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

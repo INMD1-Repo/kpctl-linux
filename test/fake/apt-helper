@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+[ "$#" = 2 ] && [ "$1" = cat-file ] || exit 64
+exec cat "$2"

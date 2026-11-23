@@ -1,0 +1,42 @@
+{
+  "test_vm": {
+    "enabled": false,
+    "modes": "auto",
+    "memory": 4096,
+    "cpus": 2,
+    "max_concurrent": 2,
+    "cmd_timeout": "3m",
+    "boot_timeout": "3m",
+    "test_timeout": "5m",
+    "allow_tcg": false,
+    "listen_addr": "127.0.0.1",
+    "port_range": "2200-2299",
+    "seed_iso": false,
+    "ssh_user": "ubuntu",
+    "ssh_key": "/etc/kpctl/testvm/id_ed25519",
+    "ssh_public_key": "/etc/kpctl/testvm/id_ed25519.pub",
+    "create_cmd": [
+      "/opt/kpctl/testvm/qemu/create.sh",
+      "{{.Name}}",
+      "{{.Disk}}",
+      "{{.Vars}}",
+      "{{.Firmware}}",
+      "{{.Memory}}",
+      "{{.CPUs}}"
+    ],
+    "delete_cmd": [
+      "/opt/kpctl/testvm/qemu/delete.sh",
+      "{{.ID}}"
+    ],
+    "console_log_cmd": [
+      "/opt/kpctl/testvm/qemu/console.sh",
+      "{{.ID}}"
+    ],
+    "list_cmd": [
+      "/opt/kpctl/testvm/qemu/list.sh"
+    ],
+    "images": {},
+    "negative_sig_test": true,
+    "smoke_cmd": []
+  }
+}

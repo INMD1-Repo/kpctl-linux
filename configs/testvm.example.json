@@ -1,0 +1,27 @@
+{
+  "test_vm": {
+    "enabled": false,
+    "modes": "auto",
+    "max_concurrent": 2,
+    "boot_timeout": "3m",
+    "test_timeout": "5m",
+    "ssh_user": "ubuntu",
+    "ssh_key": "/etc/kpctl/testvm/id_ed25519",
+    "fixed": {
+      "6.8.0-85-generic": {
+        "sb_on": {
+          "host": "192.0.2.31"
+        },
+        "sb_off": {
+          "host": "192.0.2.32"
+        },
+        "bios": {
+          "host": "192.0.2.33",
+          "port": 22
+        }
+      }
+    },
+    "negative_sig_test": true,
+    "smoke_cmd": []
+  }
+}

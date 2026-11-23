@@ -1,0 +1,10 @@
+--- a/kpatch-build/kpatch-build
++++ b/kpatch-build/kpatch-build
+@@ -1156,6 +1156,7 @@
+ 		# for some reason the Ubuntu kernel versions don't follow the
+ 		# upstream SUBLEVEL; they are always at SUBLEVEL 0
+ 		sed -i "s/^SUBLEVEL.*/${sublevel}/" "$KERNEL_SRCDIR/Makefile" || die
++		find "$KERNEL_SRCDIR/scripts" -type f ! -perm -u+x -exec grep -lZ -m1 "^#!" {} + | xargs -0 -r chmod +x # kpctl-exec-fix
+ 		echo "$ARCHVERSION" > "$VERSIONFILE" || die
+ 	else
+ 		die "Unsupported distribution"

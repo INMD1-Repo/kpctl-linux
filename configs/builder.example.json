@@ -1,0 +1,45 @@
+{
+  "controller_url": "https://kpatch.internal:8443",
+  "token": "컨트롤러의-builder_token-과-같은-값",
+  "ca_file": "/etc/kpctl/tls/ca.crt",
+
+  "work_dir": "/var/lib/kpctl-builder",
+  "kpatch_build": "/usr/local/bin/kpatch-build",
+  "build_tool": "auto",
+  "jobs": 16,
+
+  "poll_seconds": 30,
+  "discover_minutes": 60,
+  "update_check_minutes": 5,
+  "self_update": true,
+  "auto_debug_symbols": true,
+  "controller_kernel_inputs": true,
+  "max_kernels": 2,
+  "max_trials_per_run": 10,
+  "build_timeout_minutes": 180,
+
+  "sandbox": {
+    "profiles_dir": "/var/lib/kpctl-builder/environments/noble",
+    "retry_clean": true,
+    "auto_prepare": true,
+    "retention_days": 14,
+    "prepare": {
+      "memory_mib": 12288,
+      "pids": 4096,
+      "min_free_gib": 60,
+      "cache_gib": 20,
+      "cache_total_gib": 40,
+      "snapshot": "auto"
+    }
+  },
+
+  "series": "",
+  "git_root": "/srv",
+  "debug_dir": "/usr/lib/debug/boot",
+  "paths": [],
+  "kernels": [],
+  "cve_feed": {
+    "enabled": false,
+    "url": "https://git.kernel.org/pub/scm/linux/security/vulns.git"
+  }
+}

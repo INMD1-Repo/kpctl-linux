@@ -1,0 +1,35 @@
+{
+  "listen": ":8443",
+  "tls_cert": "/etc/kpctl/tls/server.crt",
+  "tls_key": "/etc/kpctl/tls/server.key",
+  "data_dir": "/var/lib/kpctl",
+
+  "admin_tokens": {
+    "admin": "여기에-openssl-rand-hex-32-결과",
+    "ops2": "여기에-다른-토큰"
+  },
+  "builder_token": "여기에-빌드서버-토큰",
+  "enroll_tokens": [
+    { "name": "canary", "token": "카나리-호스트-등록-토큰", "ring": 1, "reboot_policy": "drain" },
+    { "name": "server", "token": "일반-호스트-등록-토큰", "ring": 2, "reboot_policy": "drain" }
+  ],
+
+  "rings": [1, 2],
+  "min_soak_minutes": { "2": 1440 },
+  "auto_rollout": { "enabled": false, "approve_only": false, "soak_minutes": 1440, "check_seconds": 60 },
+  "auto_prepare_kernel": false,
+  "auto_jump_kernel_hosts": [],
+
+  "job_timeout_minutes": 180,
+  "host_stale_minutes": 10,
+
+  "test_vm": { "enabled": false },
+
+  "sign_command": [
+    "/usr/src/linux-headers-6.8.0-85-generic/scripts/sign-file",
+    "sha256", "/etc/kpctl/keys/mok.priv", "/etc/kpctl/keys/mok.der", "{module}"
+  ],
+
+  "scheduler": {},
+  "drain_check_seconds": 300
+}

@@ -1,0 +1,28 @@
+# 호스트의 관리망 NIC 설정 예시
+#   /etc/netplan/60-kpctl-mgmt.yaml 로 저장 → chmod 600 → netplan try (확인 후 Enter)
+#
+# 관리망 NIC 만 컨트롤러 DHCP 로 IP 를 받습니다. 아래 설정으로 서비스망은 건드리지 않습니다.
+#   - 기본 경로를 받지 않음        → 인터넷/서비스 트래픽 경로가 바뀌지 않음
+#   - 관리망 도메인 질의만 컨트롤러 DNS 로 (use-domains: route)
+#                                  → 다른 이름은 지금 쓰는 DNS 그대로
+#   - optional                     → 관리망이 끊겨도 부팅이 멈추지 않음
+#
+# 컨트롤러가 멈춰도 서비스망·VM 은 영향이 없습니다.
+# 컨트롤러에서 kpctl dhcp reserve 로 IP 를 고정하면 관리망 IP 도 계속 유지됩니다.
+network:
+  version: 2
+  ethernets:
+    mgmt0:
+      match:
+        macaddress: "aa:bb:cc:dd:ee:ff"   # ← 관리망 NIC 의 MAC 으로 바꾸세요
+      set-name: mgmt0
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false     # 기본 경로·경로 정보 무시 (컨트롤러도 보내지 않지만 이중 안전장치)
+        use-dns: true
+        use-domains: route    # 관리망 도메인만 컨트롤러 DNS 로 보냄 (systemd-resolved 라우팅 도메인)
+        use-ntp: false
+        send-hostname: true   # 호스트 이름을 알려서 <이름>.<관리망 도메인> 으로 DNS 등록
+      dhcp6: false
+      link-local: []
+      optional: true

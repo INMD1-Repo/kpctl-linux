@@ -1,0 +1,31 @@
+#!/bin/bash
+# 가짜 kpatch (테스트용). FAKE_ROOT 아래에 /sys/kernel/livepatch, /sys/module 을 흉내 낸다.
+R="${FAKE_ROOT:?FAKE_ROOT 필요}"
+LP="$R/sys/livepatch" MOD="$R/sys/module" INST="$R/installed/$(cat "$R/proc/osrelease")"
+mkdir -p "$LP" "$MOD" "$INST"
+cmd="$1" arg="$2"
+case "$cmd" in
+  install)
+    [ ! -e "$INST/$(basename "$arg")" ] || { echo "$arg is already installed"; exit 1; }
+    cp "$arg" "$INST/" ;;
+  load)
+    if [ -f "$R/fail-load" ]; then echo "load failed (fake)"; exit 1; fi
+    name=$(basename "$arg" .ko)
+    # atomic replace 는 공급자와 무관하게 기존 패치 전체를 교체합니다 (모듈 자체는 남음).
+    for d in "$LP"/*; do
+      [ -e "$d" ] && [ "$(basename "$d")" != "$name" ] && rm -rf "$d"
+    done
+    mkdir -p "$LP/$name" "$MOD/$name"
+    echo 1 > "$LP/$name/enabled"
+    echo 0 > "$LP/$name/transition" ;;
+  unload)
+    if [ -f "$R/fail-unload" ]; then echo "unload failed (fake)"; exit 1; fi
+    [ -d "$MOD/$arg" ] || { echo "module $arg not loaded"; exit 1; }
+    rm -rf "$LP/$arg" "$MOD/$arg" ;;
+  uninstall)
+    if [ -f "$R/fail-uninstall" ]; then echo "uninstall failed (fake)"; exit 1; fi
+    [ -f "$INST/$arg.ko" ] || { echo "$arg is not installed"; exit 1; }
+    rm -f "$INST/$arg.ko" ;;
+  *)
+    echo "unknown command $cmd"; exit 1 ;;
+esac

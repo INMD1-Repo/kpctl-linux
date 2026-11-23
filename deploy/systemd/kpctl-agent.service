@@ -1,0 +1,13 @@
+[Unit]
+Description=kpctl live patch agent
+After=network-online.target kpatch.service
+Wants=network-online.target
+
+[Service]
+# 커널 모듈을 올리고 재부팅 훅을 실행하므로 root 로 실행합니다
+ExecStart=/usr/local/bin/kpctl-agent -config /etc/kpctl/agent.json
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

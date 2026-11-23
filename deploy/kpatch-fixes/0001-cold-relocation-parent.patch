@@ -1,0 +1,102 @@
+From: kpctl maintainers
+Subject: [PATCH] kpatch: compare UBSAN descriptors and include cold parents
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+Compiler-generated UBSAN numbers are unstable. Compare descriptor bytes,
+source strings and bounded type graphs before treating code references as
+equal. Unknown pointers, changed locations/types and cycles fail closed.
+Do not correlate descriptor sections: changed functions retain fresh data.
+
+For genuine relocation-only cold changes, include the profiled parent as
+the existing code-change rule intends. Normal fentry and patchability
+checks remain mandatory. No sanitizer, ABI or instruction check is skipped.
+
+diff --git a/kpatch-build/create-diff-object.c b/kpatch-build/create-diff-object.c
+index 3d01e71..f778a9f 100644
+--- a/kpatch-build/create-diff-object.c
++++ b/kpatch-build/create-diff-object.c
+@@ -570,6 +570,62 @@ static int kpatch_mangled_strcmp(char *s1, char *s2)
+ 	return 1;
+ }
+ 
++/* GCC's UBSAN descriptor numbers are unstable.  Only treat references as
++ * equivalent when every descriptor byte and referenced value agrees.  Do
++ * not correlate the sections: changed functions still get fresh metadata.
++ * Unknown pointers, different source locations/types, and cycles fail closed.
++ */
++static bool ubsan_metadata_equal(struct section *first, struct section *second,
++                                 unsigned int depth)
++{
++    struct list_head *one, *two;
++    struct rela *a, *b;
++
++    if (!depth || !first || !second ||
++        !is_ubsan_sec(first->name) || !is_ubsan_sec(second->name) ||
++        !first->data || !second->data ||
++        !first->data->d_buf || !second->data->d_buf ||
++        first->sh.sh_type != SHT_PROGBITS ||
++        first->data->d_off || second->data->d_off ||
++        first->sh.sh_size != first->data->d_size ||
++        second->sh.sh_size != second->data->d_size ||
++        first->sh.sh_type != second->sh.sh_type ||
++        first->sh.sh_flags != second->sh.sh_flags ||
++        first->sh.sh_addralign != second->sh.sh_addralign ||
++        first->data->d_size != second->data->d_size ||
++        !first->data->d_size || first->data->d_size > 4096 ||
++        memcmp(first->data->d_buf, second->data->d_buf, first->data->d_size))
++        return false;
++    if (!first->rela || !second->rela)
++        return !first->rela && !second->rela;
++
++    one = first->rela->relas.next;
++    two = second->rela->relas.next;
++    while (one != &first->rela->relas && two != &second->rela->relas) {
++        a = list_entry(one, struct rela, list);
++        b = list_entry(two, struct rela, list);
++        if (a->offset != b->offset || a->type != b->type)
++            return false;
++        if (a->string || b->string) {
++            if (!a->string || !b->string || strcmp(a->string, b->string))
++                return false;
++        } else {
++            if (a->addend != b->addend ||
++                a->sym->sym.st_value != b->sym->sym.st_value)
++                return false;
++            if (is_ubsan_sec(a->sym->name) && is_ubsan_sec(b->sym->name)) {
++                if (!ubsan_metadata_equal(a->sym->sec, b->sym->sec, depth - 1))
++                    return false;
++            } else {
++                return false;
++            }
++        }
++        one = one->next;
++        two = two->next;
++    }
++    return one == &first->rela->relas && two == &second->rela->relas;
++}
++
+ static bool rela_equal(struct rela *rela1, struct rela *rela2)
+ {
+ 	struct rela *rela_toc1, *rela_toc2;
+@@ -579,6 +635,11 @@ static bool rela_equal(struct rela *rela1, struct rela *rela2)
+ 	    rela1->offset != rela2->offset)
+ 		return false;
+ 
++	if (is_ubsan_sec(rela1->sym->name) || is_ubsan_sec(rela2->sym->name))
++		return rela1->addend == rela2->addend &&
++		       rela1->sym->sym.st_value == rela2->sym->sym.st_value &&
++		       ubsan_metadata_equal(rela1->sym->sec, rela2->sym->sec, 4);
++
+ 	/*
+ 	 * On x86, .altinstr_aux is used to store temporary code which allows
+ 	 * static_cpu_has() to work before apply_alternatives() has run.  This
+@@ -965,6 +1026,8 @@ static bool kpatch_changed_child_needs_parent_profiling(struct symbol *sym)
+ 		if (child->has_func_profiling)
+ 			continue;
+ 		if (child->sec->status == CHANGED ||
++		    (child->sec->rela &&
++		     child->sec->rela->status == CHANGED) ||
+ 		    kpatch_changed_child_needs_parent_profiling(child))
+ 			return true;
+ 	}

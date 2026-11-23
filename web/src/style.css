@@ -1,0 +1,1238 @@
+/* kpctl 관리자 화면. 외부 글꼴·파일 없이 동작합니다 (컨트롤러는 인터넷이 막혀 있음). */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./shadcn-variants.css";
+@import "@fontsource-variable/geist";
+
+/* 다크 모드는 OS 설정을 따릅니다. shadcn 컴포넌트의 dark: 유틸리티도 같은 기준을 씁니다. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
+
+.builder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 16px;
+}
+.builder-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.builder-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.builder-card h3 { overflow-wrap: anywhere; }
+.builder-state { margin-bottom: 12px; }
+.builder-activity { display: grid; gap: 5px; margin: 12px 0; min-width: 0; }
+.builder-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+.builder-metrics dt { color: var(--text-muted); font-size: 12px; }
+.builder-metrics dd { margin: 2px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.log-controls { margin-bottom: 12px; }
+.live-log { max-height: 48vh; min-width: 0; overflow: auto; overflow-wrap: anywhere; }
+
+/* ───────────────────────── 디자인 토큰 ─────────────────────────
+   shadcn 토큰이 기준이고, 기존 클래스용 이름(--bg, --panel …)은 그 별칭입니다.
+   색을 바꿀 때는 이 블록과 아래 다크 블록만 고치면 됩니다. */
+:root {
+
+  /* 바탕 · 면 · 선 */
+  --background: oklch(1 0 250);
+  --foreground: oklch(0.21 0.012 260);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+  --muted: oklch(0.962 0.004 250);
+  --muted-foreground: oklch(0.5 0.014 258);
+  --border: oklch(0.912 0.005 255);
+  --input: oklch(0.89 0.006 255);
+  --ring: oklch(0.6 0.13 245);
+
+  /* 강조색: 차분한 블루 하나만 씁니다 */
+  --primary: oklch(0.5 0.15 254);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.955 0.006 250);
+  --secondary-foreground: oklch(0.27 0.02 258);
+  --accent: oklch(0.95 0.018 252);
+  --accent-foreground: oklch(0.36 0.11 255);
+  --destructive: oklch(0.56 0.2 27);
+
+  /* 상태색 (글자 / 바탕) */
+  --ok: oklch(0.5 0.12 155);
+  --ok-bg: oklch(0.955 0.035 158);
+  --warn: oklch(0.52 0.12 65);
+  --warn-bg: oklch(0.96 0.045 85);
+  --bad: oklch(0.53 0.19 27);
+  --bad-bg: oklch(0.955 0.025 25);
+
+  /* 사이드바 */
+  --sidebar: oklch(0.972 0.004 250);
+  --sidebar-foreground: oklch(0.3 0.015 258);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: oklch(0.935 0.012 252);
+  --sidebar-accent-foreground: oklch(0.2 0.02 258);
+  --sidebar-border: oklch(0.915 0.005 255);
+  --sidebar-ring: var(--ring);
+
+  --chart-1: oklch(0.6 0.15 254);
+  --chart-2: oklch(0.62 0.12 160);
+  --chart-3: oklch(0.7 0.13 75);
+  --chart-4: oklch(0.6 0.17 27);
+  --chart-5: oklch(0.55 0.02 258);
+
+  --radius: 0.625rem;
+  --shadow-sm: 0 1px 2px oklch(0.2 0.02 260 / 0.05);
+  --shadow-md:
+    0 1px 2px oklch(0.2 0.02 260 / 0.04), 0 4px 12px oklch(0.2 0.02 260 / 0.05);
+  --shadow-lg:
+    0 2px 6px oklch(0.2 0.02 260 / 0.06), 0 16px 40px oklch(0.2 0.02 260 / 0.14);
+
+  --mono:
+    ui-monospace, "SF Mono", "JetBrains Mono", "D2Coding", Menlo, Consolas,
+    monospace;
+  --sans:
+    "Geist Variable", "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo",
+    "Malgun Gothic", system-ui, sans-serif;
+
+  /* 기존 클래스용 별칭 */
+  --bg: var(--background);
+  --panel: var(--card);
+  --line: var(--border);
+  --text: var(--foreground);
+  --text-muted: var(--muted-foreground);
+  --brand: var(--primary);
+  --brand-text: var(--primary-foreground);
+  --idle-bg: var(--muted);
+  --inset: oklch(0.975 0.003 250);
+}
+
+
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: var(--sans);
+  --font-mono: var(--mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* 아래 기존 클래스 스타일은 components 레이어에 둡니다.
+   레이어 밖에 두면 Tailwind 유틸리티보다 우선해서 shadcn 컴포넌트(Table·Input 등)의 모양을 덮어씁니다. */
+@layer components {
+/* ───────────────────────── 기본 ───────────────────────── */
+[hidden] {
+  display: none !important;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "tnum" 1;
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  letter-spacing: -0.01em;
+}
+.muted {
+  color: var(--text-muted);
+}
+.error {
+  color: var(--bad);
+  white-space: pre-wrap;
+}
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+a {
+  color: var(--brand);
+  text-underline-offset: 2px;
+}
+
+/* ───────────────────────── 레이아웃 ───────────────────────── */
+.page-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  padding: 0 20px 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in oklch, var(--bg) 82%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px);
+}
+.page-header .sep {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+}
+.page-header h1 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.page-header .meta {
+  margin-left: auto;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.page-header .meta::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-bg);
+}
+
+/* 사이드바 안의 <main>(SidebarInset)은 건드리지 않고, 내용 영역만 폭을 제한합니다 */
+main:not([data-slot="sidebar-inset"]) {
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 24px 28px 48px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 28px;
+  align-content: start;
+}
+section > h2 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--text);
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ───────────────────────── 로그인 ───────────────────────── */
+.login {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background:
+    radial-gradient(
+      1200px 600px at 50% -10%,
+      color-mix(in oklch, var(--brand) 12%, transparent),
+      transparent 70%
+    ),
+    var(--bg);
+}
+.login-box {
+  width: min(400px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow-lg);
+  padding: 32px 28px 28px;
+  display: grid;
+  gap: 10px;
+}
+.login-brand {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 2px;
+}
+.login-sub {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  margin-bottom: 14px;
+}
+.login-box label {
+  font-weight: 600;
+  font-size: 13px;
+}
+.login-box input {
+  height: 38px;
+}
+.login-box .btn {
+  height: 38px;
+  font-size: 14px;
+  margin-top: 4px;
+}
+.hint {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+/* ───────────────────────── 버튼 · 입력 ───────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid var(--input);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+}
+.btn:hover:not(:disabled) {
+  background: var(--muted);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn.small {
+  height: 30px;
+  padding: 0 11px;
+  font-size: 12.5px;
+  border-radius: 7px;
+}
+.btn.primary {
+  background: var(--brand);
+  border-color: transparent;
+  color: var(--brand-text);
+  font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) {
+  background: color-mix(in oklch, var(--brand) 88%, var(--text));
+}
+.btn.danger {
+  color: var(--bad);
+  border-color: color-mix(in oklch, var(--bad) 40%, var(--input));
+}
+.btn.danger:hover:not(:disabled) {
+  background: var(--bad-bg);
+}
+.btn.danger-solid {
+  background: var(--bad);
+  border-color: transparent;
+  color: var(--panel);
+  font-weight: 600;
+}
+.btn.danger-solid:hover:not(:disabled) {
+  background: color-mix(in oklch, var(--bad) 88%, var(--text));
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+input:not([type="checkbox"]):not([type="radio"]),
+select {
+  font: inherit;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--input);
+  background: var(--panel);
+  color: var(--text);
+  max-width: 100%;
+  box-shadow: var(--shadow-sm);
+}
+input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 25%, transparent);
+}
+select.small {
+  height: 28px;
+  padding: 0 6px;
+  font-size: 12.5px;
+}
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--brand);
+}
+
+/* ───────────────────────── 카드형 면 공통 ───────────────────────── */
+.todo,
+.kernel,
+.table-wrap,
+.settings,
+.auto {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+}
+
+/* 자동 배포 띠 */
+.auto {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 14px 18px 14px 22px;
+  overflow: hidden;
+}
+.auto::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--line);
+}
+.auto.on::before {
+  background: var(--ok);
+}
+.auto.paused {
+  background: var(--warn-bg);
+  border-color: color-mix(in oklch, var(--warn) 30%, var(--line));
+}
+.auto.paused::before {
+  background: var(--warn);
+}
+.auto strong {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+.auto .btn {
+  margin-left: auto;
+}
+
+/* 처리할 일 */
+.todo {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.todo li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+.todo li:first-child {
+  border-top: 0;
+}
+.todo li:hover {
+  background: var(--inset);
+}
+.todo .grow {
+  flex: 1 1 280px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  border: 1px dashed var(--input);
+  border-radius: 12px;
+  background: var(--inset);
+}
+
+/* 커널 카드: 링을 왼쪽에서 오른쪽으로 따라가는 배포 경로 */
+.kernel {
+  padding: 16px 18px 18px;
+  display: grid;
+  gap: 14px;
+}
+.kernel + .kernel {
+  margin-top: 12px;
+}
+.kernel header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.kernel h3 {
+  font: 600 14px var(--mono);
+  overflow-wrap: anywhere;
+}
+.kernel header .actions {
+  margin-left: auto;
+}
+.path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 8px;
+}
+.ring-step {
+  display: flex;
+  flex: 1 1 160px;
+  gap: 8px;
+  min-width: 140px;
+}
+.ring-step .stop {
+  flex: 1;
+}
+.stop {
+  flex: 1 1 160px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px 12px;
+  background: var(--inset);
+  min-width: 140px;
+  display: grid;
+  gap: 2px;
+}
+.stop.current {
+  border-color: color-mix(in oklch, var(--brand) 45%, var(--line));
+  background: color-mix(in oklch, var(--brand) 5%, var(--panel));
+}
+.stop .ring {
+  font-size: 11.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.stop .ver {
+  font: 600 22px/1.3 var(--mono);
+  letter-spacing: -0.02em;
+}
+.stop .ver.none {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.stop .health {
+  font-size: 12.5px;
+  margin-top: 2px;
+}
+.arrow {
+  align-self: center;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  opacity: 0.6;
+}
+.notes {
+  margin: 0;
+  padding: 10px 12px;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  display: grid;
+  gap: 3px;
+  overflow-wrap: anywhere;
+  background: var(--inset);
+  border-radius: 8px;
+}
+.notes li::before {
+  content: "· ";
+}
+.notes li.stopped {
+  color: var(--bad);
+  font-weight: 600;
+}
+.notes li.resolved {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ───────────────────────── 표 ───────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 9px 14px;
+  background: var(--inset);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+td {
+  padding: 9px 14px;
+  border-top: 1px solid var(--line);
+  vertical-align: middle;
+}
+tr:first-child td {
+  border-top: 0;
+}
+tbody tr:hover td {
+  background: var(--inset);
+}
+td.mono,
+td .mono {
+  white-space: nowrap;
+}
+td.title {
+  min-width: 220px;
+  overflow-wrap: anywhere;
+}
+td.wrap {
+  min-width: 200px;
+  overflow-wrap: anywhere;
+}
+
+/* 상태 배지: 점 + 글자 */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: var(--idle-bg);
+  color: var(--text-muted);
+}
+.badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+}
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.badge.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.badge.bad {
+  background: var(--bad-bg);
+  color: var(--bad);
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.toolbar .actions {
+  margin-left: auto;
+}
+
+/* ───────────────────────── 대화상자 ─────────────────────────
+   브라우저 기본값은 dialog:modal { margin: auto } 로 화면 가운데에 놓지만,
+   Tailwind preflight 가 모든 요소에 margin: 0 을 주어 왼쪽 위에 붙습니다. 여기서 되살립니다. */
+dialog {
+  margin: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 0;
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  box-shadow: var(--shadow-lg);
+}
+dialog::backdrop {
+  background: oklch(0.15 0.02 260 / 0.45);
+  backdrop-filter: blur(2px);
+}
+.dlg {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 50px);
+}
+.dlg h2 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.dlg .body {
+  padding: 16px 22px;
+  overflow: auto;
+  display: grid;
+  gap: 14px;
+}
+/* 내용이 넘쳐 본문이 스크롤될 때 overflow:hidden 인 칸(패치 details 등)이
+   0 높이로 눌리지 않도록 행 높이를 내용 크기로 고정합니다. */
+.dlg .body {
+  grid-auto-rows: max-content;
+}
+.dlg .foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--inset);
+  border-radius: 0 0 14px 14px;
+}
+.warning,
+.danger-note {
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid;
+}
+.warning {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: color-mix(in oklch, var(--warn) 25%, transparent);
+}
+.danger-note {
+  background: var(--bad-bg);
+  color: var(--bad);
+  border-color: color-mix(in oklch, var(--bad) 25%, transparent);
+}
+details {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+details[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+summary {
+  padding: 9px 12px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+summary:hover {
+  background: var(--inset);
+}
+pre {
+  margin: 0;
+  padding: 12px 14px;
+  font: 12.5px/1.6 var(--mono);
+  overflow: auto;
+  max-height: 420px;
+  background: var(--inset);
+  white-space: pre;
+}
+pre.log {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  max-height: 70vh;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff-add {
+  color: var(--ok);
+  background: color-mix(in oklch, var(--ok-bg) 60%, transparent);
+}
+.diff-del {
+  color: var(--bad);
+  background: color-mix(in oklch, var(--bad-bg) 60%, transparent);
+}
+
+/* ───────────────────────── 알림 ───────────────────────── */
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--text);
+  color: var(--panel);
+  box-shadow: var(--shadow-lg);
+  z-index: 60;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.toast.bad {
+  background: var(--bad);
+}
+
+/* ───────────────────────── 설정 ───────────────────────── */
+.settings {
+  overflow: hidden;
+}
+.set-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 24px;
+  align-items: center;
+  padding: 14px 18px;
+  border-top: 1px solid var(--line);
+}
+.set-row:first-child {
+  border-top: 0;
+}
+.set-label {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.set-label label {
+  font-weight: 600;
+}
+.set-control {
+  justify-self: end;
+}
+.num-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.num-field input {
+  width: 7em;
+  text-align: right;
+  font-family: var(--mono);
+}
+.set-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.set-foot .hint {
+  flex: 1 1 360px;
+}
+.small-note {
+  font-family: var(--sans);
+  font-size: 12px;
+}
+.kup {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  min-width: 180px;
+}
+.settings-form,
+.coverage-results {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+.coverage-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.confirm-message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 개발 환경 띠 */
+.development-banner {
+  padding: 10px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  font-size: 13px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-bottom: 1px solid color-mix(in oklch, var(--warn) 30%, transparent);
+}
+.development-banner label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ───────────────────────── 반응형 · 모션 ───────────────────────── */
+@media (max-width: 640px) {
+  .page-header {
+    padding: 0 16px 0 8px;
+  }
+  .page-header .meta {
+    display: none;
+  }
+  main:not([data-slot="sidebar-inset"]) {
+    padding: 16px 16px 40px;
+  }
+  .arrow {
+    display: none;
+  }
+}
+@media (max-width: 600px) {
+  .set-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .set-control {
+    justify-self: start;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .btn,
+  input,
+  select,
+  .todo li,
+  tbody tr td,
+  summary {
+    transition:
+      background-color 0.12s,
+      border-color 0.12s,
+      box-shadow 0.12s;
+  }
+}
+
+/* 호스트 표: 보안 상태와 긴 설명은 정해진 폭 안에서 줄바꿈합니다. */
+.hosts-table td {
+  vertical-align: top;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.hosts-table th,
+.hosts-table td {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+.host-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 180px;
+}
+.host-name {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.host-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.hosts-table .col-kernel {
+  width: 30%;
+  min-width: 240px;
+}
+.hosts-table .col-kernel .kup {
+  min-width: 0;
+  margin-top: 4px;
+}
+.hosts-table .col-reboot {
+  min-width: 160px;
+  overflow-wrap: anywhere;
+}
+.hosts-table .col-security {
+  min-width: 230px;
+  max-width: 330px;
+}
+.host-security {
+  display: grid;
+  gap: 7px;
+  overflow-wrap: anywhere;
+}
+.security-signals {
+  margin: 0;
+  font-size: 12px;
+}
+.security-signals > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.security-signals dt {
+  color: var(--muted-foreground);
+}
+.security-signals dd {
+  margin: 0;
+}
+.cert-enrollments {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+}
+.cert-enrollments li {
+  margin: 3px 0;
+}
+.security-warning {
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+.vm-evidence {
+  min-width: 150px;
+  max-width: 390px;
+}
+.vm-evidence > summary {
+  white-space: normal;
+}
+.vm-steps {
+  padding-left: 20px;
+  margin: 10px 0 0;
+}
+.vm-steps li {
+  margin: 8px 0;
+}
+.artifact-sha {
+  overflow-wrap: anywhere;
+}
+.host-ops {
+  display: grid;
+  gap: 2px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.hosts-table td:last-child .actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+} /* @layer components */
+
+/* ───────────────────────── 모바일 ─────────────────────────
+   레이어 밖에 두어 shadcn(Tailwind 유틸리티)과 기존 클래스 스타일보다 우선합니다.
+   768px 미만에서는 표(.rtable)를 행마다 카드로 보여 주고, 각 칸 위에 열 이름(data-label)을 붙입니다. */
+@media (max-width: 767px) {
+  .rtable {
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    overflow: visible !important;
+    border-radius: 0 !important;
+  }
+  .rtable [data-slot="table-container"] {
+    overflow: visible;
+  }
+  .rtable table,
+  .rtable tbody,
+  .rtable tr,
+  .rtable td {
+    display: block;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  .rtable thead {
+    display: none;
+  }
+  .rtable tbody {
+    display: grid;
+    gap: 10px;
+  }
+  .rtable tr {
+    background: var(--panel);
+    border: 1px solid var(--line) !important;
+    border-radius: 12px;
+    box-shadow: var(--shadow-sm);
+    padding: 2px 14px;
+  }
+  .rtable td {
+    border: 0;
+    border-top: 1px solid var(--line);
+    padding: 10px 0 !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    background: none !important;
+  }
+  .rtable td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 3px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+  /* 첫 칸은 카드 제목: 열 이름 없이 굵게 */
+  .rtable td:first-child {
+    border-top: 0;
+    padding-top: 12px !important;
+    font-weight: 600;
+  }
+  .rtable td:first-child::before,
+  .rtable td[data-label=""]::before {
+    display: none;
+  }
+  .rtable td .actions,
+  .hosts-table td:last-child .actions {
+    flex-direction: row;
+    align-items: center;
+  }
+  .rtable td.mono,
+  .rtable td .mono {
+    white-space: normal;
+  }
+
+  /* 터치하기 쉬운 크기, iOS 입력 확대 방지(16px) */
+  .btn.small {
+    height: 36px;
+    padding: 0 12px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]),
+  select {
+    font-size: 16px;
+    height: 38px;
+  }
+  select.small {
+    height: 34px;
+    font-size: 15px;
+  }
+
+  /* 레이아웃 여백 */
+  section > h2 {
+    flex-wrap: wrap;
+  }
+  .auto {
+    padding: 12px 14px 12px 18px;
+  }
+  .auto .btn {
+    margin-left: 0;
+    width: 100%;
+  }
+  .kernel {
+    padding: 14px;
+  }
+  .kernel header .actions {
+    margin-left: 0;
+    width: 100%;
+  }
+  .path > .ring-step {
+    min-width: calc(50% - 4px);
+    flex-basis: calc(50% - 4px);
+  }
+  .ring-step .stop {
+    min-width: 0;
+  }
+  .stop .ver {
+    font-size: 18px;
+  }
+  .todo li {
+    padding: 12px 14px;
+  }
+  .todo li .btn {
+    margin-left: auto;
+  }
+  .toolbar .actions {
+    margin-left: 0;
+  }
+  .set-foot .btn {
+    flex: 1;
+  }
+  .development-banner {
+    padding: 10px 16px;
+  }
+
+  /* 메뉴 시트 안 항목도 손가락으로 누르기 쉬운 높이로 */
+  [data-sidebar="menu-button"] {
+    height: 40px;
+  }
+
+  /* 대화상자는 화면 거의 전체 */
+  dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+    border-radius: 12px;
+  }
+  .dlg {
+    max-height: calc(100dvh - 18px);
+  }
+  .dlg h2 {
+    padding: 14px 16px 12px;
+  }
+  .dlg .body {
+    padding: 14px 16px;
+  }
+  .dlg .foot {
+    padding: 10px 16px;
+    border-radius: 0 0 12px 12px;
+  }
+  .dlg .foot .btn {
+    flex: 1;
+  }
+
+  .toast {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+  .login-box {
+    padding: 24px 20px 20px;
+  }
+}
+
+.old-kernels {
+  margin-top: 12px;
+}
+.old-kernels > summary {
+  color: var(--muted-foreground);
+}

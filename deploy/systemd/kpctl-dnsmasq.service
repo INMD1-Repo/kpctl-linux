@@ -1,0 +1,17 @@
+[Unit]
+Description=kpctl management network DHCP/DNS (dnsmasq)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 설정을 먼저 검사하고, 틀리면 시작하지 않음
+ExecStartPre=/usr/sbin/dnsmasq --test --conf-file=/etc/kpctl/dnsmasq.conf
+# --log-facility=- : 로그를 표준 출력으로 → journalctl -u kpctl-dnsmasq 로 확인
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --log-facility=- --conf-file=/etc/kpctl/dnsmasq.conf
+# 고정 예약 파일(/etc/kpctl/dhcp-hosts)을 다시 읽음 — kpctl dhcp reserve 가 같은 신호를 보냄
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

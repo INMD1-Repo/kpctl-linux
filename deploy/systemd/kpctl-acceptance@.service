@@ -1,0 +1,19 @@
+[Unit]
+Description=kpctl dedicated-host acceptance (%i)
+After=network-online.target kpctl-controller.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/kpctl-acceptance /var/lib/kpctl/acceptance-%i/manifest.json
+Restart=no
+RuntimeMaxSec=30h
+TimeoutStopSec=120
+Nice=10
+NoNewPrivileges=true
+ProtectHome=read-only
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

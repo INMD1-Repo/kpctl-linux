@@ -1,0 +1,25 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG LOCKED=0
+ARG COMPILER_PACKAGE
+ARG CXX_PACKAGE
+ARG SNAPSHOT_ID
+ENV DEBIAN_FRONTEND=noninteractive
+COPY install-packages.sh configure-apt.sh toolchain-pins.sh packages.lock base-packages.lock extra-packages sources ca-certificates.crt /tmp/environment/
+RUN bash /tmp/environment/install-packages.sh "$LOCKED" "$COMPILER_PACKAGE" "$CXX_PACKAGE" "$SNAPSHOT_ID"
+COPY kpatch/ /opt/kpatch/
+COPY kpctl-kpatch-fixes.sh kpctl-kpatch-cold-test.py /opt/kpctl-tools/
+COPY kpatch-fixes/ /opt/kpctl-tools/kpatch-fixes/
+RUN bash /opt/kpctl-tools/kpctl-kpatch-fixes.sh /opt/kpatch && \
+    make -C /opt/kpatch -j2 && \
+    python3 /opt/kpctl-tools/kpctl-kpatch-cold-test.py /opt/kpatch/kpatch-build/create-diff-object && \
+    make -C /opt/kpatch install && \
+    git config --system user.name 'kpctl isolated build' && \
+    git config --system user.email 'builder@kpctl.invalid' && \
+    mkdir -p /home/kpbuild /var/lib/kpctl-builder /inputs && \
+    chmod 1777 /home/kpbuild /var/lib/kpctl-builder && \
+    rm -rf /opt/kpatch /tmp/environment /var/lib/apt/lists/*
+ENV HOME=/home/kpbuild
+ENV TMPDIR=/var/lib/kpctl-builder/tmp
+USER 1000:1000
+WORKDIR /var/lib/kpctl-builder
