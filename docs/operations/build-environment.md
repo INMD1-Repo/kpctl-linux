@@ -37,6 +37,8 @@ sudo systemctl enable --now kpctl-builder
 
 기준 빌드 캐시는 입력·프로파일별로 봉인되어 읽기 전용으로 재사용됩니다. 각 시험은 독립 작업 디렉터리에서 실행하고 네트워크·메모리·PID·디스크 한도를 적용합니다. 캐시 정합성 실패나 clean 재시도 결과도 로그에 남습니다. 손상 캐시를 원본 검증 없이 신뢰하도록 바꾸지 않습니다.
 
+`build_timeout_minutes`(기본 180)는 단계마다 따로 적용됩니다. 커널마다 처음 한 번 하는 패치 없는 기준 빌드(ccache 준비)와 그 뒤의 실제 빌드가 각각 이 시간을 씁니다. 예전에는 둘이 한 시간을 나눠 써서 캐시가 없는 첫 빌드가 끝나지 못했습니다. 2026-11-23 실측(14코어, Ubuntu 26.04 `7.0.0-43`)은 기준 빌드 2시간 6분, 캐시를 쓴 klp-build 72분입니다. 빌더는 도우미 전체를 `2 × build_timeout_minutes + 15분`까지 기다립니다. 중단된 빌드 컨테이너는 다음 실행이 시작할 때 최대 10분 동안 지웁니다. 수십 GiB를 지우는 데 25초 제한은 짧아서, 지우지 못한 컨테이너 때문에 이후 실행이 모두 시작 단계에서 실패했습니다.
+
 ```sh
 sudo journalctl -u kpctl-builder --since today
 sudo -u kpbuild -H /usr/local/libexec/kpctl-build-environment kernel-inventory --profiles-dir /var/lib/kpctl-builder/environments/noble

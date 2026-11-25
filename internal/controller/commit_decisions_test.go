@@ -35,7 +35,13 @@ func TestCommitDecisionPersistsAndIsNotRecovery(t *testing.T) {
 		callAPI(t, s, "POST", path, body, http.StatusBadRequest)
 	}
 	callAPI(t, s, "POST", path, `{"reason":"별도 완화", "problem_ref":"stale"}`, http.StatusConflict)
-	callAPI(t, s, "POST", path, `{"reason":"별도 완화", "problem_ref":"`+ref+`"}`, http.StatusOK)
+	stamp, err := time.Parse(time.RFC3339Nano, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kst := stamp.In(time.FixedZone("KST", 9*3600))
+	callAPI(t, s, "POST", path, `{"reason":"별도 완화", "problem_ref":"`+kst.Add(-time.Nanosecond).Format(time.RFC3339Nano)+`"}`, http.StatusConflict)
+	callAPI(t, s, "POST", path, `{"reason":"별도 완화", "problem_ref":"`+kst.Format(time.RFC3339Nano)+`"}`, http.StatusOK)
 	s.store.View(func(st *State) {
 		u, track := st.upstream(testKernel), st.track(testKernel)
 		if u.Problem != "" || track.AutoHold == "" || track.AutoHoldResolved != "관리자 제외로 수집 계속 · CVE 미해결" {

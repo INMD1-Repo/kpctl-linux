@@ -88,7 +88,7 @@ func (s *Session) run(command, stdin string) (string, error) {
 	s.Log.WriteString(out)
 	if err != nil {
 		fmt.Fprintf(&s.Log, "!! %v\n", err)
-		return out, fmt.Errorf("%v\n%s", err, lastLines(out, 15))
+		return out, fmt.Errorf("%w\n%s", err, lastLines(out, 15))
 	}
 	return out, nil
 }

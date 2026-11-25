@@ -29,7 +29,7 @@ type sshFlags struct {
 	acceptNew  bool
 	knownHosts string
 	hostsFile  string
-	fromDHCP   bool     // -from-dhcp: 관리망 DHCP 임대 중 아직 등록 안 된 호스트를 대상에 추가
+	fromDHCP   bool     // -from-dhcp: 관리망 동적 임대 중 아직 등록 안 된 호스트를 대상에 추가
 	extra      []string // fromDHCP 로 찾은 대상 (명령이 채움)
 	skipArgs   int      // 앞에서 몇 개의 위치 인자를 대상이 아닌 것으로 뺄지 (ssh-key copy <계정> ...)
 }
@@ -44,7 +44,7 @@ func addSSHFlags(fs *flag.FlagSet) *sshFlags {
 	fs.StringVar(&f.knownHosts, "ssh-known-hosts", os.Getenv("KPCTL_SSH_KNOWN_HOSTS"),
 		"known_hosts 파일 (기본: KPCTL_SSH_KNOWN_HOSTS, 비면 ~/.ssh/known_hosts)")
 	fs.StringVar(&f.hostsFile, "hosts-file", "", "호스트 목록 파일 (한 줄에 하나, # 은 주석)")
-	fs.BoolVar(&f.fromDHCP, "from-dhcp", false, "관리망 DHCP 에서 IP 를 받았지만 아직 컨트롤러에 등록 안 된 호스트 전부")
+	fs.BoolVar(&f.fromDHCP, "from-dhcp", false, "관리망 DHCP에서 동적 IP를 받은 미등록 호스트 전부 (고정 IP 제외)")
 	return f
 }
 
@@ -58,7 +58,7 @@ func (f *sshFlags) loadDHCPTargets(c *client.Client, fs *flag.FlagSet) (ok bool,
 	if err != nil {
 		return false, err
 	}
-	fmt.Printf("관리망 DHCP: 대상 %d대 (이미 등록된 %d대 제외)\n", len(targets), registered)
+	fmt.Printf("관리망 DHCP: 대상 %d대 (고정 IP 제외, 동적 IP 중 이미 등록된 %d대 제외)\n", len(targets), registered)
 	f.extra = targets
 	if len(targets) == 0 && fs.NArg() <= f.skipArgs && f.hostsFile == "" {
 		fmt.Println("새로 설치할 호스트가 없습니다.")

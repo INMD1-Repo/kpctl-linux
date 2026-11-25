@@ -16,8 +16,38 @@ import (
 	"time"
 )
 
+// Legacy configs omit both flags. Leave those helpers on their own defaults
+// when the builder binary is updated independently of the installed helper.
+func (p *SandboxPreparation) timeouts() ([]string, time.Duration) {
+	var args []string
+	snapshotMinutes, imageMinutes := 20, 180
+	if p.SnapshotTimeoutMinutes != nil {
+		snapshotMinutes = *p.SnapshotTimeoutMinutes
+		args = append(args, "--snapshot-timeout-minutes", strconv.Itoa(snapshotMinutes))
+	}
+	if p.ImageTimeoutMinutes != nil {
+		imageMinutes = *p.ImageTimeoutMinutes
+		args = append(args, "--image-timeout-minutes", strconv.Itoa(imageMinutes))
+	}
+	candidates := 1
+	if p.Snapshot == "auto" && p.Sources == "" {
+		candidates = 8 // Two publication dates plus up to six dates around the kernel Git tag.
+	}
+	// Keep time for the base image, Git inputs, manifest verification and cleanup.
+	return args, time.Duration(candidates*snapshotMinutes+imageMinutes+45) * time.Minute
+}
+
+const profileFailureCooldown = 30 * time.Minute
+
+type archiveCooldown struct {
+	retryAt time.Time
+	cause   error
+}
+
+func (e *archiveCooldown) Error() string { return e.cause.Error() }
+func (e *archiveCooldown) Unwrap() error { return e.cause }
+
 func (b *Builder) ensureSandboxProfile(k KernelConfig) (string, error) {
-	b.profileBusy = false
 	path, err := b.sandboxProfile(k.Kernel)
 	if err == nil || !errors.Is(err, errSandboxProfileMissing) {
 		return path, err
@@ -28,7 +58,10 @@ func (b *Builder) ensureSandboxProfile(k KernelConfig) (string, error) {
 	}
 	key := gccID(kernelCompiler(k.Kernel, b.headersRoot))
 	failureKey := key + " " + k.Kernel + " " + k.BaseTag
-	if previous, ok := b.profileFailed[failureKey]; ok && time.Since(previous.at) < 30*time.Minute {
+	if previous, ok := b.profileFailed[failureKey]; ok && time.Since(previous.at) < profileFailureCooldown {
+		if errors.Is(previous.err, errBuildDeferred) {
+			b.retryDiscovery = true
+		}
 		return "", previous.err
 	}
 	p := s.Prepare
@@ -52,6 +85,8 @@ func (b *Builder) ensureSandboxProfile(k KernelConfig) (string, error) {
 	args := []string{"prepare", "--kernel", k.Kernel, "--base-image", base, "--memory-mib", strconv.Itoa(p.MemoryMiB),
 		"--pids", strconv.Itoa(p.PIDs), "--min-free-gib", strconv.Itoa(p.MinFreeGiB), "--cache-gib", strconv.Itoa(*p.CacheGiB),
 		"--cache-total-gib", strconv.Itoa(p.CacheTotalGiB), "--snapshot", p.Snapshot}
+	timeoutArgs, timeout := p.timeouts()
+	args = append(args, timeoutArgs...)
 	if s.ProfilesDir != "" {
 		args = append(args, "--profiles-dir", s.ProfilesDir)
 	} else {
@@ -71,7 +106,7 @@ func (b *Builder) ensureSandboxProfile(k KernelConfig) (string, error) {
 	}
 	b.setStep("대상 GCC 프로파일 자동 준비 · 서명 스냅샷·고정 레시피")
 	log.Printf("[%s] 대상 컴파일러 프로파일 자동 준비: %s", k.Kernel, key)
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, s.Helper, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -86,21 +121,35 @@ func (b *Builder) ensureSandboxProfile(k KernelConfig) (string, error) {
 	defer stop()
 	output, prepareErr := b.commandOutput(cmd)
 	var exit *exec.ExitError
-	if errors.As(prepareErr, &exit) && exit.ExitCode() == 75 {
-		b.profileBusy = true
-		b.retryDiscovery = true
-		return "", errBuildBusy
+	detail := strings.TrimSpace(lastLines(string(output), 20))
+	if errors.As(prepareErr, &exit) {
+		switch exit.ExitCode() {
+		case 73: // EX_CANTCREAT: the helper's disk space check failed.
+			b.retryDiscovery = true
+			return "", fmt.Errorf("%w: %s", errDiskSpace, detail)
+		case 75: // EX_TEMPFAIL: another process owns the build lock.
+			b.retryDiscovery = true
+			return "", errBuildBusy
+		}
 	}
 	if prepareErr == nil {
 		path, prepareErr = b.sandboxProfile(k.Kernel)
 	}
 	if prepareErr != nil {
-		detail := strings.TrimSpace(lastLines(string(output), 20))
-		failure := fmt.Errorf("대상 GCC 프로파일 자동 준비 실패 (30분 뒤 재시도): %v: %s", prepareErr, detail)
+		failure := fmt.Errorf("대상 GCC 프로파일 자동 준비 실패 (30분 뒤 재시도): %w: %s", prepareErr, detail)
+		failedAt := time.Now()
+		// The helper reserves EX_UNAVAILABLE (69) for confirmed APT archive outages.
+		if exit != nil && exit.ExitCode() == 69 {
+			failure = &archiveCooldown{
+				retryAt: failedAt.Add(profileFailureCooldown),
+				cause:   fmt.Errorf("%w: APT 저장소 일시 장애 · 30분 뒤 재시도\n%s", errBuildDeferred, detail),
+			}
+			b.retryDiscovery = true
+		}
 		if b.profileFailed == nil {
 			b.profileFailed = map[string]debugFailure{}
 		}
-		b.profileFailed[failureKey] = debugFailure{at: time.Now(), err: failure}
+		b.profileFailed[failureKey] = debugFailure{at: failedAt, err: failure}
 		return "", failure
 	}
 	delete(b.profileFailed, failureKey)

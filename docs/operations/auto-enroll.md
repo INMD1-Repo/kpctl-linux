@@ -2,7 +2,7 @@
 
 <a id="auto-enroll"></a>
 
-`kpctl autoenroll`은 미등록 호스트 중 **클라이언트 키로 들어가지는 호스트**에 질문 없이 에이전트를 설치하는 일회 명령입니다. 대상은 관리망 DHCP 임대와 `/etc/kpctl/autoenroll-hosts`(DHCP를 쓰지 않을 때, 한 줄에 IP 또는 이름)에 적은 호스트입니다. `kpctl-autoenroll.timer`는 부팅 후 1분, 이전 실행 종료 후 1분 간격으로 실행합니다. 컨트롤러를 관리망 DHCP(`-N`)나 미리 준비한 클라이언트 키(`-k`)로 설치하면 타이머가 켜지므로 운영 전 대상을 확인합니다.
+`kpctl autoenroll`은 미등록 호스트 중 **클라이언트 키로 들어가지는 호스트**에 질문 없이 에이전트를 설치하는 일회 명령입니다. 관리망 DHCP에서는 고정 예약과 무기한 임대를 제외한 동적 IP만 찾습니다. 직접 지정할 호스트는 `/etc/kpctl/autoenroll-hosts`에 IP나 이름을 한 줄씩 적습니다. `kpctl-autoenroll.timer`는 부팅 후 1분, 이전 실행 종료 후 1분 간격으로 실행합니다. 컨트롤러를 관리망 DHCP(`-N`)나 미리 준비한 클라이언트 키(`-k`)로 설치하면 타이머가 켜지므로 운영 전 대상을 확인합니다.
 
 ```sh
 echo 192.0.2.21 | sudo tee -a /etc/kpctl/autoenroll-hosts   # DHCP 없이 대상 추가
@@ -25,7 +25,8 @@ sudo journalctl -u kpctl-autoenroll.service --since today
 
 ```sh
 sudo kpctl ssh-key list
-sudo kpctl ssh-key copy node-01
+sudo kpctl ssh-key copy node-01                          # 이미 있는 호스트: 비밀번호로 한 번만
+sudo kpctl ssh-key show -cloud-init > kpctl-client.yaml  # 새 VM: user-data 로 사용 (토큰 없음)
 sudo kpctl autoenroll -dry-run
 ```
 

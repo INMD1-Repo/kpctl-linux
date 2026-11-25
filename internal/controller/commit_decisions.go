@@ -29,10 +29,11 @@ func (s *Server) handleExcludeCommit(w http.ResponseWriter, r *http.Request, who
 		writeErr(w, fail(http.StatusBadRequest, "제외 사유는 1~1000바이트로 입력하세요"))
 		return
 	}
+	reportedAt, parseErr := time.Parse(time.RFC3339Nano, req.ProblemRef)
 	err := s.store.Update(func(st *State) error {
 		u := st.Upstream[kernel]
 		if u == nil || u.Problem == "" || u.ProblemKind == model.FailureBusy || u.ProblemFailure == nil || u.ProblemFailure.Commit != commit ||
-			u.ProblemAt.IsZero() || req.ProblemRef != u.ProblemAt.UTC().Format(time.RFC3339Nano) {
+			parseErr != nil || u.ProblemAt.IsZero() || !reportedAt.Equal(u.ProblemAt) {
 			return fail(http.StatusConflict, "수집 문제가 바뀌었습니다. 새로 확인하세요")
 		}
 		for _, known := range st.knownCommits(kernel) {
@@ -46,7 +47,7 @@ func (s *Server) handleExcludeCommit(w http.ResponseWriter, r *http.Request, who
 			Kernel: kernel, Commit: commit, CVEs: append([]string(nil), f.CVEs...), Title: f.Title,
 			Reason: req.Reason, FoundAt: now, Decision: &model.CommitDecision{By: who, At: now, Input: f.Input},
 		})
-		u.ProblemResolvedRef, u.ProblemResolution = req.ProblemRef, "admin_exclusion"
+		u.ProblemResolvedRef, u.ProblemResolution = u.ProblemAt.UTC().Format(time.RFC3339Nano), "admin_exclusion"
 		u.Problem, u.ProblemKind, u.ProblemFailure = "", "", nil
 		u.RefreshRequestedAt, u.RefreshRequestedBy = now, who
 		return nil

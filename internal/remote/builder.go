@@ -5,6 +5,7 @@
 package remote
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,8 +68,8 @@ func (s *Session) InstallBuilder(b *Bundle, o BuilderInstallOptions) (err error)
 	}
 	defer func() {
 		// 성공하든 실패하든 임시 파일(토큰이 든 설정 포함)은 지움
-		if _, cerr := s.run(s.sudo()+"rm -rf "+shq(dir), ""); cerr != nil && err == nil {
-			err = fmt.Errorf("임시 디렉터리 %s 삭제 실패 (토큰이 든 설정이 남아 있을 수 있음): %w", dir, cerr)
+		if _, cerr := s.run(s.sudo()+"rm -rf "+shq(dir), ""); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("임시 디렉터리 %s 삭제 실패 (토큰이 든 설정이 남아 있을 수 있음): %w", dir, cerr))
 		}
 	}()
 
@@ -153,7 +154,7 @@ func (s *Session) InstallBuilder(b *Bundle, o BuilderInstallOptions) (err error)
 	s.Log.WriteString(out)
 	if err != nil {
 		fmt.Fprintf(&s.Log, "!! %v\n", err)
-		return fmt.Errorf("%v\n%s", err, lastLines(out, 15))
+		return fmt.Errorf("%w\n%s", err, lastLines(out, 15))
 	}
 	return nil
 }

@@ -5,6 +5,11 @@ snapshot=${1:-}
 if [ -n "$snapshot" ] && [[ ! "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
   echo '잘못된 Ubuntu snapshot ID' >&2; exit 2
 fi
+# Retry individual failed indexes and packages in both the probe and the image build.
+cat > /etc/apt/apt.conf.d/99kpctl-archive <<'EOF'
+Acquire::Retries "4";
+APT::Update::Error-Mode "any";
+EOF
 if [ -s /tmp/environment/ca-certificates.crt ]; then
   echo 'Acquire::https::CaInfo "/tmp/environment/ca-certificates.crt";' > /etc/apt/apt.conf.d/49kpctl-bootstrap-ca
 fi

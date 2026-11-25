@@ -2,12 +2,23 @@
 
 [설치 순서](README.md)
 
-`dist/controller/` 전체를 서버에 복사하고 root로 설치합니다. 아래 주소는 설명용입니다. `-n` 이름과 `-i` IP는 대상 호스트에서 접근 가능한 값으로 바꾸세요.
+`dist/controller/` 전체를 서버에 복사하고 root로 설치합니다. 가장 쉬운 방법은 인자 없이 터미널에서 실행하는 질문형입니다.
 
 ```sh
 cd dist/controller
-sudo ./setup-controller.sh -n ctl.mgmt.example.test -i 192.0.2.10 -u ops -S -y
+sudo ./setup-controller.sh
 ```
+
+질문형은 이 서버의 IPv4 NIC를 보여 줍니다. 기본 경로가 아닌 사설망 NIC가 하나뿐이면 그 NIC를 관리망으로 제안하고, 도메인(`mgmt.internal`), 이름(`ctl.<도메인>`), 컨트롤러 IP, DHCP 범위의 기본값을 계산합니다. 설치 전에 같은 설치를 다시 할 수 있는 한 줄 명령을 보여 주고 확인을 받습니다. 관리망 NIC를 고르지 않으면 DHCP 없이 설치합니다.
+
+옵션으로 바로 설치할 수도 있습니다. 아래 주소는 설명용입니다. 실제 값을 넣기 전에 `-D`로 계산 결과만 확인할 수 있으며, `-D`는 아무것도 바꾸지 않습니다.
+
+```sh
+sudo ./setup-controller.sh -N eno2 -D                                   # 관리망 NIC 하나로 IP·범위·이름 계산
+sudo ./setup-controller.sh -n ctl.mgmt.example.test -i 192.0.2.10 -u ops -S -y   # 관리망 DHCP 없이
+```
+
+이미 설치한 컨트롤러에서 다시 실행하면 `/etc/kpctl/kpctl.env`의 이름·IP·SSH 계정을 그대로 씁니다. TLS 인증서와 호스트 설정이 어긋나지 않게 하기 위해서입니다. 바꾸려면 `-n`·`-i`·`-u`를 줍니다.
 
 `-S`는 서비스 시작을 생략하고 `-y`는 SSH 키 선택 질문을 생략합니다. 준비한 설치용 개인키는 `-k`, 추가 관리자 키는 반복 가능한 `-b`로 지정합니다. 스크립트가 토큰·사설 CA·서버 인증서·설치용 SSH 키와 기본 설정을 만듭니다. 기존 설정과 키가 있으면 해당 생성 부분은 보존합니다.
 

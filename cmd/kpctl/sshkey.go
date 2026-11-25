@@ -1,6 +1,7 @@
 // 이 파일: kpctl ssh-key — 컨트롤러 SSH 공개키를 호스트에 등록
 //
-//	kpctl ssh-key show              authorized_keys 에 넣을 줄 출력 (cloud-init, 기존 자동화용)
+//	kpctl ssh-key show              authorized_keys 에 넣을 줄 출력 (기존 자동화용)
+//	kpctl ssh-key show -cloud-init  새 VM 의 cloud-init user-data 로 그대로 쓰는 설정 출력
 //	kpctl ssh-key copy <호스트...>   지금 쓰는 계정/비밀번호로 한 번 로그인해서 키 등록
 //	kpctl ssh-key add | list | remove  관리자가 준 키를 컨트롤러에 저장 (keystore.go)
 //
@@ -22,7 +23,7 @@ import (
 )
 
 const sshKeyUsage = `사용법:
-  kpctl ssh-key show [-from IP]
+  kpctl ssh-key show [-from IP] [-cloud-init [-user 계정]]
   kpctl ssh-key copy [옵션] [계정] <호스트...>      (옵션은 맨 앞에)
 
   계정을 첫 인자로 주면 그 계정으로 로그인해서 그 계정의 authorized_keys 에 넣습니다.
@@ -34,6 +35,10 @@ const sshKeyUsage = `사용법:
   copy 는 호스트마다 비밀번호나 평소 쓰는 키로 한 번 로그인해서
   컨트롤러 공개키를 ~<사용자>/.ssh/authorized_keys 에 추가하고, 그 키로 로그인되는지 확인합니다.
   처음 접속하는 호스트는 호스트 키 지문을 물어봅니다. 확인한 지문은 kpctl 의 known_hosts 에 저장됩니다.
+
+  show -cloud-init 은 새 VM 의 user-data(#cloud-config)로 쓰는 설정을 냅니다. 그 VM 이 관리망 DHCP 를
+  받으면 자동 등록 타이머가 이 키로 들어가 1분 안에 에이전트를 설치합니다 (등록 토큰은 들어 있지 않음).
+    sudo kpctl ssh-key show -cloud-init > kpctl-client.yaml
 
 옵션:`
 
@@ -52,6 +57,12 @@ func cmdSSHKey(c *client.Client, args []string) error {
 	from := fs.String("from", os.Getenv("KPCTL_SSH_FROM"), "이 키를 쓸 수 있는 접속 출발지 IP (기본: KPCTL_SSH_FROM)")
 	var sf *sshFlags
 	var loginKey *string
+	var cloudInit *bool
+	var ciUser *string
+	if action == "show" {
+		cloudInit = fs.Bool("cloud-init", false, "새 VM 의 cloud-init 설정(#cloud-config)으로 출력")
+		ciUser = fs.String("user", defaultSSHUser(), "-cloud-init: 키를 넣을 계정 (root 가 아니면 비밀번호 없는 sudo 계정으로 만듦)")
+	}
 	if action == "copy" {
 		sf = addSSHFlags(fs)
 		loginKey = fs.String("login-key", "", "처음 로그인할 때 쓸 키 (기본: 평소 쓰는 ssh 키 또는 비밀번호)")
@@ -68,6 +79,14 @@ func cmdSSHKey(c *client.Client, args []string) error {
 	}
 
 	if action == "show" {
+		if *cloudInit {
+			out, err := cloudInitKey(line, *ciUser)
+			if err != nil {
+				return err
+			}
+			fmt.Print(out)
+			return nil
+		}
 		fmt.Println(line)
 		return nil
 	}
@@ -105,6 +124,60 @@ func authorizedLine(pubFile, from string) (string, error) {
 		opts = fmt.Sprintf(`from="%s",%s`, from, opts)
 	}
 	return opts + " " + pub, nil
+}
+
+// cloudInitKey 는 컨트롤러 공개키 줄만 넣는 #cloud-config 를 만듭니다. 등록 토큰은 넣지 않으므로
+// (kpctl bootstrap -cloud-init 과 달리) VM 템플릿에 두어도 토큰이 퍼지지 않습니다. 설치는 자동 등록이 SSH 로 합니다.
+func cloudInitKey(line, user string) (string, error) {
+	if !validUnixUser(user) {
+		return "", fmt.Errorf("-user 값이 계정 이름이 아닙니다: %q", user)
+	}
+	quoted := "'" + strings.ReplaceAll(line, "'", "''") + "'"
+	var b strings.Builder
+	b.WriteString("#cloud-config\n")
+	b.WriteString("# kpctl: 관리망 DHCP 를 받으면 컨트롤러가 이 키로 들어와 1분 안에 에이전트를 설치합니다.\n")
+	b.WriteString("# 키는 컨트롤러 IP 에서만 쓸 수 있고(from=) 포워딩·pty 가 막혀 있습니다(restrict).\n")
+	if user == "root" {
+		// Ubuntu 클라우드 이미지는 root 로그인 키 앞에 거부 명령을 붙이므로(disable_root) 끕니다.
+		// 이 파일이 넣는 키만 허용되고 비밀번호 로그인은 바뀌지 않습니다.
+		b.WriteString("disable_root: false\n")
+		b.WriteString("write_files:\n")
+		b.WriteString("  - path: /root/.ssh/authorized_keys\n")
+		b.WriteString("    permissions: '0600'\n")
+		b.WriteString("    append: true\n")
+		// 블록(|)이라 끝에 줄바꿈이 붙습니다. 이미 있는 키 뒤에 덧붙여도 줄이 섞이지 않습니다.
+		b.WriteString("    content: |\n      " + line + "\n")
+		return b.String(), nil
+	}
+	b.WriteString("users:\n")
+	b.WriteString("  - default\n")
+	b.WriteString("  - name: " + user + "\n")
+	b.WriteString("    shell: /bin/bash\n")
+	b.WriteString("    lock_passwd: true\n")
+	b.WriteString("    # kpctl 설치는 sudo -n 을 씁니다 (비밀번호를 물으면 실패)\n")
+	b.WriteString("    sudo: 'ALL=(ALL) NOPASSWD:ALL'\n")
+	b.WriteString("    ssh_authorized_keys:\n")
+	b.WriteString("      - " + quoted + "\n")
+	return b.String(), nil
+}
+
+func defaultSSHUser() string {
+	if u := os.Getenv("KPCTL_SSH_USER"); u != "" {
+		return u
+	}
+	return "root"
+}
+
+func validUnixUser(u string) bool {
+	if u == "" || len(u) > 32 || u[0] == '-' {
+		return false
+	}
+	for _, r := range u {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // copyScript 는 원격에서 표준 입력으로 받은 줄을 authorized_keys 에 넣습니다 (같은 키가 이미 있으면 그대로 둠).

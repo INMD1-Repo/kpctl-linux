@@ -68,3 +68,24 @@ func TestNextQueuedJobBySeries(t *testing.T) {
 		t.Fatalf("resolute 빌드 서버에 줄 작업 없음: %+v", j)
 	}
 }
+
+func TestArchiveCooldownSkipsJobOnlyForRequestingBuilder(t *testing.T) {
+	first := &model.Job{ID: 1, Kernel: "6.8.0-85-generic", Status: model.JobQueued, Urgent: true}
+	ready := &model.Job{ID: 2, Kernel: "6.8.0-86-generic", Status: model.JobQueued}
+	st := &State{Jobs: []*model.Job{first, ready}}
+	req := model.NextJobRequest{Builder: "builder-a", Series: "noble", DeferredJobIDs: []int{first.ID}}
+	if got := nextQueuedJob(st, req); got != ready {
+		t.Fatalf("ready job was blocked by this builder's cooldown: %+v", got)
+	}
+	if got := nextQueuedJob(st, model.NextJobRequest{Builder: "builder-b", Series: "noble"}); got != first {
+		t.Fatalf("builder-b could not take the urgent job: %+v", got)
+	}
+	ready.Status = model.JobBuilt
+	if got := nextQueuedJob(st, req); got != nil {
+		t.Fatalf("a deferred job prevented idle polling for administrative work: %+v", got)
+	}
+	req.DeferredJobIDs = nil
+	if got := nextQueuedJob(st, req); got != first {
+		t.Fatalf("priority was not restored after builder-a's cooldown: %+v", got)
+	}
+}

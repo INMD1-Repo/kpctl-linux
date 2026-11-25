@@ -67,9 +67,9 @@ ip link add $BR type bridge && ip addr add $NET.1/24 dev $BR && ip link set $BR 
 pass "관리망 브리지 $BR ($NET.1/24)"
 
 echo "■ 1. setup-controller.sh 의 DHCP 옵션 검사 (아무것도 만들지 않아야 함)"
-S=(bash "$D/setup-controller.sh" -i $NET.1 -u kpdeploy -p $PORT -S)
-if "${S[@]}" -n $CTL -N $BR >"$W/out" 2>&1; then die "-r 없이 통과"; fi
-check "-r 없으면 거부" grep -q '\-r (범위) 가 필요' "$W/out"
+S=(bash "$D/setup-controller.sh" -i $NET.1 -u kpdeploy -p $PORT -S -y)
+"${S[@]}" -D -n $CTL -N $BR >"$W/out" 2>&1 || die "동적 범위 계산 실패"
+check "-r 생략 시 /24 기본 동적 범위 사용" grep -Fq "$NET.100,$NET.250" "$W/out"
 if "${S[@]}" -n kpatch.internal -N $BR -r $NET.100,$NET.150 >"$W/out" 2>&1; then die "점 없는 도메인 통과"; fi
 check "도메인에 점이 없으면 거부 (-n kpatch.internal → internal)" grep -q "점이 하나 이상" "$W/out"
 if "${S[@]}" -n ctl.other.test -d $DOM -N $BR -r $NET.100,$NET.150 >"$W/out" 2>&1; then die "도메인 밖 이름 통과"; fi
@@ -151,6 +151,12 @@ check "이미 예약된 MAC/IP 중복 거부" grep -q '이미' "$W/out"
 kpctl dhcp unreserve gpu-02 >/dev/null && kpctl dhcp reserve -all >"$W/out" 2>&1 || die "unreserve/-all 실패"
 check "unreserve 후 reserve -all 이 지금 IP 로 다시 고정" grep -q "고정: .* → $NET.20 gpu-02" "$W/out"
 check "손으로 쓴 주석은 그대로" grep -q '손으로 쓴 주석' /etc/kpctl/dhcp-hosts
+kpctl dhcp unreserve gpu-01 >/dev/null || die "gpu-01 예약 해제 실패"
+dhcp_get 1 gpu-01
+. "$W/lease-gpu-01.env"
+IP1=$ip
+kpctl dhcp leases >"$W/out" 2>&1 || die "갱신 후 임대 확인 실패"
+check "gpu-01 은 동적 임대, gpu-02 는 고정 예약" bash -c "grep -q '^$IP1 .*gpu-01 .*남은' '$W/out' && grep -q '^$IP2 .*gpu-02 .*고정(무기한) *예' '$W/out'"
 
 echo "■ 6. 호스트별 sshd (자기 이름, 자기 /etc/kpctl·에이전트 상태)"
 useradd -m -s /bin/bash kpdeploy; usermod -p '*' kpdeploy
@@ -179,16 +185,17 @@ pass "sshd 2대 ($IP1, $IP2)"
 
 echo "■ 7. -from-dhcp 로 키 등록 → 점검 → 설치"
 kpctl ssh-key copy -from-dhcp -accept-new-hostkey -login-key "$W/admin_id" >"$W/out" 2>&1 || die "ssh-key copy -from-dhcp 실패"
-check "DHCP 대상 2대 키 등록·로그인 확인" bash -c "grep -q '대상 2대' '$W/out' && [ \$(grep -c '컨트롤러 키로 로그인 확인' '$W/out') = 2 ]"
+check "동적 IP 1대만 키 등록·로그인 확인" bash -c "grep -q '대상 1대' '$W/out' && grep -F '[$IP1]' '$W/out' | grep -q '컨트롤러 키로 로그인 확인' && ! grep -Fq '[$IP2]' '$W/out'"
 kpctl install -check -from-dhcp >"$W/out" 2>&1 || die "점검 실패"
-check "2대 점검 통과 (호스트가 $CTL 을 관리망 DNS 로 찾아 접속)" grep -q '2대 모두 성공' "$W/out"
+check "동적 IP 1대 점검 통과 (호스트가 $CTL 을 관리망 DNS 로 찾아 접속)" grep -q '1대 모두 성공' "$W/out"
 kpctl install -group server -from-dhcp -parallel 2 -log-dir "$W/logs" >"$W/out" 2>&1 || die "설치 실패"
-check "2대 동시 설치 완료" bash -c "[ \$(grep -c '설치 완료' '$W/out') = 2 ]"
-check "컨트롤러에 gpu-01, gpu-02 등록 (링 2)" bash -c "kpctl hosts | grep -q '^gpu-01 .* 2 ' && kpctl hosts | grep -q '^gpu-02 .* 2 '"
+check "동적 IP 의 gpu-01 에만 설치" bash -c "grep -q '^$IP1 .*gpu-01 .*설치 완료' '$W/out' && [ ! -e '$W/gpu2/etc/agent.json' ]"
+kpctl hosts >"$W/out" 2>&1 || die "등록 조회 실패"
+check "컨트롤러에 gpu-01 만 등록 (링 2)" bash -c "grep -q '^gpu-01 .* 2 ' '$W/out' && ! grep -q '^gpu-02 ' '$W/out'"
 check "에이전트가 이름으로 컨트롤러 접속" grep -q "\"controller_url\": \"https://$CTL:$PORT\"" "$W/gpu1/etc/agent.json"
 check "dhcp leases 에 등록 상태 표시" bash -c "kpctl dhcp leases | grep '^$IP1' | grep -q '등록 (링 2'"
 kpctl install -check -from-dhcp >"$W/out" 2>&1 || die "재점검 오류"
-check "모두 등록되면 -from-dhcp 대상 없음" grep -q '새로 설치할 호스트가 없습니다' "$W/out"
+check "동적 IP 가 모두 등록되면 -from-dhcp 대상 없음" grep -q '새로 설치할 호스트가 없습니다' "$W/out"
 if kpctl uninstall -from-dhcp >"$W/out" 2>&1; then die "uninstall -from-dhcp 통과"; fi
 check "uninstall 에는 -from-dhcp 금지" grep -q '쓸 수 없습니다' "$W/out"
 

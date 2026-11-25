@@ -174,6 +174,10 @@ func TestDiskLowKeepsAllHostKernelsAndDefersBuildUntilRecovery(t *testing.T) {
 	if !reflect.DeepEqual(f.b.activeKernels, []string{diskOld, diskMid, diskLatest}) {
 		t.Fatalf("136·142·147 모두 범위 유지: %v", f.b.activeKernels)
 	}
+	f.b.DiscoverKernels([]string{diskOld})
+	if !f.b.deferredDiscovery[diskOld] || len(f.b.deferredDiscovery) != 1 {
+		t.Fatalf("디스크 부족 중 수동 수집 요청 유실: %v", f.b.deferredDiscovery)
+	}
 	window, err := f.b.kernelWindow()
 	if err != nil || window.floor != 0 {
 		t.Fatalf("디스크 경계 없음: %+v %v", window, err)
@@ -190,7 +194,7 @@ func TestDiskLowKeepsAllHostKernelsAndDefersBuildUntilRecovery(t *testing.T) {
 	if f.b.BuildNext() || f.nextRequests != 0 {
 		t.Fatal("새 작업을 가져오면 안 됨")
 	}
-	if _, err := f.b.runBuild(KernelConfig{Kernel: diskOld}, "unused", t.TempDir(), nil); !errors.Is(err, errBuildBusy) {
+	if _, err := f.b.runBuild(KernelConfig{Kernel: diskOld}, "unused", t.TempDir(), nil); !errors.Is(err, errDiskSpace) {
 		t.Fatalf("시험도 보류: %v", err)
 	}
 	f.free = 500 << 30

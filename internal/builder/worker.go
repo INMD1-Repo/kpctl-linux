@@ -44,7 +44,7 @@ type Builder struct {
 	headersRoot       string    // empty uses /usr/src
 	activeKernels     []string
 	profileFailed     map[string]debugFailure
-	profileBusy       bool
+	archiveJobRetryAt map[int]time.Time // only the work loop reads or writes this map
 	timings           map[string]float64
 	retryDiscovery    bool
 	deferredDiscovery map[string]bool
@@ -157,13 +157,21 @@ func (b *Builder) BuildNext() bool {
 	if !b.ensureBuildSpace() {
 		return false
 	}
-	req := b.identity()
+	req := b.nextRequest(time.Now())
 	var task model.BuildTask
 	err := b.c.Do("POST", "/api/builder/next", req, &task)
 	if errors.Is(err, client.ErrNoContent) {
 		return false
 	}
 	if err != nil {
+		// 컨트롤러 재시작·재부팅 중의 연결 거부나 5xx 는 빌더 고장이 아닙니다. 활동을 "failed"로
+		// 바꾸면 컨트롤러가 돌아와 "할 일 없음"(204)을 줘도 되돌릴 곳이 없어 웹에 실패로 계속 남습니다.
+		// 연결이 끊긴 동안의 상태는 컨트롤러가 last_seen 으로 판단하므로 여기서는 로그만 남기고
+		// 다음 폴링에서 다시 요청합니다. 인증 거부 같은 4xx 는 사람이 고쳐야 하므로 그대로 실패로 보입니다.
+		if client.Retryable(err) {
+			log.Printf("컨트롤러 연결 실패, %d초 뒤 다시 요청: %v", b.cfg.PollSeconds, err)
+			return false
+		}
 		log.Printf("작업 요청 실패: %v", err)
 		b.finishActivity("", "", err)
 		return false
@@ -190,7 +198,7 @@ func (b *Builder) BuildNext() bool {
 	result := b.build(task)
 	result.Builder, result.JobStartedAt = b.cfg.Name, &job.StartedAt
 	if result.Deferred {
-		log.Printf("빌드 대기: job %d · 빌드 자원 확보 후 재시도", job.ID)
+		log.Printf("빌드 대기: job %d · %s", job.ID, result.Error)
 	} else if result.Success {
 		log.Printf("빌드 성공: job %d → %s", job.ID, result.ModuleName)
 	} else {
@@ -202,13 +210,36 @@ func (b *Builder) BuildNext() bool {
 		log.Printf("결과 업로드 실패 job %d: %v (컨트롤러가 시간 초과 후 다시 대기열에 넣습니다)", job.ID, err)
 		b.finishActivity(job.Kernel, "", err)
 	} else if result.Deferred {
-		b.finishActivity(job.Kernel, "빌드 보류 · 자원 확보 후 작업 대기열에서 재시도", nil)
+		b.finishActivity(job.Kernel, firstLineOf(result.Error), nil)
 	} else if result.Success {
 		b.finishActivity(job.Kernel, fmt.Sprintf("작업 %d 빌드 성공 · 승인 대기", job.ID), nil)
 	} else {
 		b.finishActivity(job.Kernel, "", errors.New(result.Error))
 	}
 	return !result.Deferred
+}
+
+func (b *Builder) nextRequest(now time.Time) model.NextJobRequest {
+	req := b.identity()
+	for id, retryAt := range b.archiveJobRetryAt {
+		if now.Before(retryAt) {
+			req.DeferredJobIDs = append(req.DeferredJobIDs, id)
+		} else {
+			delete(b.archiveJobRetryAt, id)
+		}
+	}
+	return req
+}
+
+func (b *Builder) failedJob(id int, err error, log string) model.BuildResult {
+	var outage *archiveCooldown
+	if errors.As(err, &outage) {
+		if b.archiveJobRetryAt == nil {
+			b.archiveJobRetryAt = make(map[int]time.Time)
+		}
+		b.archiveJobRetryAt[id] = outage.retryAt
+	}
+	return model.BuildResult{Error: err.Error(), Log: log, Deferred: errors.Is(err, errBuildDeferred)}
 }
 
 // resultRetryDelays 는 결과 업로드를 다시 보내기 전 기다리는 시간입니다 (합계 약 4분).
@@ -252,7 +283,7 @@ func (b *Builder) build(task model.BuildTask) model.BuildResult {
 
 	k, err := b.resolveTaskKernel(task)
 	if err != nil {
-		return model.BuildResult{Error: err.Error(), Deferred: errors.Is(err, errBuildBusy)}
+		return b.failedJob(job.ID, err, "")
 	}
 	// 패치마다 들어 있는 선행 커밋 묶음을 풀어 중복을 없애고 git 이력 순서로 저장 (prereq.go)
 	var labels, contents []string
@@ -266,7 +297,7 @@ func (b *Builder) build(task model.BuildTask) model.BuildResult {
 	}
 	out, err := b.runBuild(k, moduleName(job.Kernel, job.Version), filepath.Join(dir, "out"), files)
 	if err != nil {
-		return model.BuildResult{Error: err.Error(), Log: out.Log, Deferred: errors.Is(err, errBuildBusy)}
+		return b.failedJob(job.ID, err, out.Log)
 	}
 
 	data, err := os.ReadFile(out.ModulePath)

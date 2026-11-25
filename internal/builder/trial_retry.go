@@ -212,7 +212,7 @@ func (b *Builder) previousTrialFailure(kernel, commit, fingerprint string, prere
 
 func (b *Builder) saveTrialFailure(kernel, commit, fingerprint string, failure error, prerelease ...bool) error {
 	path := b.trialFailurePath(kernel, prerelease...)
-	if path == "" || fingerprint == "" || b.stopping() || errors.Is(failure, errBuildBusy) {
+	if path == "" || fingerprint == "" || b.stopping() || errors.Is(failure, errBuildDeferred) {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

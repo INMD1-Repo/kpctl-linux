@@ -17,6 +17,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -40,13 +41,6 @@ type SSH struct {
 	// Interactive 가 true 면 비밀번호·호스트 키 확인을 터미널에서 물어봅니다.
 	// (kpctl ssh-key copy 처럼 처음 한 번 사람이 직접 로그인할 때만 사용)
 	Interactive bool
-}
-
-func (s *SSH) bin(name, def string) string {
-	if name != "" {
-		return name
-	}
-	return def
 }
 
 // commonArgs 는 ssh 와 scp 에 공통으로 붙는 옵션입니다.
@@ -117,7 +111,7 @@ func (s *SSH) Run(host, command, stdin string) (string, error) {
 // RunContext also bounds SSH with the caller's lifetime (for disposable VM tests).
 func (s *SSH) RunContext(ctx context.Context, host, command, stdin string) (string, error) {
 	args := append(s.commonArgs("-p"), s.dest(host), command)
-	return s.execContext(ctx, s.bin(s.SSHBin, "ssh"), args, stdin)
+	return s.execStream(ctx, "ssh", s.SSHBin, args, stdin, nil)
 }
 
 // Copy 는 로컬 파일들을 원격 디렉터리에 복사합니다.
@@ -130,14 +124,14 @@ func (s *SSH) CopyContext(ctx context.Context, host string, files []string, remo
 	args := append(s.commonArgs("-P"), "-q")
 	args = append(args, files...)
 	args = append(args, s.scpDest(host)+":"+remoteDir+"/")
-	_, err := s.execContext(ctx, s.bin(s.SCPBin, "scp"), args, "")
+	_, err := s.execStream(ctx, "scp", s.SCPBin, args, "", nil)
 	return err
 }
 
 // RunStream 은 Run 과 같지만, 출력이 한 줄씩 나올 때마다 onLine 을 부릅니다 (오래 걸리는 설치의 진행 표시용).
 func (s *SSH) RunStream(host, command, stdin string, onLine func(string)) (string, error) {
 	args := append(s.commonArgs("-p"), s.dest(host), command)
-	return s.execStream(context.Background(), s.bin(s.SSHBin, "ssh"), args, stdin, onLine)
+	return s.execStream(context.Background(), "ssh", s.SSHBin, args, stdin, onLine)
 }
 
 // CopyTree 는 로컬 파일·디렉터리들을 원격 디렉터리에 하위 디렉터리까지 복사합니다 (scp -r).
@@ -145,16 +139,8 @@ func (s *SSH) CopyTree(host string, paths []string, remoteDir string) error {
 	args := append(s.commonArgs("-P"), "-q", "-r")
 	args = append(args, paths...)
 	args = append(args, s.scpDest(host)+":"+remoteDir+"/")
-	_, err := s.execContext(context.Background(), s.bin(s.SCPBin, "scp"), args, "")
+	_, err := s.execStream(context.Background(), "scp", s.SCPBin, args, "", nil)
 	return err
-}
-
-func (s *SSH) exec(bin string, args []string, stdin string) (string, error) {
-	return s.execContext(context.Background(), bin, args, stdin)
-}
-
-func (s *SSH) execContext(parent context.Context, bin string, args []string, stdin string) (string, error) {
-	return s.execStream(parent, bin, args, stdin, nil)
 }
 
 // lineWriter 는 받은 바이트를 줄 단위로 끊어 fn 에 넘깁니다.
@@ -182,7 +168,7 @@ func (w *lineWriter) flush() {
 	}
 }
 
-func (s *SSH) execStream(parent context.Context, bin string, args []string, stdin string, onLine func(string)) (string, error) {
+func (s *SSH) execStream(parent context.Context, tool, bin string, args []string, stdin string, onLine func(string)) (string, error) {
 	timeout := s.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Minute
@@ -190,6 +176,9 @@ func (s *SSH) execStream(parent context.Context, bin string, args []string, stdi
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
+	if bin == "" {
+		bin = tool
+	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = time.Second
 	cmd.Stdin = strings.NewReader(stdin)
@@ -206,13 +195,26 @@ func (s *SSH) execStream(parent context.Context, bin string, args []string, stdi
 	if lines != nil {
 		lines.flush()
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return out.String(), fmt.Errorf("%s 시간 초과 (%s)", bin, timeout)
+	if err == nil {
+		return out.String(), nil
 	}
-	if err != nil {
-		return out.String(), fmt.Errorf("%s 실패: %v", bin, err)
+	switch ctx.Err() {
+	case context.DeadlineExceeded:
+		return out.String(), fmt.Errorf("%s 시간 초과: %w", tool, ctx.Err())
+	case context.Canceled:
+		return out.String(), fmt.Errorf("%s 실행 취소: %w", tool, ctx.Err())
 	}
-	return out.String(), nil
+	var exitErr *exec.ExitError
+	switch {
+	case !errors.As(err, &exitErr) || exitErr.ExitCode() < 0:
+		return out.String(), fmt.Errorf("%s 클라이언트 실행 실패: %w", tool, err)
+	case tool == "scp":
+		return out.String(), fmt.Errorf("SCP 파일 전송 실패: %w", err)
+	case exitErr.ExitCode() == 255:
+		return out.String(), fmt.Errorf("SSH 연결 또는 세션 실패: %w", err)
+	default:
+		return out.String(), fmt.Errorf("원격 명령 실패: %w", err)
+	}
 }
 
 // shq 는 문자열을 셸에서 안전하게 쓸 수 있도록 작은따옴표로 감쌉니다.

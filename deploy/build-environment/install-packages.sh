@@ -5,6 +5,9 @@ locked=${1:?locked mode}
 compiler=${2:?compiler package}
 cxx=${3:?C++ package}
 bash /tmp/environment/configure-apt.sh "${4:-}"
+# Record APT's own failure in the combined Podman log (Podman's exit status can differ).
+echo 'KPCTL_IMAGE_APT_BEGIN'
+trap 'case "$BASH_COMMAND" in "apt-get "*|"xargs -r apt-get "*) echo "KPCTL_IMAGE_APT_FAILED $?" >&2;; esac' ERR
 apt-get update -q
 if [ "$locked" = 1 ]; then
   # Unchanged base packages are already supplied by the immutable base image.
@@ -26,6 +29,7 @@ else
     xargs -r apt-get install -y -q --no-install-recommends --allow-downgrades < /tmp/environment/extra-packages
   fi
 fi
+trap - ERR
 python3 - "$compiler" <<'PY'
 import subprocess
 import sys
@@ -54,4 +58,4 @@ if [ "$locked" = 1 ]; then
   cmp /usr/local/share/kpctl/packages.lock /tmp/environment/packages.lock
 fi
 apt-get clean
-rm -f /etc/apt/apt.conf.d/49kpctl-bootstrap-ca
+rm -f /etc/apt/apt.conf.d/49kpctl-bootstrap-ca /etc/apt/apt.conf.d/99kpctl-archive

@@ -22,7 +22,10 @@ func (b *Builder) resolveTaskKernel(task model.BuildTask) (KernelConfig, error) 
 		return KernelConfig{}, err
 	}
 	if info == nil {
-		k := b.resolveKernel(task.Job.Kernel)
+		k, err := b.resolveKernel(task.Job.Kernel)
+		if err != nil {
+			return KernelConfig{}, err
+		}
 		if !b.cfg.autoKernels() {
 			return k, b.prepareConfiguredInputs(k)
 		}
@@ -39,13 +42,12 @@ func (b *Builder) resolveTaskKernel(task model.BuildTask) (KernelConfig, error) 
 		return k, b.prepareConfiguredInputs(k)
 	}
 	// autoKernel keeps the normal series, HWE, debug symbol and toolchain checks.
-	b.profileBusy = false
-	k, reason := b.autoKernel(model.HostKernel{Kernel: info.Kernel, Signature: info.Signature})
-	if b.profileBusy {
-		return KernelConfig{}, errBuildBusy
+	k, err := b.autoKernel(model.HostKernel{Kernel: info.Kernel, Signature: info.Signature})
+	if err != nil {
+		return KernelConfig{}, fmt.Errorf("%w: 컨트롤러 커널 기준으로 준비할 수 없습니다 (%s): %w", errBuildEnv, info.Kernel, err)
 	}
-	if reason != "" || k.Kernel == "" {
-		return KernelConfig{}, fmt.Errorf("%w: 컨트롤러 커널 기준으로 준비할 수 없습니다 (%s): %s", errBuildEnv, info.Kernel, reason)
+	if k.Kernel == "" {
+		return KernelConfig{}, fmt.Errorf("%w: 이 빌더의 대상 시리즈 밖 커널 (%s)", errBuildEnv, info.Kernel)
 	}
 	return k, nil
 }

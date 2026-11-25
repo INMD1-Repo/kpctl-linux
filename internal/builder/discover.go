@@ -24,7 +24,7 @@ func (b *Builder) DiscoverAll() (more bool) {
 			return more
 		}
 		m, err := b.discover(k)
-		if errors.Is(err, errBuildBusy) {
+		if errors.Is(err, errBuildDeferred) {
 			b.retryDiscovery = true
 		}
 		if err != nil {
@@ -37,15 +37,15 @@ func (b *Builder) DiscoverAll() (more bool) {
 
 // DiscoverKernels 는 지정한 커널만 바로 수집합니다 (관리자 요청). 한도에 걸린 나머지도 끝까지 이어서 합니다.
 func (b *Builder) DiscoverKernels(names []string) {
-	want := map[string]bool{}
+	want := map[string]error{}
 	for _, n := range names {
-		want[n] = true
+		want[n] = nil
 	}
-	for _, k := range b.kernels() {
+	for _, k := range b.availableKernels(want) {
 		if b.stopping() {
 			return
 		}
-		if !want[k.Kernel] {
+		if _, requested := want[k.Kernel]; !requested {
 			continue
 		}
 		delete(want, k.Kernel)
@@ -56,7 +56,7 @@ func (b *Builder) DiscoverKernels(names []string) {
 			}
 			more, err := b.discoverWithForce(k, true)
 			if err != nil {
-				if errors.Is(err, errBuildBusy) {
+				if errors.Is(err, errBuildDeferred) {
 					b.deferDiscovery(k.Kernel)
 				}
 				log.Printf("[%s] 수집 실패: %v", k.Kernel, err)
@@ -67,8 +67,13 @@ func (b *Builder) DiscoverKernels(names []string) {
 			}
 		}
 	}
-	for n := range want {
-		log.Printf("[%s] 이 빌드 서버에서 수집할 수 없는 커널입니다 (위의 '자동 수집 대상 아님' 로그 참고)", n)
+	for n, err := range want {
+		if err != nil {
+			b.deferDiscovery(n)
+			log.Printf("[%s] 수동 수집 요청 보류: %v", n, err)
+			continue
+		}
+		log.Printf("[%s] 이 빌드 서버에서 수집할 수 없는 커널입니다", n)
 	}
 }
 
@@ -159,8 +164,8 @@ func (b *Builder) discoverWithForce(k KernelConfig, force bool) (more bool, err 
 	defer func() {
 		if errors.Is(err, errDiskSpace) {
 			b.finishActivity(k.Kernel, "디스크 부족 · 빌드 보류", nil)
-		} else if errors.Is(err, errBuildBusy) {
-			b.finishActivity(k.Kernel, "다른 빌드 사용 중 · 다음 확인 때 수집 재시도", nil)
+		} else if errors.Is(err, errBuildDeferred) {
+			b.finishActivity(k.Kernel, firstLineOf(err.Error()), nil)
 		} else {
 			b.finishActivity(k.Kernel, "수집 주기 완료", err)
 		}
@@ -169,7 +174,7 @@ func (b *Builder) discoverWithForce(k KernelConfig, force bool) (more bool, err 
 	var failedCommit *model.TrialFailure
 	tagFailed := false
 	defer func() {
-		if errors.Is(err, errBuildBusy) {
+		if errors.Is(err, errBuildDeferred) {
 			b.retryDiscovery = true
 		} else if err != nil && !tagFailed {
 			b.reportTrialFailure(k, err, failedCommit)
@@ -383,7 +388,7 @@ func (b *Builder) discoverRange(k KernelConfig, lower, latest string, force, pre
 				_, envErr = b.trialBuildPatches(k, sha, content, prerequisites, prerelease)
 			}
 			if envErr != nil {
-				if errors.Is(envErr, errBuildBusy) {
+				if errors.Is(envErr, errBuildDeferred) {
 					reviewErr = envErr
 					break
 				}
@@ -474,7 +479,7 @@ func (b *Builder) trialBuildPatches(k KernelConfig, sha, content string, prerequ
 			break
 		}
 	}
-	if errors.Is(err, errBuildBusy) {
+	if errors.Is(err, errBuildDeferred) {
 		return "", err
 	}
 	if err != nil {

@@ -180,8 +180,8 @@ func (b *Builder) runKLPBuild(k KernelConfig, name, outDir string, patchFiles []
 // 시험 빌드에서 이 오류가 나면 커밋을 "라이브패치 불가"로 기록하지 않고 수집을 멈춥니다.
 var errBuildEnv = errors.New("빌드 환경 오류")
 
-// Busy is temporary contention; it must never become a CVE review failure.
-var errBuildBusy = fmt.Errorf("%w: 다른 커널 빌드가 실행 중입니다", errBuildEnv)
+var errBuildDeferred = fmt.Errorf("%w: 빌드 보류", errBuildEnv)
+var errBuildBusy = fmt.Errorf("%w: 다른 커널 빌드가 실행 중입니다", errBuildDeferred)
 
 // kernelSource 는 upstream 버전을 보존한 소스와 대상 .config 를 돌려줍니다. 없으면 만듭니다.
 // 커널 git 과 기준 태그를 알면 git 에서 꺼내고(오래된 커널도 가능), 모르면 Ubuntu 저장소에서 받습니다.

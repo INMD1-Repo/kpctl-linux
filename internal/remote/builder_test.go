@@ -2,6 +2,7 @@
 package remote
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,28 @@ func fakeTools(t *testing.T) (sshBin, scpBin string) {
 	write(scpBin, `args=(); for a in "$@"; do case "$a" in -o|-i|-P) skip=1; continue ;; esac; [ -n "$skip" ] && { skip=; continue; }; case "$a" in -*) ;; *) args+=("$a") ;; esac; done
 dst=${args[-1]#*:}; unset 'args[-1]'; cp -R "${args[@]}" "$dst"`+"\n")
 	return sshBin, scpBin
+}
+
+func TestInstallBuilderReportsOriginalAndCleanupFailures(t *testing.T) {
+	sshBin := filepath.Join(t.TempDir(), "ssh")
+	fake := `#!/bin/bash
+case "${@: -1}" in
+  mktemp*) echo /tmp/kpctl-builder.test ;;
+  "rm -rf "*) echo 'cleanup connection lost' >&2; exit 255 ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(sshBin, []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{SSH: &SSH{SSHBin: sshBin}, Target: "test", Facts: Facts{UID: "0"}}
+	err := s.InstallBuilder(&Bundle{Dir: filepath.Join(t.TempDir(), "missing-bundle")}, BuilderInstallOptions{})
+	var exitErr *exec.ExitError
+	if !errors.Is(err, os.ErrNotExist) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 255 ||
+		!strings.Contains(err.Error(), "/tmp/kpctl-builder.test 삭제 실패") ||
+		!strings.Contains(err.Error(), "cleanup connection lost") {
+		t.Fatalf("expected the bundle and cleanup failures with their paths, got %v", err)
+	}
 }
 
 func TestInstallBuilderCopiesBundleAndRunsSetup(t *testing.T) {

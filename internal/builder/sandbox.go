@@ -51,7 +51,7 @@ func (b *Builder) runSandboxBuild(k KernelConfig, name, outDir string, patches [
 	out := buildOutput{ModuleName: name}
 	profile, err := b.ensureSandboxProfile(k)
 	if err != nil {
-		return out, fmt.Errorf("%w: %v", errBuildEnv, err)
+		return out, fmt.Errorf("%w: %w", errBuildEnv, err)
 	}
 	if !sandboxKernel.MatchString(k.Kernel) || !sandboxModule.MatchString(name) || k.GitDir == "" || k.BaseTag == "" {
 		return out, fmt.Errorf("%w: 격리 빌드에는 정확한 커널·Git 저장소·기준 태그가 필요합니다", errBuildEnv)
@@ -93,7 +93,10 @@ func (b *Builder) runSandboxBuild(k KernelConfig, name, outDir string, patches [
 	if worker == "" {
 		worker = "/proc/" + strconv.Itoa(os.Getpid()) + "/exe"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(b.cfg.BuildTimeoutMinutes)*time.Minute)
+	// 도우미가 단계마다 build_timeout_minutes 를 지킵니다: 처음 한 번의 기준 빌드(ccache 준비)와
+	// 실제 빌드가 각각 그 시간을 씁니다. 여기는 도우미가 멈췄을 때만 끊는 바깥 안전장치라
+	// 두 단계와 컨테이너 정리 여유(15분)를 합친 만큼 기다립니다.
+	ctx, cancel := context.WithTimeout(context.Background(), sandboxTimeout(b.cfg.BuildTimeoutMinutes))
 	defer cancel()
 	args := []string{"run", "--profile", profile, "--request", file, "--worker", worker}
 	for _, kernel := range b.activeKernels {
@@ -126,6 +129,9 @@ func (b *Builder) runSandboxBuild(k KernelConfig, name, outDir string, patches [
 		_, _ = writer.Write([]byte(lastLines(response.Log, 40) + "\n"))
 	}
 	if runErr != nil || !response.Success {
+		if response.Kind == "disk_space" {
+			return out, fmt.Errorf("%w: %s", errDiskSpace, response.Error)
+		}
 		if response.Kind == "busy" {
 			return out, fmt.Errorf("%w: %s", errBuildBusy, response.Error)
 		}
@@ -159,7 +165,13 @@ func sandboxResponseFailure(runErr, contextErr error, action string, resultErr e
 	default:
 		processErr = errors.New("도우미 정상 종료 후 유효한 결과가 없습니다")
 	}
-	failure := fmt.Errorf("%w: 격리 실행 실패: %w; %s: %v", errBuildEnv, processErr, action, resultErr)
+	class := errBuildEnv
+	var exit *exec.ExitError
+	if contextErr == nil && errors.As(runErr, &exit) && exit.ExitCode() == 73 {
+		// ENOSPC/EDQUOT can prevent even the helper's result file from being written.
+		class = errDiskSpace
+	}
+	failure := fmt.Errorf("%w: 격리 실행 실패: %w; %s: %v", class, processErr, action, resultErr)
 	if tail := strings.TrimSpace(lastLines(output, 20)); tail != "" {
 		return fmt.Errorf("%w\n도우미 로그 끝부분 (참고):\n%s", failure, tail)
 	}
@@ -264,4 +276,13 @@ func runLocalBuild(req BuildRequest, response *BuildResponse) error {
 	}
 	response.Success = err == nil
 	return err
+}
+
+// sandboxTimeout 은 격리 빌드 도우미 전체를 기다리는 최대 시간입니다 (기준 빌드 + 실제 빌드 + 정리 여유).
+// 0 이하(시험에서 쓰는 즉시 만료)는 그대로 0 입니다. 설정 검사는 1~1440분만 허용합니다.
+func sandboxTimeout(buildMinutes int) time.Duration {
+	if buildMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(2*buildMinutes+15) * time.Minute
 }

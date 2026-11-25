@@ -27,7 +27,7 @@ func (e *buildFailure) Unwrap() error { return e.err }
 
 func failureKind(err error, log string) string {
 	switch {
-	case errors.Is(err, errBuildBusy):
+	case errors.Is(err, errBuildDeferred):
 		return model.FailureBusy
 	case errors.Is(err, errBuildArtifact):
 		return model.FailureArtifact

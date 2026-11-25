@@ -150,6 +150,29 @@ class BuilderCacheChoice(unittest.TestCase):
         self.assertIn("Environment=CCACHE_DISABLE=1", disabled["ccache_service_settings"])
         self.assertIn("UnsetEnvironment=CCACHE_NODISABLE CCACHE_MAXSIZE", disabled["ccache_service_settings"])
 
+    def test_snapshot_timeout_range(self):
+        for minutes in ("1", "1440"):
+            self.plan("--snapshot-timeout-minutes", minutes)
+        for minutes in ("0", "1441"):
+            status, output = self.run_install_selection(
+                ("--plan", "--snapshot-timeout-minutes", minutes), terminal=False
+            )
+            self.assertEqual(status, 2, output)
+            self.assertIn("--snapshot-timeout-minutes", output)
+
+    def test_install_live_fallback_requires_automatic_default_sources(self):
+        self.plan("--allow-live-fallback", "--snapshot", "auto")
+        for conflict in (
+            ("--host-mode",), ("--sources", "/custom.sources"),
+            ("--snapshot", "none"), ("--snapshot", "20261120T122658Z"),
+        ):
+            with self.subTest(conflict=conflict):
+                status, output = self.run_install_selection(
+                    ("--plan", "--allow-live-fallback", *conflict), terminal=False,
+                )
+                self.assertEqual(status, 2, output)
+                self.assertIn("--allow-live-fallback", output)
+
     def test_interactive_default_yes_and_no_are_used_before_installation(self):
         for answer, maximum in [("\n", 20), ("y\n", 20), ("n\n", 0)]:
             with self.subTest(answer=answer):
@@ -194,6 +217,84 @@ class BuilderCacheChoice(unittest.TestCase):
         self.assertEqual(output.count(PROMPT), 2, output)
         self.assertIn("y 또는 n", output)
         self.assert_selection(output, 0)
+
+
+class BuilderKernelRepository(unittest.TestCase):
+    origin = "git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.target = self.root / "ubuntu-resolute"
+        self.upstream = self.root / "upstream"
+        self.env = dict(os.environ, HOME=temp.name, GIT_ALLOW_PROTOCOL="file",
+                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_ROOT=temp.name, CODENAME="resolute", BUILD_USER=str(os.getuid()),
+                        BUILD_GROUP=str(os.getgid()))
+        self.git("init", "-q", str(self.upstream))
+        self.git("-C", str(self.upstream), "-c", "user.name=Builder", "-c", "user.email=test@localhost",
+                 "commit", "-q", "--allow-empty", "-m", "kernel")
+
+    def git(self, *arguments):
+        return subprocess.check_output(["git", *arguments], env=self.env, text=True).strip()
+
+    def prepare(self, *, fallback=False, collide=False):
+        # Exercise just the repository step with local Git transports, without running apt or systemctl.
+        step = SCRIPT.read_text().split('echo "■ Ubuntu 커널 git ($CODENAME)"\n', 1)[1].split("\nprofiles=", 1)[0]
+        stubs = 'set -euo pipefail\nsudo() { shift 3; "$@"; }\nsleep() { :; }\n'
+        if collide:
+            # Publish an empty directory between a completed clone and the installer rename.
+            stubs += 'mv() { mkdir "$GIT_ROOT/ubuntu-$CODENAME"; command mv "$@"; }\n'
+        env = self.env.copy()
+        if fallback:
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{self.upstream.as_uri()}.insteadOf",
+                       GIT_CONFIG_VALUE_0=f"git://{self.origin}")
+        result = subprocess.run(["bash", "-c", stubs + step], env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(list(self.root.glob(".ubuntu-resolute.clone.*")), [])
+        return result
+
+    def test_failure_then_reinstall_and_transport_fallback(self):
+        result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.target.exists())
+        result = self.prepare(fallback=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("clone: https://"), 3)
+        self.assertEqual(result.stdout.count("clone: git://"), 1)
+        self.assertEqual(self.git("-C", str(self.target), "config", "--get", "remote.origin.url"), f"https://{self.origin}")
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("clone:", result.stdout)
+
+    def test_linked_worktree_keeps_local_files(self):
+        self.git("-C", str(self.upstream), "worktree", "add", "-q", "--detach", str(self.target))
+        marker = self.target / "local"
+        marker.write_text("local edits")
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marker.read_text(), "local edits")
+        self.assertTrue((self.target / ".git").is_file())
+
+    def test_preserves_unrelated_directory_and_interrupted_checkout(self):
+        self.target.mkdir()
+        marker = self.target / "local"
+        marker.write_text("preserve")
+        for partial in (False, True):
+            if partial:
+                self.git("init", "-q", str(self.target))
+            with self.subTest(partial=partial):
+                result = self.prepare()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(self.target), result.stderr)
+                self.assertNotIn("clone:", result.stdout)
+                self.assertEqual(marker.read_text(), "preserve")
+
+    def test_preserves_directory_created_during_clone(self):
+        result = self.prepare(fallback=True, collide=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.target), result.stderr)
+        self.assertEqual(list(self.target.iterdir()), [])
 
 
 if __name__ == "__main__":

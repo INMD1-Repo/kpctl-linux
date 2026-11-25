@@ -94,6 +94,7 @@ DHCP 부트스트랩(`/api/bootstrap/agent.tar.gz`)은 SSH 점검을 거치지 �
 | `connection refused` | 컨트롤러 서비스가 부팅 후 시작되지 않음. 사용 중인 관리망 서비스나 타이머도 비활성일 수 있음 | `systemctl status kpctl-controller`와 `systemctl is-enabled kpctl-controller`를 확인합니다. 이 배포에서 사용하는 컨트롤러·관리망 서비스·타이머만 활성화합니다 |
 | `lookup … no such host` | cloud-init이 부팅 중 `/etc/hosts`를 다시 작성함 | 사용하는 DNS 또는 `/etc/hosts`를 확인합니다. 호스트명 고정이 필요한 cloud-init 환경에서는 해당 템플릿에도 관리 주소를 유지합니다 |
 | 빌더의 관리망 주소가 부팅마다 바뀜 | DHCP 클라이언트 ID가 달라지거나 고정 예약이 없음 | `kpctl dhcp reserve <IP>`로 MAC을 예약하고, DHCP 서버의 예약 정책을 확인합니다 |
+| 웹에 빌드 서버가 `failed`로 표시됨 | 컨트롤러 재시작 중 연결이 끊겼거나 빌더 요청이 거부됨 | 빌더 로그와 `last_seen`을 확인합니다. 연결 거부·시간 초과·5xx는 재시도하고, 인증 오류 등 4xx는 실패로 표시합니다 |
 | `unknown authority` | 접속하는 클라이언트가 컨트롤러의 사설 CA를 신뢰하지 않음 | 빌더·에이전트의 `ca_file` 또는 관리 장비의 신뢰 저장소에 이 배포의 CA 인증서를 설정합니다 |
 
 <a id="apply"></a>

@@ -113,9 +113,13 @@ func (s *Server) createJobChannel(st *State, kernel, requestedBy string, urgent,
 // nextQueuedJob 은 빌드 서버에 줄 다음 작업을 고릅니다.
 // 그 빌드 서버가 만들 수 있는 커널 작업 중에서, 긴급(urgent) 작업이 먼저, 그다음은 먼저 만든 순서입니다.
 func nextQueuedJob(st *State, req model.NextJobRequest) *model.Job {
+	deferred := make(map[int]bool, len(req.DeferredJobIDs))
+	for _, id := range req.DeferredJobIDs {
+		deferred[id] = true
+	}
 	var pick *model.Job
 	for _, j := range st.Jobs {
-		if j.Status != model.JobQueued || !builderCanBuild(req, j.Kernel) || j.Prerelease && !req.CanPrerelease {
+		if j.Status != model.JobQueued || deferred[j.ID] || !builderCanBuild(req, j.Kernel) || j.Prerelease && !req.CanPrerelease {
 			continue
 		}
 		if req.Series != "" && !explicitBuilderKernel(req, j.Kernel) {

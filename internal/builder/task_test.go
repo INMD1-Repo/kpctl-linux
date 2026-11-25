@@ -22,6 +22,29 @@ func taskKernelInfo() *model.BuildKernelInfo {
 		PackageVersion: "6.8.0-987654.987655", BaseTag: "Ubuntu-6.8.0-987654.987655"}
 }
 
+func TestManualDiscoveryRetainsRequestedKernelsDuringControllerOutage(t *testing.T) {
+	for _, code := range []int{http.StatusServiceUnavailable, http.StatusUnauthorized} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, http.StatusText(code), code)
+			}))
+			defer server.Close()
+			b, err := New(&Config{ControllerURL: server.URL, PollSeconds: 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			kernel := taskKernelInfo().Kernel
+			b.DiscoverKernels([]string{kernel})
+			if b.deferredDiscovery[kernel] != (code == http.StatusServiceUnavailable) {
+				t.Fatalf("unexpected discovery state after HTTP %d: %v", code, b.deferredDiscovery)
+			}
+			if _, err := b.resolveKernel(kernel); errors.Is(err, errBuildDeferred) != (code == http.StatusServiceUnavailable) {
+				t.Fatalf("unexpected legacy job lookup result after HTTP %d: %v", code, err)
+			}
+		})
+	}
+}
+
 type taskWindowFixture struct {
 	b               *Builder
 	old, current    *model.BuildKernelInfo

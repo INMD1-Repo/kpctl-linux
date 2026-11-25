@@ -260,7 +260,7 @@ agent gpu-03; agent gpu-04
 check "22.04 HWE 호스트에는 24.04 GA 용 모듈을 주지 않음" test -z "$(ls "$(lp gpu-04)" 2>/dev/null)"
 check "HWE 호스트는 목표 v0, 'HWE 미지원' 표시" bash -c "kpctl hosts | grep gpu-04 | grep -q 'v0/v0.*HWE 미지원'"
 kpctl submit -kernel $JAMMY -title "jammy 수동 패치" "$W/manual.patch" >/dev/null
-JOB=$(kpctl jobs | awk -v k=$JAMMY '$0 ~ k {print $1; exit}')
+JOB=$(kpctl jobs | awk -v k=$JAMMY '!found && $0 ~ k {print $1; found=1}')
 "$BIN/kpctl-builder" -config "$W/builder.json" -once 2>"$W/builder.log"
 check "noble 빌드 서버는 jammy 작업을 가져가지 않음" bash -c "kpctl jobs | grep -qE '^$JOB .*대기'"
 check "새 커널(86) 디버그 심볼 없음 안내" grep -q '6.8.0-86-generic.*디버그 심볼 없음' "$W/builder.log"
@@ -278,7 +278,7 @@ git -C "$J" add -A && git -C "$J" commit -qm 'jammy fixture'
 git -C "$J" tag Ubuntu-5.15.0-125.135
 echo 'fake vmlinux' > "$W/debug/vmlinux-$JAMMY"
 kpctl build -kernel "$JAMMY" >/dev/null
-JOB=$(kpctl jobs | awk -v k=$JAMMY '$0 ~ k {print $1; exit}')
+JOB=$(kpctl jobs | awk -v k=$JAMMY '!found && $0 ~ k {print $1; found=1}')
 "$BIN/kpctl-builder" -config "$W/builder-jammy.json" -once 2>>"$W/builder-jammy.log"
 check "정확한 jammy 기준 입력을 준비하면 작업 빌드" bash -c "kpctl jobs | grep -qE '^$JOB .*승인대기'"
 
@@ -292,7 +292,7 @@ git -C "$U" tag Ubuntu-6.8.0-87.87
 # Git 태그만으로는 수집하지 않습니다. 정식 APT 색인에도 87이 공개된 상황으로 진행합니다.
 sed -i -e 's/6.8.0-86-generic/6.8.0-87-generic/' -e 's/6.8.0-86.86/6.8.0-87.87/' "$W/Packages"
 "$BIN/kpctl-builder" -config "$W/builder.json" -once 2>"$W/builder-auto.log"
-AUTOJOB=$(kpctl jobs | awk -v k=$KERNEL '$0 ~ k && /승인대기/ {print $1; exit}')
+AUTOJOB=$(kpctl jobs | awk -v k=$KERNEL '!found && $0 ~ k && /승인대기/ {print $1; found=1}')
 test -n "$AUTOJOB" || die "새 Ubuntu 패치 빌드 작업이 없음"
 sleep 2
 check "롤백한 커널은 자동 승인하지 않고 멈춤" bash -c "kpctl jobs | grep -qE '^$AUTOJOB .*승인대기' && kpctl auto | grep -q '자동 배포 멈춤'"

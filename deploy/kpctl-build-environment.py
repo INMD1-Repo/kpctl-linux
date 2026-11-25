@@ -10,6 +10,7 @@ import argparse
 import contextlib
 from collections import Counter
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -31,6 +32,7 @@ import urllib.request
 import uuid
 
 IMAGE = re.compile(r"^sha256:[0-9a-f]{64}$")
+REGISTRY_DIGEST = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 KERNEL = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[A-Za-z0-9_-]+$")
 MODULE = re.compile(r"^[a-z][a-z0-9_]{0,54}$")
@@ -52,6 +54,15 @@ REQUEST_KEYS = {
 KERNEL_KEYS = {"kernel", "git_dir", "base_tag", "tag_glob", "vmlinux", "paths"}
 
 
+# Removing a stopped kernel-build container deletes tens of GiB of overlay
+# files. 25 s was too short on the real builder: the stale container from an
+# interrupted run was never removed, so every later run failed at start-up
+# (61 of 81 failures, 2026-11-19..23). A failure still keeps the marker so the
+# next run retries the removal.
+CONTAINER_REMOVE_SECONDS = 600
+SNAPSHOT_TIMEOUT_MINUTES = 20
+
+
 class BuildCancelled(Exception):
     # subprocess retries InterruptedError internally; use a distinct exception
     # so SIGTERM reliably reaches our container cleanup.
@@ -62,7 +73,17 @@ class DiskSpaceError(Exception):
     pass
 
 
+def disk_space_error(error):
+    return isinstance(error, DiskSpaceError) or (
+        isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT)
+    )
+
+
 class BuildBusy(Exception):
+    pass
+
+
+class ArchiveUnavailable(ValueError):
     pass
 
 
@@ -240,28 +261,157 @@ def snapshot_candidates(args):
     return candidates, basis
 
 
-def select_snapshot(args, root, settings):
+def run_snapshot_probe(argv, name, archive, log_path, timeout_minutes, timeout_option="--snapshot-timeout-minutes"):
+    with log_path.open("a+", encoding="utf-8", errors="replace") as log:
+        log.write(f"\nSnapshot {archive}\n")
+        log.flush()
+        start = log.tell()
+        try:
+            result = subprocess.run(
+                argv, stdout=log, stderr=subprocess.STDOUT, text=True,
+                timeout=timeout_minutes * 60,
+            )
+        except (subprocess.TimeoutExpired, BuildCancelled, KeyboardInterrupt) as error:
+            # Killing the attached Podman client can leave the APT container running.
+            try:
+                subprocess.run(
+                    ["podman", "--cgroup-manager=cgroupfs", "rm", "--force", "--ignore", name],
+                    stdout=log, stderr=subprocess.STDOUT, timeout=CONTAINER_REMOVE_SECONDS,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError) as cleanup_error:
+                print(f"스냅샷 검사 컨테이너 정리 실패: {name}: {cleanup_error}", file=log, flush=True)
+                print(f"스냅샷 검사 컨테이너 정리 실패: {name} (로그 {log_path})", file=sys.stderr)
+            if not isinstance(error, subprocess.TimeoutExpired):
+                raise
+            log.write(f"\n스냅샷 검사 시간 초과 ({timeout_minutes:g}분)\n")
+            log.seek(start)
+            raise ValueError(
+                f"{archive} 스냅샷 검사 시간 초과 ({timeout_minutes:g}분). "
+                f"APT 전송 상태를 확인하고 필요하면 {timeout_option} 값을 늘리세요. "
+                f"로그: {log_path}\n{log.read()[-2000:]}"
+            ) from None
+        log.seek(start)
+        return result.returncode, log.read()
+
+
+def archive_origin(uri):
+    try:
+        url = urllib.parse.urlsplit(uri)
+        port = url.port
+    except ValueError:
+        return None
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return None
+    return (url.scheme, url.hostname, port if port is not None else (443 if url.scheme == "https" else 80))
+
+
+def transient_archive_failure(output):
+    # APT can cancel queued indexes with no individual HTTP status after another
+    # request fails. Correlate those only with a confirmed outage on the same origin.
+    summaries = {
+        "E: Some index files failed to download. They have been ignored, or old ones used instead.",
+        "E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?",
+        "E: Unable to fetch some archives, maybe run apt update or try with --fix-missing?",
+        "E: Failed to fetch some archives.",
+    }
+    retryable = re.compile(r"^(429|500|502|503|504)\b")
+    confirmed, unexplained = set(), set()
+    for line in output.splitlines():
+        if not line.startswith(("E:", "W:", "dpkg:", "dpkg-deb:")) or line in summaries:
+            continue
+        item = re.fullmatch(r"E: Failed to fetch (https?://\S+)(?:\s+(.*))?", line.rstrip())
+        if not item:
+            return False
+        origin = archive_origin(item[1])
+        if origin is None:
+            return False
+        if not item[2]:
+            unexplained.add(origin)
+        elif retryable.match(item[2]):
+            confirmed.add(origin)
+        else:
+            return False
+    if not confirmed or not unexplained.issubset(confirmed):
+        return False
+
+    # Err: may show several transport attempts (including a missing compressed
+    # variant), or a decisive APT authentication/integrity error on the next line.
+    for block in re.finditer(r"(?m)^(Err:\d+|E: Failed to fetch) (\S+)[^\n]*((?:\n[ \t][^\n]*)*)", output):
+        marker, uri, details = block.groups()
+        cancelled = marker.startswith("Err:") and not details.strip()
+        if unexplained and cancelled and archive_origin(uri) not in confirmed:
+            return False
+        for line in details.splitlines():
+            detail = line.strip()
+            if not detail or retryable.match(detail):
+                continue
+            if not unexplained and marker.startswith("Err:") and re.fullmatch(
+                r"404\s+Not Found(?:\s+\[IP: [^\]]+\])?", detail, re.I
+            ):
+                continue
+            return False
+    return True
+
+
+def image_archive_error(output):
+    _, start, last_apt = output.rpartition("KPCTL_IMAGE_APT_BEGIN\n")
+    failed = re.search(r"^KPCTL_IMAGE_APT_FAILED (?:100|123)$", last_apt, re.M)
+    if not start or not failed:
+        return ""
+    diagnostics = last_apt[:failed.start()]
+    if not transient_archive_failure(diagnostics):
+        return ""
+    return diagnostics[-2000:]
+
+
+def remaining_image_minutes(deadline, log_path):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError(f"컴파일러 이미지 준비 제한 시간(--image-timeout-minutes)을 소진했습니다. 로그: {log_path}")
+    return remaining / 60
+
+
+def select_snapshot(args, root, settings, *, image_deadline=None):
     candidates, basis = snapshot_candidates(args)
     recipe = root / "recipe"
-    script = """set -euo pipefail
+    timeout_minutes = getattr(args, "snapshot_timeout_minutes", SNAPSHOT_TIMEOUT_MINUTES)
+    log_path = root / "snapshot-probe.log"
+    script = r"""set -euo pipefail
+export LC_ALL=C
 bash /tmp/environment/configure-apt.sh "$1"
-apt-get -o APT::Sandbox::User=root -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update -q
+echo '== apt-get update (binary package indexes) =='
+apt-get -q -o APT::Sandbox::User=root \
+    -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+    -o Acquire::IndexTargets::deb-src::Sources::DefaultEnabled=false -o Acquire::Languages=none \
+    -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
+    -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false update
+echo '== resolve exact GCC packages =='
 bash /tmp/environment/toolchain-pins.sh "$2" "$3" > /tmp/kpctl-toolchain.lock
 mapfile -t pins < /tmp/kpctl-toolchain.lock
-apt-get -s -o APT::Sandbox::User=root --no-install-recommends --allow-downgrades install "${pins[@]}"
-printf 'KPCTL_TOOLCHAIN_PIN %s\\n' "${pins[@]}"
+echo '== simulate exact GCC install =='
+apt-get -s -o APT::Sandbox::User=root --no-install-recommends --allow-downgrades install "${pins[@]}" || {
+    status=$?
+    if [ "$status" -eq 100 ]; then exit 3; fi
+    exit "$status"
+}
+printf 'KPCTL_TOOLCHAIN_PIN %s\n' "${pins[@]}"
 """
     failures = []
-    for snapshot in candidates:
-        print(
-            "서명 APT·GCC 의존성 확인: " + (snapshot or "configured archive"),
-            flush=True,
-        )
+    unavailable = []
+    automatic = getattr(args, "snapshot", "auto") == "auto" and not getattr(args, "sources", None)
+    remaining = list(candidates)
+    while remaining:
+        snapshot = remaining.pop(0)
+        archive = snapshot or "configured archive"
+        name = "kpctl-snapshot-" + uuid.uuid4().hex
         argv = [
             "podman",
             "--cgroup-manager=cgroupfs",
             "run",
             "--cgroups=disabled",
+            "--name",
+            name,
             "--rm",
             "--pull=never",
             "--network=host",
@@ -278,30 +428,52 @@ printf 'KPCTL_TOOLCHAIN_PIN %s\\n' "${pins[@]}"
             settings["compiler_package"],
             settings["cxx_package"],
         ]
-        try:
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=240)
-            output = result.stdout + result.stderr
-        except subprocess.TimeoutExpired as error:
-            output = str(error)
-            result = None
-        with (root / "snapshot-probe.log").open("a") as log:
-            log.write(
-                "\nSnapshot " + (snapshot or "configured archive") + "\n" + output
-            )
-        if result is not None and result.returncode == 0:
+        probe_minutes = timeout_minutes
+        timeout_option = "--snapshot-timeout-minutes"
+        if image_deadline is not None:
+            image_minutes = remaining_image_minutes(image_deadline, log_path)
+            if image_minutes <= probe_minutes:
+                probe_minutes = image_minutes
+                timeout_option = "--image-timeout-minutes"
+        print(f"서명 APT·GCC 의존성 확인: {archive} (제한 {probe_minutes:g}분, 로그 {log_path})", flush=True)
+        status, output = run_snapshot_probe(argv, name, archive, log_path, probe_minutes, timeout_option)
+        if status == 0:
             pins = [
                 line.removeprefix("KPCTL_TOOLCHAIN_PIN ")
                 for line in output.splitlines()
                 if line.startswith("KPCTL_TOOLCHAIN_PIN ")
             ]
-            if not pins or not all(PACKAGE.fullmatch(pin) for pin in pins):
+            required = {settings["compiler_package"], settings["cxx_package"]}
+            if not required.issubset(pins) or not all(PACKAGE.fullmatch(pin) for pin in pins):
                 raise ValueError("invalid exact GCC dependency plan")
+            if unavailable:
+                basis = dict(basis, unavailable_snapshots=unavailable)
             return {
                 "snapshot_id": snapshot,
                 "snapshot_time_basis": basis,
                 "compiler_family": pins,
             }
-        failures.append((snapshot or "configured archive") + ": " + output[-2000:])
+        if status == 3:
+            failures.append(archive + ": " + output[-2000:])
+            continue
+        temporary = status == 100 and transient_archive_failure(output)
+        if snapshot and automatic and temporary:
+            unavailable.append(snapshot)
+            if getattr(args, "allow_live_fallback", False):
+                print(f"{archive} HTTP 재시도 소진. 이번 설치에 허용된 Ubuntu 기본 저장소에서 GCC 버전을 확인합니다.", flush=True)
+                remaining = [""]
+                basis = {"kind": "live_archive_fallback"}
+                continue
+            if len(unavailable) == 1 and remaining:
+                print(f"{archive} HTTP 재시도 소진. 다음 서명 스냅샷을 확인합니다.", flush=True)
+                continue
+        error_type = ArchiveUnavailable if temporary else ValueError
+        raise error_type(
+            f"{archive} 스냅샷 검사를 완료하지 못했습니다 (종료 코드 {status}). "
+            f"로그: {log_path}\n{output[-2000:]}"
+        )
+    if unavailable:
+        raise ArchiveUnavailable("HTTP 오류로 확인하지 못한 날짜: " + ", ".join(unavailable) + f" (로그 {log_path})")
     raise ValueError(
         "exact GCC packages unavailable in verified snapshots; no compiler substitution:\n"
         + "\n".join(failures)
@@ -384,36 +556,43 @@ def image_packages(image):
 IMAGE_BUILD_TIMEOUT_MINUTES = 180
 
 
-def external_containers():
+def stop_podman_build(process, grace):
+    # Leave the session leader waitable until the last signal. Its PID (and hence
+    # our process group ID) cannot then be recycled for an unrelated build.
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
     try:
-        out = command(["podman", "ps", "--all", "--quiet", "--no-trunc", "--external"])
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    return {line.strip() for line in out.splitlines() if line.strip()}
+        exited = os.waitid(os.P_PID, process.pid, flags)
+    except ChildProcessError:
+        return  # Popen.wait may have already reaped it when Ctrl-C arrived.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while exited is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+            exited = os.waitid(os.P_PID, process.pid, flags)
+        if exited is None:
+            print("Podman 이미지 빌드가 SIGTERM에 응답하지 않아 강제 종료합니다. "
+                  "중간 컨테이너가 남았는지 확인하세요.", file=sys.stderr, flush=True)
+    finally:
+        # An OCI helper can outlive the CLI. Limit escalation to this invocation.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        finally:
+            process.wait(timeout=5)
 
 
 def run_podman_build(args, log, timeout):
-    """podman build 를 제한 시간 안에 돌립니다. 시간이 넘으면 SIGTERM 으로 멈춰
-    RUN 단계 프로세스까지 끝내고(SIGKILL 은 컨테이너 안 apt 등을 고아로 남김),
-    이번 빌드가 남긴 작업 컨테이너를 지운 뒤 TimeoutExpired 를 올립니다."""
-    before = external_containers()
-    process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
+    # Podman --force-rm owns intermediate containers. Its ps --external also
+    # includes containers created concurrently by other Podman/Buildah clients.
+    process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.terminate()
+    except (subprocess.TimeoutExpired, BuildCancelled, KeyboardInterrupt) as error:
         try:
-            process.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        for container in sorted(external_containers() - before):
-            subprocess.run(
-                ["podman", "rm", "--force", container],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            # On service cancellation the parent gives this helper 30s to exit.
+            stop_podman_build(process, 120 if isinstance(error, subprocess.TimeoutExpired) else 20)
+        except (OSError, subprocess.SubprocessError, BuildCancelled, KeyboardInterrupt) as cleanup_error:
+            print(f"Podman 이미지 빌드 중단 처리 실패: {cleanup_error}", file=sys.stderr, flush=True)
         raise
     if returncode:
         raise subprocess.CalledProcessError(returncode, args)
@@ -452,13 +631,26 @@ def build_image(root, settings, locked, timeout_minutes=IMAGE_BUILD_TIMEOUT_MINU
     with (root / "image-build.log").open("w") as log:
         try:
             run_podman_build(args, log, timeout_minutes * 60)
+        except subprocess.CalledProcessError as error:
+            log.flush()
+            if not locked:
+                diagnostics = image_archive_error((root / "image-build.log").read_text(errors="replace"))
+                if diagnostics:
+                    raise ArchiveUnavailable(
+                        f"APT 패키지 다운로드 실패. 로그: {root / 'image-build.log'}\n{diagnostics}"
+                    ) from None
+            with (root / "image-build.log").open("rb") as evidence:
+                evidence.seek(max(0, log.tell() - 2000))
+                tail = evidence.read(2000).decode(errors="replace").strip()
+            error.stderr = f"로그: {root / 'image-build.log'}\n{tail}"
+            raise
         except subprocess.TimeoutExpired:
             fetched = re.findall(
                 r"(?m)^Fetched .*$", (root / "image-build.log").read_text(errors="replace")
             )
             raise ValueError(
                 "컴파일러 이미지 빌드가 "
-                + str(timeout_minutes)
+                + f"{timeout_minutes:g}"
                 + "분 안에 끝나지 않아 멈췄습니다"
                 + (" (마지막 다운로드: " + fetched[-1] + ")" if fetched else "")
                 + ". 대개 패키지 저장소(서명 스냅샷)가 느린 탓이니 --image-timeout-minutes 를 늘려 다시 실행하세요. 로그: "
@@ -588,11 +780,38 @@ def prepare(args):
         return prepare_locked(args, root, settings)
 
 
+def resolve_base_image(requested):
+    pinned = "@sha256:" in requested
+    try:
+        if pinned:
+            if not REGISTRY_DIGEST.fullmatch(requested):
+                raise ValueError("invalid registry base digest")
+            present = subprocess.run(
+                ["podman", "image", "exists", requested], capture_output=True, text=True
+            )
+            if present.returncode == 0:
+                return requested
+            if present.returncode != 1:
+                present.check_returncode()
+        command(["podman", "pull", requested])
+        if pinned:
+            return requested
+        data = json.loads(command(["podman", "image", "inspect", requested]))[0]
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip()
+        raise ValueError(f"기본 이미지 준비 실패: {error}" + ("\n" + detail if detail else "")) from None
+    for digest in data.get("RepoDigests") or []:
+        if REGISTRY_DIGEST.fullmatch(digest):
+            return digest
+    raise ValueError("an immutable registry base digest is required")
+
+
 def pinned_base(directory, requested):
     pin = directory / "base-image.json"
     if pin.is_symlink():
         raise ValueError("base image pin cannot be a symlink")
-    if pin.exists():
+    existing_pin = pin.exists()
+    if existing_pin:
         base = json.loads(pin.read_text())["base_image"]
     else:
         bases = {
@@ -603,20 +822,41 @@ def pinned_base(directory, requested):
             raise ValueError(
                 "existing profiles use different base images; choose a new registry"
             )
-        if bases:
-            base = bases.pop()
-        else:
-            command(["podman", "pull", requested])
-            data = json.loads(command(["podman", "image", "inspect", requested]))[0]
-            base = next((d for d in data.get("RepoDigests", []) if "@sha256:" in d), "")
-        if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", base):
-            raise ValueError("an immutable registry base digest is required")
-        atomic(pin, {"base_image": base})
-    if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", base):
+        base = bases.pop() if bases else resolve_base_image(requested)
+    if not REGISTRY_DIGEST.fullmatch(base):
         raise ValueError("invalid base image pin")
     if "@sha256:" in requested and requested != base:
         raise ValueError("base image differs from the registry pin; use a new registry")
+    if not existing_pin:
+        atomic(pin, {"base_image": base})
     return base
+
+
+def build_initial_image(args, root, settings):
+    timeout = getattr(args, "image_timeout_minutes", IMAGE_BUILD_TIMEOUT_MINUTES)
+    deadline = time.monotonic() + timeout * 60
+    try:
+        return build_image(root, settings, False, timeout)
+    except ArchiveUnavailable:
+        if not (getattr(args, "allow_live_fallback", False) and args.snapshot == "auto"
+                and not args.sources and settings["snapshot_id"]):
+            raise
+
+    snapshot = settings["snapshot_id"]
+    failed_log = f"image-build-{snapshot}-{uuid.uuid4().hex}.log"
+    (root / "image-build.log").rename(root / failed_log)
+    print(f"{snapshot} 이미지 빌드 중 HTTP 재시도 소진. Ubuntu 기본 저장소에서 GCC 버전을 다시 확인합니다. "
+          f"로그: {root / failed_log}", flush=True)
+    live_args = argparse.Namespace(**{**vars(args), "snapshot": "none", "allow_live_fallback": False})
+    live = select_snapshot(live_args, root, settings, image_deadline=deadline)
+    basis = settings["snapshot_time_basis"]
+    live["snapshot_time_basis"] = {
+        **basis, "kind": "live_archive_fallback", "failed_stage": "image_build", "failed_log": failed_log,
+        "unavailable_snapshots": [*basis.get("unavailable_snapshots", []), snapshot],
+    }
+    remaining = remaining_image_minutes(deadline, root / failed_log)
+    settings.update(live)
+    return build_image(root, settings, False, remaining)
 
 
 def prepare_locked(args, root, settings):
@@ -655,18 +895,7 @@ def prepare_locked(args, root, settings):
         return
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     require_space(root, args.min_free_gib * 1024)
-    # A locally present digest works during registry outages. Tags are resolved
-    # only by explicit preparation/installation, never by automatic preparation.
-    present = subprocess.run(
-        ["podman", "image", "exists", args.base_image], capture_output=True
-    )
-    if present.returncode != 0 or "@sha256:" not in args.base_image:
-        command(["podman", "pull", args.base_image])
-    inspected = json.loads(command(["podman", "image", "inspect", args.base_image]))[0]
-    digests = inspected.get("RepoDigests") or []
-    if not digests or "@sha256:" not in digests[0]:
-        raise ValueError("a registry digest is required for the base image")
-    settings["base"] = digests[0]
+    settings["base"] = resolve_base_image(args.base_image)
     if not all(
         PACKAGE.fullmatch(p)
         for p in [settings["compiler_package"], settings["cxx_package"], *args.package]
@@ -696,12 +925,7 @@ def prepare_locked(args, root, settings):
     (recipe / "base-packages.lock").write_text(
         "\n".join(sorted(base_packages.splitlines())) + "\n"
     )
-    image, tools, packages = build_image(
-        root,
-        settings,
-        False,
-        getattr(args, "image_timeout_minutes", IMAGE_BUILD_TIMEOUT_MINUTES),
-    )
+    image, tools, packages = build_initial_image(args, root, settings)
     (recipe / "packages.lock").write_text(packages)
     profile = {
         "schema": 1,
@@ -1303,7 +1527,7 @@ def cleanup_container(root):
         subprocess.run(
             ["podman", "--cgroup-manager=cgroupfs", "rm", "--force", "--ignore", name],
             capture_output=True,
-            timeout=25,
+            timeout=CONTAINER_REMOVE_SECONDS,
             check=True,
         )
         marker.unlink()
@@ -1619,7 +1843,7 @@ def run_attempt(req, profile, worker, root, timeout, cache, warmup):
         )
         return {
             "success": False,
-            "kind": "environment",
+            "kind": "disk_space" if isinstance(error, DiskSpaceError) else "environment",
             "error": message,
             "log": interrupted_logs(root, kernel),
             "cache": read_cache_stats(
@@ -1849,6 +2073,8 @@ def prepare_cache(args, path, profile, req, state, deadline, logs):
         )
         logs.append(response.get("log", ""))
         if not response.get("success"):
+            if response.get("kind") == "disk_space":
+                raise DiskSpaceError(response["error"])
             raise ValueError(
                 "baseline cache build failed: " + response.get("error", "unknown error")
             )
@@ -1965,7 +2191,12 @@ def run_locked(args, path, profile, req, out, actual_limits):
     touch_profile(path.parent)
     records = []
     logs = []
-    deadline = time.monotonic() + req["timeout_minutes"] * 60
+    # The one-time unpatched baseline (ccache warm-up) and the real build each
+    # get the full limit. Sharing one deadline left a cold first build about an
+    # hour for klp-build after a two-hour baseline, so it never finished
+    # (2026-11-23: baseline 2h06m, then cancelled; warm rerun finished in 72m).
+    budget = req["timeout_minutes"] * 60
+    deadline = time.monotonic() + budget
     state = path.parent / "runs"
     state.mkdir(mode=0o700, exist_ok=True)
     # Recover only this profile's own interrupted attempts, before starting work.
@@ -1988,6 +2219,8 @@ def run_locked(args, path, profile, req, out, actual_limits):
         cache, cache_info = prepare_cache(
             args, path, profile, req, state, deadline, logs
         )
+        if cache_info.get("warmup"):
+            deadline = time.monotonic() + budget
         for index in range(2 if args.retry_clean else 1):
             require_space(
                 path.parent, profile.get("limits", {}).get("disk_free_mib", 61440)
@@ -2045,7 +2278,7 @@ def run_locked(args, path, profile, req, out, actual_limits):
     except (Exception, KeyboardInterrupt) as error:
         response = {
             "success": False,
-            "kind": "environment",
+            "kind": "disk_space" if disk_space_error(error) else "environment",
             "error": str(error),
             "log": "",
         }
@@ -2109,6 +2342,10 @@ def parse_args():
     p.add_argument("--cache-gib", type=int, default=20)
     p.add_argument("--cache-total-gib", type=int, default=40)
     p.add_argument("--snapshot", default="auto")
+    p.add_argument("--allow-live-fallback", action="store_true",
+                   help="allow the base image's signed Ubuntu archive for this preparation after transient snapshot HTTP errors")
+    p.add_argument("--snapshot-timeout-minutes", type=int, default=SNAPSHOT_TIMEOUT_MINUTES,
+                   help="maximum minutes per signed snapshot probe (default: %(default)s)")
     p.add_argument("--git-dir")
     p.add_argument("--base-tag")
     p.add_argument(
@@ -2156,6 +2393,10 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     if args.action == "prepare":
+        if args.allow_live_fallback and (args.snapshot != "auto" or args.sources):
+            raise ValueError("--allow-live-fallback requires --snapshot auto and default Ubuntu sources")
+        if not 1 <= args.snapshot_timeout_minutes <= 1440:
+            raise ValueError("--snapshot-timeout-minutes must be between 1 and 1440")
         if (
             not 1024 <= args.memory_mib <= 1048576
             or not 128 <= args.pids <= 32768
@@ -2182,12 +2423,28 @@ def main():
     return 0
 
 
-if __name__ == "__main__":
+def cli():
     try:
-        sys.exit(main())
+        return main()
     except BuildBusy as error:
         print("격리 빌드 환경 사용 중: " + str(error), file=sys.stderr)
-        sys.exit(75)
+        return os.EX_TEMPFAIL
+    except ArchiveUnavailable as error:
+        print("APT 저장소 일시 장애: " + str(error), file=sys.stderr)
+        return os.EX_UNAVAILABLE
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip()
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        print(f"{error.cmd[0]} 종료 코드 {error.returncode}\n{detail[-3000:]}", file=sys.stderr)
+        return 1
     except Exception as error:
+        if disk_space_error(error):
+            print("빌드 디스크 공간 부족: " + str(error), file=sys.stderr)
+            return os.EX_CANTCREAT
         print("격리 빌드 환경 오류: " + str(error), file=sys.stderr)
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

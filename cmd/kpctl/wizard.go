@@ -1,6 +1,6 @@
 // 이 파일: 질문형 설치 — 터미널에서 kpctl install / install-builder 를 호스트 없이 실행하면 하나씩 물어봅니다.
 //
-// 답으로 명령줄 인자를 만들고 기존 cmdInstall / cmdInstallBuilder 를 그대로 부릅니다.
+// 답으로 명령줄 인자를 만들고 일반 설치와 같은 점검·설치 함수를 부릅니다.
 // 순서: 질문 → 같은 명령줄 보여 주기 → 점검(-check) → (실패 시 SSH 키 등록 제안·재점검) → 확인 → 설치.
 // 스크립트·타이머처럼 터미널이 아니면 질문하지 않고 예전처럼 동작합니다.
 package main
@@ -150,8 +150,10 @@ func enrollGroups() []string {
 // wizardPlan 은 질문으로 정한 설치 한 건입니다.
 type wizardPlan struct {
 	command string   // "install" | "install-builder"
-	flags   []string // 호스트 앞에 올 옵션
-	hosts   []string // 호스트 (그리고 install-builder 면 커널)
+	source  []string // 자동으로 대상을 읽는 옵션 (-from-dhcp 또는 -hosts-file 경로)
+	flags   []string // 설치 옵션
+	hosts   []string // 직접 지정한 호스트
+	kernels []string // install-builder 대상 커널
 	setup   []string // install-builder 의 "--" 뒤 setup-builder.sh 옵션
 	user    string   // SSH 접속 계정 (키 등록 제안에 씀)
 }
@@ -161,8 +163,10 @@ func (w *wizardPlan) args(check bool) []string {
 	if check {
 		out = append(out, "-check")
 	}
+	out = append(out, w.source...)
 	out = append(out, w.flags...)
 	out = append(out, w.hosts...)
+	out = append(out, w.kernels...)
 	if len(w.setup) > 0 {
 		out = append(out, "--")
 		out = append(out, w.setup...)
@@ -178,7 +182,7 @@ func askAgentPlan(p *prompter, dhcpAvailable bool) (*wizardPlan, error) {
 
 	choices := []string{"호스트 주소를 직접 입력", "호스트 목록 파일 (한 줄에 하나)"}
 	if dhcpAvailable {
-		choices = append(choices, "관리망 DHCP 에서 IP 를 받은 미등록 호스트 전부")
+		choices = append(choices, "관리망 DHCP에서 동적 IP를 받은 미등록 호스트 (고정 IP 제외)")
 	}
 	how, err := p.pick("설치할 호스트를 어떻게 정할까요", choices, 0)
 	if err != nil {
@@ -196,9 +200,9 @@ func askAgentPlan(p *prompter, dhcpAvailable bool) (*wizardPlan, error) {
 		if err != nil {
 			return nil, err
 		}
-		w.flags = append(w.flags, "-hosts-file", v)
+		w.source = []string{"-hosts-file", v}
 	case 2:
-		w.flags = append(w.flags, "-from-dhcp")
+		w.source = []string{"-from-dhcp"}
 	}
 
 	fmt.Fprintln(p.out)
@@ -296,7 +300,7 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 			}
 		}
 		if bad == "" {
-			w.hosts = append(w.hosts, strings.Fields(k)...)
+			w.kernels = strings.Fields(k)
 			break
 		}
 		fmt.Fprintf(p.out, "  %q 는 커널 이름 형식이 아닙니다 (uname -r 값, 예: 6.8.0-136-generic).\n", bad)
@@ -364,39 +368,56 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 	return w, nil
 }
 
-// runWizard 는 점검 → (키 등록) → 확인 → 설치를 진행합니다. run 은 cmdInstall 또는 cmdInstallBuilder 입니다.
-func runWizard(c *client.Client, p *prompter, w *wizardPlan, run, sshKey func(*client.Client, []string) error) error {
-	fmt.Fprintf(p.out, "\n같은 설치를 다음에 바로 하려면:\n  sudo kpctl %s %s\n\n", w.command, shellJoin(w.args(false)))
+// runWizard 는 마지막 점검을 통과한 호스트를 확인받고 그 주소로 설치합니다.
+func runWizard(c *client.Client, p *prompter, w *wizardPlan, run func(*client.Client, []string) ([]hostResult, error), sshKey func(*client.Client, []string) error) error {
+	fmt.Fprintf(p.out, "\n입력한 조건으로 다시 실행할 명령:\n  sudo kpctl %s %s\n\n", w.command, shellJoin(w.args(false)))
 	for {
 		fmt.Fprintln(p.out, "■ 점검 (아무것도 바꾸지 않음)")
-		err := run(c, w.args(true))
-		if err == nil {
-			break
+		results, err := run(c, w.args(true))
+		if len(results) == 0 {
+			return err
 		}
-		fmt.Fprintf(p.out, "\n점검 실패: %v\n", err)
-		fmt.Fprintln(p.out, "결과가 \"접속 실패\"이고 키가 아직 등록되지 않은 서버라면, 지금 그 계정 비밀번호로 한 번 로그인해서 키를 등록할 수 있습니다.")
-		again, err := p.yes("SSH 키를 등록하고 다시 점검할까요", false)
+		var passed []string
+		for _, result := range results {
+			if result.ok {
+				passed = append(passed, result.target)
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(p.out, "\n점검 실패: %v\n", err)
+			fmt.Fprintln(p.out, "SSH 키가 없어 접속에 실패했다면 비밀번호로 로그인해 키를 등록할 수 있습니다.")
+			if len(passed) > 0 {
+				fmt.Fprintf(p.out, "N을 선택하면 점검을 통과한 %d대만 설치 대상으로 남습니다.\n", len(passed))
+			}
+			again, err := p.yes("SSH 키를 등록하고 다시 점검할까요", false)
+			if err != nil {
+				return err
+			}
+			if again {
+				if err := sshKey(c, w.copyArgs()); err != nil {
+					fmt.Fprintf(p.out, "키 등록 실패: %v\n", err)
+				}
+				continue
+			}
+		}
+		if len(passed) == 0 {
+			return fmt.Errorf("점검을 통과한 서버가 없어 설치하지 않았습니다")
+		}
+		fmt.Fprintf(p.out, "\n점검을 통과한 설치 대상 %d대: %s\n", len(passed), strings.Join(passed, " "))
+		ok, err := p.yes("이 서버에 설치할까요", true)
 		if err != nil {
 			return err
 		}
-		if !again {
-			return fmt.Errorf("점검을 통과하지 못해 설치하지 않았습니다. 위 이유를 고친 뒤 다시 실행하세요")
+		if !ok {
+			fmt.Fprintln(p.out, "설치하지 않았습니다.")
+			return nil
 		}
-		if err := sshKey(c, w.copyArgs()); err != nil {
-			fmt.Fprintf(p.out, "키 등록 실패: %v\n", err)
-		}
-		fmt.Fprintln(p.out)
-	}
-	fmt.Fprintln(p.out)
-	ok, err := p.yes("점검을 통과했습니다. 설치할까요", true)
-	if err != nil {
+		install := *w
+		install.source = nil
+		install.hosts = passed
+		_, err = run(c, install.args(false))
 		return err
 	}
-	if !ok {
-		fmt.Fprintln(p.out, "설치하지 않았습니다.")
-		return nil
-	}
-	return run(c, w.args(false))
 }
 
 // copyArgs 는 같은 대상·계정으로 kpctl ssh-key copy 를 부를 인자입니다 (커널 이름은 뺌).
@@ -405,21 +426,8 @@ func (w *wizardPlan) copyArgs() []string {
 	if w.user != "" {
 		out = append(out, "-ssh-user", w.user)
 	}
-	for i := 0; i < len(w.flags); i++ {
-		switch w.flags[i] {
-		case "-hosts-file":
-			out = append(out, w.flags[i], w.flags[i+1])
-			i++
-		case "-from-dhcp":
-			out = append(out, w.flags[i])
-		}
-	}
-	for _, h := range w.hosts {
-		if !kernelArg.MatchString(h) {
-			out = append(out, h)
-		}
-	}
-	return out
+	out = append(out, w.source...)
+	return append(out, w.hosts...)
 }
 
 func agentWizard(c *client.Client) error {
@@ -429,7 +437,7 @@ func agentWizard(c *client.Client) error {
 	if err != nil {
 		return err
 	}
-	return runWizard(c, p, w, cmdInstall, cmdSSHKey)
+	return runWizard(c, p, w, runAgentInstall, cmdSSHKey)
 }
 
 func builderWizard(c *client.Client) error {
@@ -438,5 +446,5 @@ func builderWizard(c *client.Client) error {
 	if err != nil {
 		return err
 	}
-	return runWizard(c, p, w, cmdInstallBuilder, cmdSSHKey)
+	return runWizard(c, p, w, runBuilderInstall, cmdSSHKey)
 }

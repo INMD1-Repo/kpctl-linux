@@ -8,7 +8,7 @@
 
 컨트롤러에 SSH 키가 등록된 빌드 서버라면 컨트롤러에서 명령 하나로 설치합니다. `kpctl install-builder`는 사전 점검(sudo·아키텍처·지원 시리즈·컨트롤러 접속·실행 중인 빌더) → `/usr/local/share/kpctl/builder` 묶음 복사 → 컨트롤러 주소·`/etc/kpctl/tokens/builder.token`·CA로 `builder.json` 작성 → `setup-builder.sh` 실행 → 컨트롤러에 빌더 보고 확인까지 진행합니다. 토큰은 명령줄이 아닌 표준 입력으로 전달되고 임시 디렉터리는 끝나면 지웁니다.
 
-헷갈리면 터미널에서 인자 없이 `sudo kpctl install-builder`만 실행합니다. 빌드 서버 주소, SSH 접속 계정(저장한 키와 계정을 보여 줌), 빌드 서비스 계정, 대상 커널, 메모리, ccache, 재설치 여부를 차례로 묻습니다. 그다음 같은 설치를 다시 할 수 있는 명령줄을 보여 주고, 점검 → 설치 확인 → 설치 순서로 진행합니다. 점검에서 접속에 실패하면 그 자리에서 `ssh-key copy`로 키를 등록하고 다시 점검할 수 있습니다.
+헷갈리면 터미널에서 인자 없이 `sudo kpctl install-builder`만 실행합니다. 빌드 서버 주소, SSH 접속 계정(저장한 키와 계정을 보여 줌), 빌드 서비스 계정, 대상 커널, 메모리, ccache, 재설치 여부를 차례로 묻습니다. 그다음 같은 설치를 다시 할 수 있는 명령줄을 보여 주고, 점검 → 설치 확인 → 설치 순서로 진행합니다. 점검에서 접속에 실패하면 그 자리에서 `ssh-key copy`로 키를 등록하고 다시 점검할 수 있습니다. 이 질문에 `N`을 선택하면 점검을 통과한 빌드 서버만 표시됩니다. 목록을 확인하고 Enter를 누르면 해당 서버에 설치합니다.
 
 ```sh
 sudo kpctl install-builder                           # 질문형
@@ -20,7 +20,17 @@ sudo kpctl install-builder build-jammy 5.15.0-160-generic -- --memory-mib 16384 
 
 대상 커널을 생략하면 컨트롤러에 등록된 호스트 중 빌드 서버와 같은 시리즈의 GA 커널을 고릅니다. 등록 호스트가 없으면 커널을 직접 지정해야 합니다. `--` 뒤 값은 `setup-builder.sh` 옵션으로 그대로 전달되며 `--config`·`--ca-file`·`--plan`은 명령이 직접 정합니다. 호스트에 `builder.json`이 이미 있으면 유지하고, 이 컨트롤러 기준으로 새로 만들려면 `-reset-config`를 붙입니다. 계정은 둘 다 고를 수 있습니다. SSH로 접속할 계정은 `-ssh-user`(또는 `user@호스트`)이고, 빌드 서비스를 실행할 계정은 `-build-user`입니다. 빌드 계정을 생략하면 `kpbuild`를 쓰고, 재설치 때는 기존 서비스 계정을 유지합니다. 실행 중인 빌더는 `-stop-running`을 줄 때만 멈추고 다시 설치합니다. 에이전트가 설치된 운영 호스트에는 `-force` 없이 설치하지 않습니다. 호스트별 상세 로그는 `kpctl-install-logs/<호스트>.install-builder.log`에 남습니다.
 
-설치 중 가장 오래 걸리는 단계는 대상 GCC 컴파일러 이미지 빌드입니다. 서명 스냅샷 저장소(snapshot.ubuntu.com)에서 커널 빌드 의존성 수백 MB를 받습니다. 이 저장소는 위치에 따라 매우 느릴 수 있습니다(실측 80 kB/s). 이미지 빌드 제한 시간은 기본 180분입니다. 시간이 넘으면 podman을 SIGTERM으로 멈춰 컨테이너 안의 apt까지 끝내고, 이번 빌드가 남긴 작업 컨테이너를 지운 뒤 마지막 다운로드 속도를 오류에 보여 줍니다. 저장소가 느린 곳에서는 `-- --image-timeout-minutes 360`처럼 늘려 다시 실행합니다. 이미지 빌드 로그는 빌드 서버의 `/var/lib/kpctl-builder/environments/<시리즈>/compiler-*/image-build.log`입니다.
+설치 중에는 먼저 서명 스냅샷에서 대상 GCC 버전의 설치 가능성을 검사합니다. 날짜별 검사 제한은 기본 20분이며 `--snapshot-timeout-minutes`로 조정합니다. 2026-11-25 Resolute 빌더에서는 바이너리 색인 27.3 MB를 받는 데 5분 3초가 걸렸습니다. APT 출력은 빌드 서버의 `/var/lib/kpctl-builder/environments/<시리즈>/compiler-*/snapshot-probe.log`에 바로 기록됩니다.
+
+검사와 이미지 빌드에서 APT는 일시적으로 받지 못한 파일을 최대 네 차례 재시도합니다. 자동 스냅샷 검사에서 재시도 후에도 HTTP 429·500·502·503·504가 남으면 다른 날짜를 확인하고, 두 날짜에서 전송에 실패하면 중단합니다. 색인을 정상적으로 받았지만 GCC 버전이나 의존성이 맞지 않는 경우에는 나머지 후보 날짜를 계속 검사합니다.
+
+스냅샷 서버 장애 중에 이번 설치만 현재 Ubuntu 공식 저장소를 사용해도 된다면 `sudo kpctl install-builder build-noble -- --allow-live-fallback`으로 실행합니다. 자동 검사 또는 첫 이미지 빌드의 APT 다운로드에서 위 HTTP 오류로 재시도를 소진하면 기본 이미지의 서명 저장소에서 동일한 GCC 버전과 의존성을 다시 확인합니다. 이미지 빌드 중 전환하면 앞선 시도의 로그를 보존하고 남은 빌드 시간 안에 새 이미지를 만듭니다. 성공 시 프로파일의 `snapshot_time_basis.kind`에 `live_archive_fallback`을, `unavailable_snapshots`에 실패한 날짜를 기록합니다. 이 옵션은 이후 서비스의 자동 준비 설정에 저장하지 않습니다. 명시한 날짜와 사용자 지정 저장소는 그대로 사용하며 서명·해시 오류가 발생하면 중단합니다.
+
+이어지는 컴파일러 이미지 빌드는 서명 스냅샷 저장소에서 커널 빌드 의존성 수백 MB를 받습니다. 이전 설치에서는 80 kB/s가 관측됐습니다. 기본 제한은 180분이며 진행 상황은 같은 디렉터리의 `image-build.log`에 기록됩니다. 원격 설치 전체가 기본 4시간을 넘을 수 있으면 `sudo kpctl install-builder -timeout 8h build-noble -- --snapshot-timeout-minutes 40 --image-timeout-minutes 360`처럼 조정합니다. 두 단계의 제한은 설치 후 새 GCC 프로파일을 자동으로 준비할 때도 적용됩니다.
+
+설치 로그에 `원격 명령 실패`가 표시되면 바로 뒤의 빌더 출력을 확인합니다. 예를 들어 APT의 503은 패키지 저장소가 보낸 응답입니다. 커널 Git 복제가 도중에 끊기면 재설치 명령을 다시 실행할 수 있습니다. 설치기는 임시 경로에 복제하고 HEAD를 검증한 뒤 최종 경로로 옮깁니다. 기존 경로가 유효한 체크아웃이면 로컬 변경과 함께 재사용합니다. 불완전한 기존 경로가 있으면 그 경로를 표시하고 보존하므로 복구하거나 옮긴 뒤 설치를 재개할 수 있습니다.
+
+설치 후 빌더 서비스가 GCC 프로파일을 자동 준비하다 APT의 일시적인 HTTP 오류로 재시도를 소진하면 작업을 대기열에 돌려보냅니다. 같은 커널·기준 태그의 준비는 30분 뒤 다시 시도합니다. 갱신된 컨트롤러는 그동안 해당 빌더에 다른 작업을 배정할 수 있으며, 다른 빌더도 대기 중인 원래 작업을 가져갈 수 있습니다. 잠금 충돌이나 설정한 최소 디스크 여유 미달로 보류된 작업은 다음 처리 주기에 조건을 다시 확인합니다. 프로파일 준비 또는 컨트롤러의 일시적인 목록 조회 장애로 보류된 수동 수집 요청도 다시 처리합니다. 서명·해시 검증 또는 GCC 버전 확인 실패는 원인을 기록하고 중단합니다.
 
 ## 접속 설정과 직접 설치
 
@@ -43,7 +53,7 @@ sudo kpctl install-builder build-jammy 5.15.0-160-generic -- --memory-mib 16384 
     "profiles_dir": "/var/lib/kpctl-builder/environments/noble",
     "auto_prepare": true,
     "retry_clean": true,
-    "prepare": {"memory_mib": 12288, "pids": 4096, "min_free_gib": 60, "cache_gib": 20, "cache_total_gib": 40, "snapshot": "auto"}
+    "prepare": {"memory_mib": 12288, "pids": 4096, "min_free_gib": 60, "cache_gib": 20, "cache_total_gib": 40, "snapshot": "auto", "snapshot_timeout_minutes": 20, "image_timeout_minutes": 180}
   },
   "cve_feed": {"enabled": false}
 }

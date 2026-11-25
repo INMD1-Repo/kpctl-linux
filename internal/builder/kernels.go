@@ -3,6 +3,7 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"kpctl/internal/client"
 	"kpctl/internal/model"
 )
 
@@ -23,12 +25,37 @@ import (
 // 지금 쓰는 커널 중 이 빌드 서버 시리즈의 GA generic 커널을 모두 대상으로 합니다.
 // 그래서 호스트가 새 커널로 재부팅하면 다음 주기부터 그 커널도 저절로 수집됩니다.
 func (b *Builder) kernels() []KernelConfig {
+	return b.availableKernels(nil)
+}
+
+// When a caller asks for specific kernels, record why any of those must wait.
+func (b *Builder) availableKernels(requested map[string]error) []KernelConfig {
+	hasSpace := func(hosts []model.HostKernel, window kernelRange) bool {
+		ready := b.cleanupForDisk(hosts, window)
+		if !ready && b.diskBlocked {
+			for _, kernel := range b.activeKernels {
+				if _, wanted := requested[kernel]; wanted {
+					requested[kernel] = errDiskSpace
+				}
+			}
+		}
+		return ready
+	}
+	report := func(kernel string, err error) {
+		if errors.Is(err, errBuildDeferred) {
+			if _, wanted := requested[kernel]; wanted {
+				requested[kernel] = err
+			}
+			return
+		}
+		b.reportProblem(kernel, err.Error())
+	}
 	b.activeKernels = nil
 	if !b.cfg.autoKernels() {
 		for _, k := range b.cfg.Kernels {
 			b.activeKernels = append(b.activeKernels, k.Kernel)
 		}
-		if !b.cleanupForDisk(nil, kernelRange{}) {
+		if !hasSpace(nil, kernelRange{}) {
 			return nil
 		}
 		b.maintainSandbox()
@@ -37,7 +64,6 @@ func (b *Builder) kernels() []KernelConfig {
 		}
 		var ready []KernelConfig
 		for _, k := range b.cfg.Kernels {
-			b.profileBusy = false
 			if err := b.prepareConfiguredInputs(k); err != nil {
 				b.reportProblem(k.Kernel, err.Error())
 				log.Printf("[%s] 컨트롤러 입력 준비 실패: %v", k.Kernel, err)
@@ -45,9 +71,7 @@ func (b *Builder) kernels() []KernelConfig {
 			}
 			if b.cfg.Sandbox != nil {
 				if _, err := b.ensureSandboxProfile(k); err != nil {
-					if !b.profileBusy {
-						b.reportProblem(k.Kernel, err.Error())
-					}
+					report(k.Kernel, err)
 					log.Printf("[%s] 격리 환경 준비 필요: %v", k.Kernel, err)
 					continue
 				}
@@ -59,6 +83,11 @@ func (b *Builder) kernels() []KernelConfig {
 	var resp model.HostKernelsResponse
 	if err := b.c.Do("GET", "/api/builder/kernels", nil, &resp); err != nil {
 		log.Printf("호스트 커널 목록 조회 실패: %v", err)
+		if client.Retryable(err) {
+			for kernel := range requested {
+				requested[kernel] = fmt.Errorf("%w: 호스트 커널 목록 조회 실패: %w", errBuildDeferred, err)
+			}
+		}
 		return nil
 	}
 	window, werr := b.kernelWindow()
@@ -80,12 +109,11 @@ func (b *Builder) kernels() []KernelConfig {
 			b.activeKernels = append(b.activeKernels, hk.Kernel)
 		}
 	}
-	if !b.cleanupForDisk(resp.Kernels, window) {
+	if !hasSpace(resp.Kernels, window) {
 		return nil
 	}
 	b.maintainSandbox()
 	for _, hk := range resp.Kernels {
-		b.profileBusy = false
 		if s := model.LTSForKernel(hk.Kernel); s != nil && s.Codename == b.cfg.Series && !model.IsHWESignature(hk.Signature) && werr == nil {
 			if !window.contains(hk.Kernel) {
 				// 디버그 심볼 설치·GCC 프로파일 준비보다 먼저 거릅니다. 수집 문제가 아니므로 자동 배포 보류도 걸지 않습니다.
@@ -97,17 +125,17 @@ func (b *Builder) kernels() []KernelConfig {
 			b.reportOutside(hk.Kernel, "", window.latestTag)
 		}
 		k, skip := b.autoKernel(hk)
-		mine := k.Kernel != "" || skip != "" && model.LTSForKernel(hk.Kernel) != nil &&
+		mine := k.Kernel != "" || skip != nil && model.LTSForKernel(hk.Kernel) != nil &&
 			model.LTSForKernel(hk.Kernel).Codename == b.cfg.Series && !model.IsHWESignature(hk.Signature)
-		if skip != "" {
-			log.Printf("[%s] 자동 수집 대상 아님 (호스트 %d대): %s", hk.Kernel, hk.Hosts, skip)
+		if skip != nil {
+			log.Printf("[%s] 자동 수집 준비 보류 (호스트 %d대): %v", hk.Kernel, hk.Hosts, skip)
 		}
-		if mine && skip != "" && !b.profileBusy {
+		if mine && skip != nil {
 			// 준비 조건이 갖춰져도 이전 시험 빌드 문제가 해결됐다고 볼 수 없습니다.
 			// 문제 해제는 discover 가 실제 수집을 끝까지 검증한 뒤에만 보고합니다.
-			b.reportProblem(hk.Kernel, skip)
+			report(hk.Kernel, skip)
 		}
-		if skip != "" || k.Kernel == "" {
+		if skip != nil || k.Kernel == "" {
 			continue // 수집할 수 없거나, 다른 시리즈 빌드 서버가 맡는 커널
 		}
 		out = append(out, k)
@@ -243,17 +271,17 @@ func recentABIs(kernel, latestTag string, tags []string, n int) (kernelRange, er
 }
 
 // autoKernel 은 호스트 커널 하나의 자동 수집 설정을 만듭니다.
-// 대상이 아니면 이유를 돌려줍니다. 다른 시리즈 커널이면 빈 설정과 "" 를 돌려줍니다.
-func (b *Builder) autoKernel(hk model.HostKernel) (KernelConfig, string) {
+// 준비하지 못한 이유를 돌려줍니다. 다른 시리즈면 빈 설정을 돌려줍니다.
+func (b *Builder) autoKernel(hk model.HostKernel) (KernelConfig, error) {
 	s := model.LTSForKernel(hk.Kernel)
 	if s == nil {
-		return KernelConfig{}, "지원 LTS 의 GA generic 커널이 아님 (필요하면 kernels 에 직접 적으세요)"
+		return KernelConfig{}, errors.New("지원 LTS 의 GA generic 커널이 아님 (필요하면 kernels 에 직접 적으세요)")
 	}
 	if model.IsHWESignature(hk.Signature) {
-		return KernelConfig{}, fmt.Sprintf("HWE 커널 (%s) — 기본 지원 대상이 아님", model.SignatureVersion(hk.Signature))
+		return KernelConfig{}, fmt.Errorf("HWE 커널 (%s) — 기본 지원 대상이 아님", model.SignatureVersion(hk.Signature))
 	}
 	if s.Codename != b.cfg.Series {
-		return KernelConfig{}, ""
+		return KernelConfig{}, nil
 	}
 
 	k := KernelConfig{
@@ -269,49 +297,50 @@ func (b *Builder) autoKernel(hk model.HostKernel) (KernelConfig, string) {
 	}
 
 	if _, err := os.Stat(filepath.Join(k.GitDir, ".git")); err != nil {
-		return KernelConfig{}, fmt.Sprintf("커널 git 이 없음 → git clone https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/%s %s",
+		return KernelConfig{}, fmt.Errorf("커널 git 이 없음 → git clone https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/%s %s",
 			s.Codename, k.GitDir)
 	}
 	if _, err := os.Stat(k.Vmlinux); err != nil || b.cfg.autoControllerInputs() {
 		// 호스트가 오래된 커널을 써도 사람 손 없이 빌드하도록 디버그 심볼을 직접 설치 (kpctl-kernel-debug)
 		if ierr := b.installDebug(hk.Kernel, model.SignatureVersion(hk.Signature)); ierr != nil {
-			return KernelConfig{}, fmt.Sprintf("디버그 심볼 없음 (%s), 자동 설치 실패: %v → 빌드 서버의 kpctl-kernel-debug 도우미·대상 입력 패키지를 확인하세요 (%s)",
+			return KernelConfig{}, fmt.Errorf("디버그 심볼 없음 (%s), 자동 설치 실패: %w → 빌드 서버의 kpctl-kernel-debug 도우미·대상 입력 패키지를 확인하세요 (%s)",
 				k.Vmlinux, ierr, hk.Kernel)
 		}
 		if _, err := os.Stat(k.Vmlinux); err != nil {
-			return KernelConfig{}, fmt.Sprintf("디버그 심볼을 설치했지만 %s 이 없습니다", k.Vmlinux)
+			return KernelConfig{}, fmt.Errorf("디버그 심볼을 설치했지만 %s 이 없습니다", k.Vmlinux)
 		}
 	}
 	// 커널을 빌드한 gcc 와 빌드 서버 gcc 가 다르면 시험 빌드가 모두 실패해서
 	// 멀쩡한 CVE 까지 "라이브패치 불가"로 잘못 분류되므로 미리 막습니다.
 	if b.cfg.Sandbox != nil {
 		if _, err := b.ensureSandboxProfile(k); err != nil {
-			return KernelConfig{}, err.Error()
+			return KernelConfig{}, err
 		}
 	} else if kernelGCC, mine := gccVersions(hk.Kernel); kernelGCC != "" && mine != "" && gccID(kernelGCC) != gccID(mine) {
-		return KernelConfig{}, fmt.Sprintf("이 커널을 빌드한 컴파일러(%s)가 빌드 서버 컴파일러(%s)와 다릅니다 → 같은 gcc 를 설치하거나 호스트를 새 커널로", kernelGCC, mine)
+		return KernelConfig{}, fmt.Errorf("이 커널을 빌드한 컴파일러(%s)가 빌드 서버 컴파일러(%s)와 다릅니다 → 같은 gcc 를 설치하거나 호스트를 새 커널로", kernelGCC, mine)
 	}
-	return k, ""
+	return k, nil
 }
 
 // resolveKernel 은 빌드 작업의 커널 설정을 찾습니다. 자동 모드면 커널 git·기준 태그까지 채워서
 // 소스를 git 에서 꺼낼 수 있게 합니다 (Ubuntu 저장소에는 오래된 커널 소스가 없음).
-func (b *Builder) resolveKernel(kernel string) KernelConfig {
+func (b *Builder) resolveKernel(kernel string) (KernelConfig, error) {
 	k := b.cfg.kernelConfig(kernel)
 	if k.GitDir != "" || !b.cfg.autoKernels() {
-		return k
+		return k, nil
 	}
-	for _, ak := range b.kernels() {
+	deferred := map[string]error{kernel: nil}
+	for _, ak := range b.availableKernels(deferred) {
 		if ak.Kernel == kernel {
 			if ak.BaseTag == "" {
 				if tag, err := resolveBaseTag(ak); err == nil {
 					ak.BaseTag = tag
 				}
 			}
-			return ak
+			return ak, nil
 		}
 	}
-	return k
+	return k, deferred[kernel]
 }
 
 // debugRetry 는 디버그 심볼 자동 설치에 실패한 커널을 다시 시도하기까지 기다리는 시간입니다.

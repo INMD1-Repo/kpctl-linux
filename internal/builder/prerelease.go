@@ -65,7 +65,7 @@ func (b *Builder) discoverPrereleasesAt(now time.Time) bool {
 		next := time.Now().Add(k.Prerelease.interval())
 		if err == nil && more {
 			next = time.Time{} // 시험 한도로 남은 후보는 빌드 작업 사이에서 계속 확인합니다.
-		} else if errors.Is(err, errBuildBusy) {
+		} else if errors.Is(err, errBuildDeferred) {
 			seconds := b.cfg.PollSeconds
 			if seconds <= 0 {
 				seconds = 30

@@ -3,6 +3,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -16,27 +17,58 @@ import (
 
 func TestAutoenrollTargets(t *testing.T) {
 	now := time.Unix(1000, 0)
-	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
-	leases := []dhcp.Lease{
-		{MAC: "aa:01", IP: "10.0.0.10", Name: "new-host", Expires: at(2000)},
-		{MAC: "aa:02", IP: "10.0.0.9", Name: "Registered-Host", Expires: at(2000)},
-		{MAC: "aa:03", IP: "10.0.0.11", Name: "builder-1", Expires: at(2000)},
-		{MAC: "aa:04", IP: "10.0.0.12", Name: "expired", Expires: at(500)},
-		// 같은 MAC 의 옛 임대는 늦게 만료되는 임대에 밀립니다
-		{MAC: "aa:05", IP: "10.0.0.13", Expires: at(1500)},
-		{MAC: "aa:05", IP: "10.0.0.14", Name: "moved", Expires: at(1600)},
-		{MAC: "aa:06", IP: "10.0.0.8", Name: "no-expiry"},
+	dir := t.TempDir()
+	paths := dhcpPaths{leases: filepath.Join(dir, "leases"), hosts: filepath.Join(dir, "hosts")}
+	leases := `2000 00:00:00:00:00:01 10.0.0.10 new-host *
+2000 00:00:00:00:00:02 10.0.0.9 Registered-Host *
+2000 00:00:00:00:00:03 10.0.0.11 builder-1 *
+500 00:00:00:00:00:04 10.0.0.12 expired *
+1500 00:00:00:00:00:05 10.0.0.13 * *
+1600 00:00:00:00:00:05 10.0.0.14 moved *
+0 00:00:00:00:00:06 10.0.0.8 no-expiry *
+2000 00:00:00:00:00:06 10.0.0.15 former-address *
+2000 00:00:00:00:00:07 10.0.0.16 new-reservation *
+2000 00:00:00:00:00:08 10.0.0.17 stale-address *
+`
+	if err := os.WriteFile(paths.leases, []byte(leases), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// 예약한 MAC이 이전 IP를 쓰거나, 예약 IP가 다른 MAC의 임대에 남은 경우.
+	reservations := "00:00:00:00:00:07,10.0.0.20,infinite\n00:00:00:00:00:09,10.0.0.17,2h\n"
+	if err := os.WriteFile(paths.hosts, []byte(reservations), 0600); err != nil {
+		t.Fatal(err)
 	}
 	hosts := []*model.Host{{Hostname: "registered-host"}}
 	ignore := map[string]bool{"builder-1": true}
 
-	var got []string
-	for _, l := range autoenrollTargets(leases, hosts, ignore, now) {
-		got = append(got, l.IP)
+	for _, tc := range []struct {
+		label  string
+		listed []string
+		want   []string
+	}{
+		{"DHCP", nil, []string{"10.0.0.10", "10.0.0.14"}},
+		{"DHCP and host list", []string{"10.0.0.10", "10.0.0.8", "10.0.0.16", "10.0.0.12", "10.0.0.13", "node-03"}, []string{"10.0.0.8", "10.0.0.10", "10.0.0.14", "10.0.0.16", "node-03"}},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			candidates, err := paths.installLeases(tc.listed, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, l := range autoenrollTargets(candidates, hosts, ignore) {
+				got = append(got, l.IP)
+				if l.IP == "10.0.0.16" && l.MAC != "00:00:00:00:00:07" {
+					t.Fatalf("직접 지정한 예약 IP의 MAC = %q", l.MAC)
+				}
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("대상 = %v, 기대 = %v", got, tc.want)
+			}
+		})
 	}
-	want := []string{"10.0.0.8", "10.0.0.10", "10.0.0.14"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("대상 = %v, 기대 = %v", got, want)
+	paths.hosts = dir
+	if _, err := paths.installLeases(nil, now); err == nil {
+		t.Fatal("예약 파일을 읽을 수 없으면 탐색을 중단해야 합니다")
 	}
 }
 
@@ -195,7 +227,7 @@ func TestListedLeasesAndSkipDone(t *testing.T) {
 	}
 	// 이름으로 적은 호스트는 이미 등록돼 있으면 접속 전에 빠짐
 	hosts := []*model.Host{{Hostname: "node-03.mgmt"}, {Hostname: "node-20"}}
-	targets := autoenrollTargets(append(dhcpLeases, got...), hosts, nil, time.Now())
+	targets := autoenrollTargets(append(dhcpLeases, got...), hosts, nil)
 	if len(targets) != 2 {
 		t.Fatalf("대상 = %+v", targets)
 	}

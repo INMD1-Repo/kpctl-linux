@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"kpctl/internal/model"
 )
@@ -99,6 +100,47 @@ func TestStoppedBuilderNeverClaimsMoreWork(t *testing.T) {
 	b.Run(ctx)
 	if !b.stopping() {
 		t.Fatal("cancellation was lost")
+	}
+}
+
+func TestQueuedBuildDefersOnProfileLock(t *testing.T) {
+	b, k, _ := automaticProfileFixture(t)
+	b.cfg.Kernels = []KernelConfig{k}
+	b.cfg.KernelCleanupFreeGiB = -1
+	if err := os.WriteFile(b.cfg.Sandbox.Helper, []byte("#!/bin/sh\nexit 75\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := b.build(model.BuildTask{Job: model.Job{ID: 1, Version: 1, Kernel: k.Kernel}})
+	if result.Success || !result.Deferred || !strings.Contains(result.Error, errBuildBusy.Error()) {
+		t.Fatalf("profile lock did not defer the queued build: %+v", result)
+	}
+	if len(b.nextRequest(time.Now()).DeferredJobIDs) != 0 {
+		t.Fatal("build lock contention inherited the APT cooldown")
+	}
+}
+
+func TestSandboxDiskPressureDefersBuild(t *testing.T) {
+	b, k, outDir := sandboxExecutionFixture(t)
+	script := `#!/usr/bin/env python3
+import json, pathlib, sys
+request = json.loads(pathlib.Path(sys.argv[sys.argv.index('--request') + 1]).read_text())
+result = {'success': False, 'kind': 'disk_space', 'error': '4 GiB free; need 5 GiB'}
+(pathlib.Path(request['out_dir']) / 'environment-result.json').write_text(json.dumps(result))
+sys.exit(1)
+`
+	if err := os.WriteFile(b.cfg.Sandbox.Helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := b.runBuild(k, "isolated_test", outDir, nil)
+	if !errors.Is(err, errDiskSpace) || failureKind(err, "") != model.FailureBusy || !strings.Contains(err.Error(), "4 GiB free") {
+		t.Fatalf("disk shortage was not preserved: %v", err)
+	}
+	if err := os.WriteFile(b.cfg.Sandbox.Helper, []byte("#!/bin/sh\necho 'No space left saving result' >&2\nexit 73\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.runBuild(k, "isolated_test", outDir, nil)
+	if !errors.Is(err, errDiskSpace) || !strings.Contains(err.Error(), "No space left saving result") {
+		t.Fatalf("lost disk deferral when helper could not write its result: %v", err)
 	}
 }
 
@@ -281,5 +323,12 @@ func TestGracefulStopPublishesFinishedTrialWithoutClaimingWholeTag(t *testing.T)
 	}
 	if b.BuildNext() {
 		t.Fatal("stopped builder claimed another job")
+	}
+}
+
+// 기준 빌드와 실제 빌드가 각각 제한 시간을 쓰므로, 바깥 안전장치가 그 전에 도우미를 끊으면 안 됩니다.
+func TestSandboxTimeoutCoversBaselineAndBuild(t *testing.T) {
+	if got := sandboxTimeout(180); got < 2*180*time.Minute {
+		t.Fatalf("sandboxTimeout(180) = %v", got)
 	}
 }

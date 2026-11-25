@@ -1,25 +1,29 @@
 #!/bin/bash
 # 컨트롤러 서버 구축 (Ubuntu, root 로 실행, make dist 결과의 dist/controller 디렉터리에서)
 #
-#   sudo ./setup-controller.sh -n kpatch.internal -i 10.0.0.5
+#   sudo ./setup-controller.sh                  인자 없이 터미널에서 실행 = 질문형 (NIC·IP·범위 기본값 제안)
+#   sudo ./setup-controller.sh -N eth1          관리망 NIC 만 주면 IP·DHCP 범위·이름을 그 NIC 에서 계산
+#   sudo ./setup-controller.sh -n kpatch.internal -i 10.0.0.5   (관리망 DHCP 없이)
 #
-#   -n 이름   호스트들이 컨트롤러에 접속할 DNS 이름 (TLS 인증서에 들어감, 필수)
-#   -i IP     컨트롤러 IP (인증서에 추가 + SSH 키를 이 IP 에서만 쓰게 제한)
+#   -n 이름   호스트들이 컨트롤러에 접속할 DNS 이름 (TLS 인증서에 들어감. -N 이면 기본 ctl.<도메인>)
+#   -i IP     컨트롤러 IP (인증서에 추가 + SSH 키를 이 IP 에서만 쓰게 제한. -N 이면 기본 그 NIC 의 IP)
 #   -u 사용자 호스트에 SSH 로 접속할 사용자 (기본 root)
 #   -p 포트   컨트롤러 포트 (기본 8443)
 #   -S        서비스를 시작하지 않음
 #   -k 파일   미리 준비한 클라이언트(호스트) 개인키. 주면 새로 만들지 않고 이 키를 설치용 키로 쓰고,
 #             이 키로 들어가지는 미등록 호스트에 질문 없이 에이전트를 자동 설치합니다 (kpctl-autoenroll.timer).
-#             대상: 관리망 DHCP(-N) 임대 + /etc/kpctl/autoenroll-hosts 에 적은 호스트
+#             대상: 관리망 DHCP(-N) 동적 임대 + /etc/kpctl/autoenroll-hosts 에 적은 호스트
 #   -b 파일   빌드 서버 개인키 (여러 번 가능). /etc/kpctl/ssh/keys 에 빌드 서버 전용으로 저장
 #             (install-builder 만 사용. 자동 설치·kpctl install 은 이 키로 들어가지 않음)
 #   -y        묻지 않음 (-k 가 없으면 키를 새로 만듦)
+#   -D        계산한 설정만 보여 주고 아무것도 바꾸지 않음
 #   (-k, -b, -y 를 안 주고 터미널에서 실행하면 미리 준비한 키가 있는지 물어봅니다)
 #
 # 관리망 DHCP + DNS (선택, dnsmasq):
 #   -N NIC    관리망 NIC 이름 (이 NIC 에만 DHCP/DNS 를 냄. 이 NIC 에 -i 의 고정 IP 가 있어야 함)
 #   -r 범위   동적 IP 범위 "시작,끝"  예: 10.0.0.100,10.0.0.250
-#   -d 도메인 관리망 DNS 도메인 (기본: -n 에서 첫 칸을 뺀 것. 예: -n ctl.mgmt.internal → mgmt.internal)
+#             (기본: NIC 의 /24 에서 .100~.250, 컨트롤러 IP 가 그 안이면 .20~.99. /24 보다 좁은 망은 직접 지정)
+#   -d 도메인 관리망 DNS 도메인 (기본: -n 에서 첫 칸을 뺀 것, -n 도 없으면 mgmt.internal)
 #   -l 시간   동적 임대 시간 (기본 24h. 고정 예약한 호스트는 무기한)
 #
 #   예) sudo ./setup-controller.sh -n ctl.mgmt.internal -i 10.0.0.1 -u ops -N eno2 -r 10.0.0.100,10.0.0.250
@@ -37,18 +41,108 @@ set -euo pipefail
 
 NAME="" IP="" SSH_USER="root" PORT=8443 START=1
 NIC="" RANGE="" DOMAIN="" LEASE=24h
-CLIENT_KEY="" BUILDER_KEYS=() ASK=1 USER_GIVEN=0
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
-while getopts "n:i:u:p:Sk:b:yN:r:d:l:h" o; do
+CLIENT_KEY="" BUILDER_KEYS=() ASK=1 USER_GIVEN=0 DRY=0
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+while getopts "n:i:u:p:Sk:b:yN:r:d:l:Dh" o; do
   case "$o" in
     n) NAME="$OPTARG" ;; i) IP="$OPTARG" ;; u) SSH_USER="$OPTARG"; USER_GIVEN=1 ;;
     p) PORT="$OPTARG" ;; S) START=0 ;;
     k) CLIENT_KEY="$OPTARG"; ASK=0 ;; b) BUILDER_KEYS+=("$OPTARG"); ASK=0 ;; y) ASK=0 ;;
-    N) NIC="$OPTARG" ;; r) RANGE="$OPTARG" ;; d) DOMAIN="$OPTARG" ;; l) LEASE="$OPTARG" ;;
+    N) NIC="$OPTARG" ;; r) RANGE="$OPTARG" ;; d) DOMAIN="$OPTARG" ;; l) LEASE="$OPTARG" ;; D) DRY=1 ;;
     *) usage ;;
   esac
 done
+
+# ── 관리망 NIC 에서 기본값 계산 ──
+# nic_cidr NIC: 그 NIC 의 IPv4 "주소/길이" 하나 (여러 개면 첫 번째)
+nic_cidr() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4; exit}'; }
+# default_range 주소/길이: /24 안에서 .100~.250 (컨트롤러 IP 가 그 안이면 .20~.99). /24 보다 좁으면 빈 값
+default_range() {
+  local ip=${1%/*} len=${1#*/} net d
+  [[ "$ip" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)$ ]] || return 0
+  [ "$len" -le 24 ] || return 0
+  net=${BASH_REMATCH[1]} d=${BASH_REMATCH[2]}
+  if [ "$d" -ge 100 ] && [ "$d" -le 250 ]; then echo "$net.20,$net.99"; else echo "$net.100,$net.250"; fi
+}
+# 관리망 후보: 기본 경로가 아니고, 사설 IPv4 를 가진 NIC (lo·/32 터널 제외)
+mgmt_candidates() {
+  local def; def=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+  ip -4 -o addr show 2>/dev/null | awk -v def="$def" '$2 != "lo" && $2 != def && $4 !~ /\/32$/ &&
+    ($4 ~ /^10\./ || $4 ~ /^192\.168\./ || $4 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./) {print $2, $4}'
+}
+fill_from_nic() {   # -N 만 주면 나머지를 채움 (직접 준 값은 그대로)
+  local cidr; cidr=$(nic_cidr "$NIC")
+  [ -n "$cidr" ] || return 0      # 아래 검사가 "NIC 이 없습니다 / IP 가 없습니다" 로 알려 줌
+  [ -n "$IP" ] || IP=${cidr%/*}
+  [ -n "$RANGE" ] || RANGE=$(default_range "$cidr")
+  if [ -z "$NAME" ]; then DOMAIN="${DOMAIN:-mgmt.internal}"; NAME="ctl.$DOMAIN"; fi
+}
+
+# 이미 설치한 컨트롤러를 다시 실행하면 이름·IP 는 지난번 값을 씁니다 (TLS 인증서·호스트 설정과 어긋나지 않게).
+PREV_ENV=${KPCTL_SETUP_PREVIOUS_ENV:-/etc/kpctl/kpctl.env}
+if [ -z "$NAME" ] && [ -r "$PREV_ENV" ]; then
+  prev_url=$(sed -n 's/^KPCTL_URL=//p' "$PREV_ENV" | tail -1)
+  prev_host=${prev_url#https://}; prev_host=${prev_host%%[:/]*}
+  if [ -n "$prev_host" ]; then
+    NAME=$prev_host
+    [ -n "$IP" ] || IP=$(sed -n 's/^KPCTL_SSH_FROM=//p' "$PREV_ENV" | tail -1)
+    prev_user=$(sed -n 's/^KPCTL_SSH_USER=//p' "$PREV_ENV" | tail -1)
+    if [ "$USER_GIVEN" = 0 ] && [ -n "$prev_user" ]; then SSH_USER=$prev_user; USER_GIVEN=1; fi
+    echo "  지난 설치의 이름·IP 사용: $NAME ${IP:-} ($PREV_ENV. 바꾸려면 -n/-i)"
+  fi
+fi
+
+# 인자 없이 터미널에서 실행: 질문형. 끝에 같은 일을 하는 한 줄 명령을 보여 주고 확인받음
+if [ -z "$NAME" ] && [ -z "$NIC" ] && [ -t 0 ] && [ -t 1 ]; then
+  command -v ip >/dev/null || { echo "ip 명령이 필요합니다 (apt install iproute2)"; exit 1; }
+  echo "■ 질문형 설치 (엔터 = [ ] 안의 기본값, 인자 설명: $0 -h)"
+  echo "  이 서버의 IPv4 NIC:"
+  ip -4 -o addr show | awk '$2 != "lo" {printf "    %-12s %s\n", $2, $4}'
+  cand=$(mgmt_candidates)
+  def_nic=""; [ "$(printf '%s\n' "$cand" | grep -c .)" = 1 ] && def_nic=${cand%% *}
+  echo "  관리망 DHCP 는 호스트들이 연결된 관리망 NIC 하나에만 냅니다. 서비스망 NIC 를 고르면 그 망에 DHCP 가 나가니 주의하세요."
+  read -r -p "  관리망 NIC (없음 = DHCP 를 쓰지 않음) [${def_nic:-없음}]: " a
+  a=${a:-$def_nic}; [ "$a" = "없음" ] && a=""
+  NIC=$a
+  if [ -n "$NIC" ]; then
+    cidr=$(nic_cidr "$NIC"); [ -n "$cidr" ] || { echo "NIC $NIC 에 IPv4 주소가 없습니다"; exit 1; }
+    read -r -p "  관리망 도메인 [mgmt.internal]: " a; DOMAIN=${a:-mgmt.internal}
+    read -r -p "  컨트롤러 이름 [ctl.$DOMAIN]: " a; NAME=${a:-ctl.$DOMAIN}
+    read -r -p "  컨트롤러 IP [${cidr%/*}]: " a; IP=${a:-${cidr%/*}}
+    r=$(default_range "$cidr")
+    while :; do
+      read -r -p "  DHCP 동적 범위 시작,끝 [${r:-직접 입력}]: " a; RANGE=${a:-$r}
+      [ -n "$RANGE" ] && break
+    done
+  else
+    src=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+    read -r -p "  컨트롤러 IP (호스트가 접속할 주소) [${src:-직접 입력}]: " a; IP=${a:-$src}
+    h=$(hostname -f 2>/dev/null || hostname)
+    read -r -p "  컨트롤러 이름 (호스트에서 풀리는 DNS 이름) [$h]: " a; NAME=${a:-$h}
+  fi
+  if [ "$USER_GIVEN" = 0 ]; then
+    read -r -p "  호스트에 SSH 로 접속할 계정 [$SSH_USER]: " a; SSH_USER=${a:-$SSH_USER}; USER_GIVEN=1
+  fi
+  cmd="$0"; [ -n "$NIC" ] && cmd="$cmd -N $NIC -r $RANGE -d $DOMAIN"
+  cmd="$cmd -n $NAME"; [ -n "$IP" ] && cmd="$cmd -i $IP"; [ "$SSH_USER" = root ] || cmd="$cmd -u $SSH_USER"
+  echo "  같은 설치를 다시 할 때:  sudo $cmd"
+  read -r -p "  이대로 설치할까요? [y/N]: " a
+  case "$a" in y|Y|yes) ;; *) echo "취소했습니다"; exit 1 ;; esac
+fi
+[ -z "$NIC" ] || fill_from_nic
 [ -n "$NAME" ] || usage
+if [ "$DRY" = 1 ]; then
+  echo "계산한 설정 (-D: 아무것도 바꾸지 않음)"
+  echo "  이름 $NAME · IP ${IP:-없음} · 포트 $PORT · SSH 계정 $SSH_USER"
+  if [ -s /etc/kpctl/dnsmasq.conf ]; then
+    echo "  관리망 DHCP: 기존 /etc/kpctl/dnsmasq.conf 그대로 ($(grep -E '^(interface|dhcp-range)=' /etc/kpctl/dnsmasq.conf | tr '\n' ' '))"
+  elif [ -n "$NIC" ]; then echo "  관리망 DHCP: NIC $NIC · 범위 ${RANGE:-(계산 못 함: -r 필요)} · 도메인 ${DOMAIN:-${NAME#*.}} · 임대 $LEASE"
+  else echo "  관리망 DHCP: 쓰지 않음"; fi
+  if [ -n "$NIC" ] || [ -n "$CLIENT_KEY" ]; then echo "  자동 설치(kpctl-autoenroll.timer): 켬"
+  elif systemctl is-enabled --quiet kpctl-autoenroll.timer 2>/dev/null; then echo "  자동 설치(kpctl-autoenroll.timer): 이미 켜져 있음 (그대로)"
+  else echo "  자동 설치(kpctl-autoenroll.timer): 끔 (-N 또는 -k 로 켬)"; fi
+  exit 0
+fi
 [ "$(id -u)" = 0 ] || { echo "root 로 실행하세요"; exit 1; }
 valid_ip() {  # IPv4 (각 칸 0~255) 또는 IPv6 (':' 포함, 16진수)
   if [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
@@ -61,7 +155,8 @@ valid_ip() {  # IPv4 (각 칸 0~255) 또는 IPv6 (':' 포함, 16진수)
 
 # 관리망 DHCP 옵션 검사 (뭔가 바꾸기 전에)
 if [ -n "$NIC" ]; then
-  [ -n "$IP" ] && [ -n "$RANGE" ] || { echo "-N 을 쓰려면 -i (컨트롤러 관리망 IP) 와 -r (범위) 가 필요합니다"; exit 1; }
+  [ -n "$IP" ] || { echo "NIC $NIC 에 IPv4 주소가 없습니다. 관리망 NIC 에 고정 IP 를 먼저 설정하세요 (netplan) 또는 -i 로 지정"; exit 1; }
+  [ -n "$RANGE" ] || { echo "NIC $NIC 의 망이 /24 보다 좁아 DHCP 범위를 정하지 못했습니다. -r 시작IP,끝IP 로 지정하세요"; exit 1; }
   [[ "$RANGE" =~ ^[0-9.]+,[0-9.]+$ ]] || { echo "-r 형식: 시작IP,끝IP  예: 10.0.0.100,10.0.0.250"; exit 1; }
   DOMAIN="${DOMAIN:-${NAME#*.}}"
   case "$DOMAIN" in *.*) ;; *) echo "관리망 도메인 '$DOMAIN' 은 점이 하나 이상 있어야 합니다. 예: -n ctl.mgmt.internal 또는 -d mgmt.internal"; exit 1 ;; esac
@@ -421,21 +516,31 @@ if [ -n "$NIC" ]; then cat <<EOF
 
 EOF
 fi
+if [ $START = 0 ]; then
+  AUTO="서비스를 시작하지 않았습니다 (-S). systemctl enable --now kpctl-controller 뒤에 자동 설치 타이머도 켜세요"
+elif { [ -n "$NIC" ] || [ -n "$CLIENT_KEY" ]; } || systemctl is-enabled --quiet kpctl-autoenroll.timer 2>/dev/null; then
+  AUTO="켜짐: 이 키로 들어가지는 미등록 호스트에 1분 안에 질문 없이 설치합니다"
+else
+  AUTO="꺼짐 (관리망 DHCP -N 이나 미리 준비한 키 -k 로 다시 실행하면 켜짐. 직접: systemctl enable --now kpctl-autoenroll.timer)"
+fi
 cat <<EOF
 다음 단계:
-  0) (DHCP 사용 시) 호스트가 IP 를 받으면 고정:  sudo kpctl dhcp leases → sudo kpctl dhcp reserve -all
-  1) 호스트에 SSH 공개키 등록 (지금 쓰는 계정/비밀번호로 한 번만. 미리 준비한 키를 썼다면 이미 들어 있는 호스트는 생략)
-       sudo kpctl ssh-key copy server-01 server-02 ...
-       sudo kpctl ssh-key copy root server-01 server-02 ...   (첫 인자로 계정 지정)
-     또는 cloud-init / 기존 자동화로 위 "SSH 공개키" 줄을 ~$SSH_USER/.ssh/authorized_keys 에 추가
-  자동 설치: 클라이언트 키(-k)를 줬거나 관리망 DHCP(-N)를 쓰면, 클라이언트 키로 들어가지는 미등록 호스트에
-     1분 안에 질문 없이 설치됩니다. DHCP 를 안 쓰면 대상 호스트를 $ETC/autoenroll-hosts 에 한 줄씩 적으세요.
+  자동 설치         $AUTO
+  1) 호스트에 위 "SSH 공개키" 줄을 넣습니다 (~$SSH_USER/.ssh/authorized_keys). 넣는 방법 중 하나:
+       새 VM (cloud-init)  sudo kpctl ssh-key show -cloud-init > kpctl-client.yaml   → VM 의 user-data 로 사용
+                           (등록 토큰은 들어 있지 않아 VM 템플릿에 넣어 둬도 됩니다)
+       이미 있는 호스트     sudo kpctl ssh-key copy server-01 server-02 ...   (지금 쓰는 계정/비밀번호로 한 번만)
+       그 밖의 자동화       sudo kpctl ssh-key show   (authorized_keys 에 넣을 한 줄)
+     관리망 DHCP에서 동적 IP를 받은 호스트는 SSH 키로 접속할 수 있으면 자동 설치 대상입니다.
+     DHCP 를 안 쓰면 대상 호스트를 $ETC/autoenroll-hosts 에 한 줄씩 적습니다.
        sudo kpctl autoenroll -dry-run      (대상·키 확인만)
+       sudo kpctl hosts                    (등록된 호스트)
+       sudo kpctl dhcp reserve server-01   (등록을 마친 호스트의 IP 고정)
   2) 수동 점검 → 설치 (헷갈리면 인자 없이 sudo kpctl install → 질문형)
        sudo kpctl install -check -hosts-file hosts.txt
        sudo kpctl install -group canary server-01
        sudo kpctl install -group server -hosts-file hosts.txt
-     (DHCP 사용 시 -hosts-file 대신 -from-dhcp: 관리망에서 IP 를 받았지만 아직 등록 안 된 호스트 전부)
+     (관리망 DHCP에서 동적 IP를 받은 미등록 호스트를 찾으려면 -from-dhcp)
   3) 빌드 서버 설치 (대상 LTS 와 같은 Ubuntu 서버)
        sudo kpctl install-builder                         (질문형: 하나씩 묻고 점검 후 설치)
        sudo kpctl install-builder -check build-noble

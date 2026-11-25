@@ -247,6 +247,11 @@ func cmdInstall(c *client.Client, args []string) error {
 	if wantsWizard(args) { // 터미널에서 인자 없이 실행 → 질문형 (wizard.go)
 		return agentWizard(c)
 	}
+	_, err := runAgentInstall(c, args)
+	return err
+}
+
+func runAgentInstall(c *client.Client, args []string) ([]hostResult, error) {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprintln(os.Stderr, installUsage); fs.PrintDefaults() }
 	r := addRemoteFlags(fs)
@@ -258,14 +263,14 @@ func cmdInstall(c *client.Client, args []string) error {
 	checkOnly := fs.Bool("check", false, "사전 점검만 하고 아무것도 바꾸지 않음")
 	force := fs.Bool("force", false, "점검에서 문제가 나와도 설치 진행 (원인을 알 때만)")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return nil, err
 	}
 	if ok, err := r.loadDHCPTargets(c, fs); !ok {
-		return err
+		return nil, err
 	}
 	targets, bundle, err := r.prepare(fs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var token string
@@ -278,18 +283,18 @@ func cmdInstall(c *client.Client, args []string) error {
 			*tokenFile = filepath.Join(dir, "enroll-"+*group+".token")
 		}
 		if *tokenFile == "" {
-			return fmt.Errorf("-group 또는 -enroll-token-file 이 필요합니다 (점검만 하려면 -check)")
+			return nil, fmt.Errorf("-group 또는 -enroll-token-file 이 필요합니다 (점검만 하려면 -check)")
 		}
 		if err := checkReadable(*tokenFile, "등록 토큰"); err != nil {
-			return err
+			return nil, err
 		}
 		data, err := os.ReadFile(*tokenFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		token = strings.TrimSpace(string(data))
 		if len(token) < 16 {
-			return fmt.Errorf("등록 토큰이 너무 짧습니다 (%s)", *tokenFile)
+			return nil, fmt.Errorf("등록 토큰이 너무 짧습니다 (%s)", *tokenFile)
 		}
 	}
 
@@ -345,7 +350,7 @@ func cmdInstall(c *client.Client, args []string) error {
 		res.note = fmt.Sprintf("%s, 링 %d, 정책 %s", h.ID, h.Ring, h.RebootPolicy)
 		return res
 	})
-	return printResults(results, r.logDir)
+	return results, printResults(results, r.logDir)
 }
 
 // waitRegistered 는 호스트가 컨트롤러에 등록되어 최근에 보고했는지 확인합니다.

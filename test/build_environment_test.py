@@ -1,5 +1,8 @@
 import contextlib
 import concurrent.futures
+import errno
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import io
 import json
@@ -38,43 +41,64 @@ class DisposableBuildEnvironment(unittest.TestCase):
             mocked.start()
             self.addCleanup(mocked.stop)
 
-    def test_image_build_timeout_terminates_and_removes_build_container(self):
-        # SIGTERM 을 받으면 적어 두고 끝나는 가짜 podman build
+    def test_image_build_timeout_terminates_its_process_group(self):
         with tempfile.TemporaryDirectory() as tmp:
-            marker = Path(tmp) / "term"
-            script = (
-                "import signal, sys, time\n"
-                "def stop(*_):\n"
-                "    open(sys.argv[1], 'w').close(); sys.exit(143)\n"
-                "signal.signal(signal.SIGTERM, stop)\n"
-                "time.sleep(30)\n"
-            )
-            seen = iter([{"old"}, {"old", "build"}])
-            removed = []
-            real_run = subprocess.run
+            script = """
+import os, signal, sys, time
+from pathlib import Path
 
-            def fake_run(args, **kwargs):
-                if args[:2] == ["podman", "rm"]:
-                    removed.append(args[-1])
-                    return subprocess.CompletedProcess(args, 0)
-                return real_run(args, **kwargs)
+child = os.fork()
+def stop(*_):
+    if child:
+        os.waitpid(child, 0)
+    (Path(sys.argv[1]) / ("parent" if child else "child")).touch()
+    sys.exit(0)
 
-            with patch.object(
-                env, "external_containers", side_effect=lambda: next(seen)
-            ), patch.object(env.subprocess, "run", side_effect=fake_run), open(
-                os.devnull, "w"
-            ) as log:
+signal.signal(signal.SIGTERM, stop)
+time.sleep(5)
+"""
+            with patch.object(env.subprocess, "run") as other_command, open(os.devnull, "w") as log:
                 with self.assertRaises(subprocess.TimeoutExpired):
-                    env.run_podman_build(
-                        [sys.executable, "-c", script, str(marker)], log, 0.5
-                    )
-            self.assertTrue(marker.exists(), "podman build 는 SIGTERM 으로 멈춰야 함")
-            self.assertEqual(removed, ["build"])
+                    env.run_podman_build([sys.executable, "-c", script, tmp], log, 0.5)
+            self.assertEqual({entry.name for entry in Path(tmp).iterdir()}, {"parent", "child"})
+            other_command.assert_not_called()
+
+    def test_image_build_interrupt_keeps_original_error_when_cleanup_fails(self):
+        for error, grace in (
+            (env.BuildCancelled("build cancelled"), 20),
+            (KeyboardInterrupt(), 20),
+            (subprocess.TimeoutExpired(["podman", "build"], 60), 120),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(env.subprocess, "Popen") as spawn,
+                patch.object(env, "stop_podman_build", side_effect=OSError("signal failed")) as stop,
+                contextlib.redirect_stderr(io.StringIO()) as diagnostics,
+            ):
+                spawn.return_value.wait.side_effect = error
+                with self.assertRaises(type(error)) as caught:
+                    env.run_podman_build(["podman", "build"], None, 60)
+                self.assertIs(caught.exception, error)
+                self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+                stop.assert_called_once_with(spawn.return_value, grace)
+                self.assertIn("signal failed", diagnostics.getvalue())
+
+    def test_image_build_unresponsive_to_sigterm_is_killed_and_reaped(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(30)",
+        ]
+        with subprocess.Popen(command, start_new_session=True, stdout=subprocess.PIPE) as process:
+            self.assertEqual(process.stdout.readline(), b"ready\n")
+            with contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+                env.stop_podman_build(process, grace=0)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+            self.assertIn("SIGTERM", diagnostics.getvalue())
 
     def test_image_build_failure_keeps_exit_code(self):
-        with patch.object(env, "external_containers", return_value=set()), open(
-            os.devnull, "w"
-        ) as log:
+        with open(os.devnull, "w") as log:
             with self.assertRaises(subprocess.CalledProcessError) as caught:
                 env.run_podman_build([sys.executable, "-c", "exit(3)"], log, 10)
         self.assertEqual(caught.exception.returncode, 3)
@@ -347,6 +371,39 @@ class DisposableBuildEnvironment(unittest.TestCase):
             "timeout_minutes": 1,
         }
 
+    def test_disk_shortage_defers_preflight_warmup_and_build(self):
+        for stage in ("preflight", "warmup", "build"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                req = self.request(root)
+                req["boot_dir"] = str(root)
+                (root / ("config-" + req["kernel"]["kernel"])).write_text("CONFIG_LIVEPATCH=y\n")
+                args = SimpleNamespace(worker=root / "worker", retry_clean=True)
+                args.worker.write_text("worker")
+                profile = {
+                    "image": "image",
+                    "packages_sha256": "p",
+                    "recipe_sha256": "r",
+                    "cache": {"max_gib": 1 if stage == "warmup" else 0},
+                }
+                out = Path(req["out_dir"])
+                out.mkdir()
+                shortage = env.DiskSpaceError("4 GiB free; need 5 GiB")
+                with patch.object(env, "require_space", side_effect=shortage if stage == "preflight" else None), patch.object(
+                    env, "container_args", return_value=[]
+                ), patch.object(env, "run_limited", side_effect=shortage) as run:
+                    status = env.run_locked(args, root / "profile.json", profile, req, out, {})
+                self.assertEqual(status, 1)
+                self.assertEqual(run.call_count, 0 if stage == "preflight" else 1)
+                result = json.loads((out / "environment-result.json").read_text())
+                self.assertEqual(result["kind"], "disk_space")
+                self.assertEqual(result["error"], str(shortage))
+                self.assertFalse(result["success"])
+                self.assertFalse(list(out.glob("*.ko")))
+                self.assertFalse(list((root / "runs").iterdir()))
+                if stage == "warmup":
+                    self.assertFalse(any(path.is_dir() for path in (root / "cache").iterdir()))
+
     def test_exactly_one_retry_same_image_and_fresh_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -404,6 +461,58 @@ class DisposableBuildEnvironment(unittest.TestCase):
             result = json.loads((root / "out/environment-result.json").read_text())
             self.assertFalse(result["success"])
             self.assertIn('"attempt": 2', result["log"])
+
+    def run_with_clock(self, cache_info, baseline_seconds):
+        """기준 빌드가 baseline_seconds 를 쓴 뒤 실제 빌드가 받는 제한 시간을 돌려줍니다 (가짜 시계)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "worker").write_bytes(b"worker")
+            request = root / "request.json"
+            req = self.request(root)
+            req["timeout_minutes"] = 180
+            request.write_text(json.dumps(req))
+            profile = {"image": "sha256:" + "c" * 64, "packages_sha256": "p", "recipe_sha256": "r"}
+            clock = [1000.0]
+            given = []
+
+            def prepare(args, path, profile, req, state, deadline, logs):
+                given.append(deadline - clock[0])
+                clock[0] += baseline_seconds
+                return Path("/sealed"), cache_info
+
+            def attempt(req, profile, worker, work, timeout, cache=None):
+                given.append(timeout)
+                return {"success": False, "kind": "build", "error": "x", "log": ""}, None
+
+            args = SimpleNamespace(profile=str(root / "profile.json"), request=str(request),
+                                   worker=str(root / "worker"), retry_clean=False)
+            with patch.object(env, "engine"), patch.object(
+                env, "load_profile", return_value=(root / "profile.json", profile)
+            ), patch.object(env, "prepare_cache", side_effect=prepare), patch.object(
+                env, "attempt", side_effect=attempt
+            ), patch.object(env.time, "monotonic", side_effect=lambda: clock[0]), contextlib.redirect_stdout(io.StringIO()):
+                env.run_build(args)
+            return given
+
+    def test_cold_baseline_does_not_eat_the_build_time_limit(self):
+        # 실제 환경: 기준 빌드 2시간 6분 뒤 klp-build 가 남은 54분 안에 못 끝나 취소됐습니다.
+        baseline, build = self.run_with_clock({"key": "k", "warmup": True}, 126 * 60)
+        self.assertEqual(baseline, 180 * 60)
+        self.assertEqual(build, 180 * 60)
+
+    def test_reused_cache_keeps_one_shared_limit(self):
+        # 이미 봉인된 캐시를 쓰는 경우(기준 빌드 없음)는 제한을 다시 주지 않습니다.
+        _, build = self.run_with_clock({"key": "k", "warmup": False}, 60)
+        self.assertEqual(build, 180 * 60 - 60)
+
+    def test_stale_container_removal_waits_long_enough(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "container-name").write_text("kpctl-build-" + "a" * 32)
+            with patch.object(env.subprocess, "run") as run:
+                env.cleanup_container(root)
+            self.assertGreaterEqual(run.call_args.kwargs["timeout"], 600)
+            self.assertFalse((root / "container-name").exists())
 
     def test_content_failure_does_not_reinstall_packages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1074,7 +1183,343 @@ class CacheObservability(unittest.TestCase):
                 env.verify_cache(entry, 8192, full=True)
 
 
+class ArchiveAcquisition(unittest.TestCase):
+    fetch_error = "E: Failed to fetch https://snapshot.ubuntu.com/ubuntu/pool/p.deb  503  Service Unavailable"
+    fetch_summary = "E: Unable to fetch some archives, maybe run apt update or try with --fix-missing?"
+
+    def test_cancelled_snapshot_indexes_need_confirmed_outage_on_their_own_origin(self):
+        uri = "https://snapshot.ubuntu.com/ubuntu/20261120T122658Z"
+        err = f"Err:17 {uri} resolute-security/main amd64 Packages\n"
+        blank = f"E: Failed to fetch {uri}/dists/resolute-security/main/binary-amd64/Packages  \n"
+        outage = f"E: Failed to fetch {uri}/dists/resolute/multiverse/source/Sources  503  Service Unavailable\n"
+        summary = "E: Some index files failed to download. They have been ignored, or old ones used instead."
+        self.assertTrue(env.transient_archive_failure(err + blank + blank.replace("/main/", "/universe/")
+                                                     + outage + summary))
+        self.assertTrue(env.transient_archive_failure(blank.replace(".com/", ".com:443/") + outage))
+        for other_origin in ("https://example.com", "http://snapshot.ubuntu.com", "https://snapshot.ubuntu.com:444"):
+            with self.subTest(other_origin=other_origin):
+                self.assertFalse(env.transient_archive_failure(blank.replace("https://snapshot.ubuntu.com", other_origin) + outage))
+                self.assertFalse(env.transient_archive_failure(err.replace("https://snapshot.ubuntu.com", other_origin) + blank + outage))
+        self.assertFalse(env.transient_archive_failure(err + blank + summary))
+        for detail in ("Hash Sum mismatch", "The following signatures were invalid: BADSIG", "404  Not Found",
+                       "Certificate verification failed", "Connection timed out"):
+            with self.subTest(detail=detail):
+                self.assertFalse(env.transient_archive_failure(err + "  " + detail + "\n" + blank + outage))
+                self.assertFalse(env.transient_archive_failure(blank + "  " + detail + "\n" + outage))
+        # APT may try another encoding that returns 404 before a status-bearing final error.
+        self.assertTrue(env.transient_archive_failure(err + "  404  NOT FOUND [IP: 192.0.2.12 443]\n" + outage))
+        self.assertFalse(env.transient_archive_failure(err + "  Hash Sum mismatch\n" + outage))
+
+    def test_only_failing_apt_download_in_image_can_switch_archives(self):
+        output = f"KPCTL_IMAGE_APT_BEGIN\n{self.fetch_error}\n{self.fetch_summary}\n"
+        self.assertIn("503", env.image_archive_error(output + "KPCTL_IMAGE_APT_FAILED 100\n"))
+        for ending in (
+            "error building kpatch", "KPCTL_IMAGE_APT_FAILED 1",
+            "E: Failed to fetch https://mirror/pkg  Hash Sum mismatch\nKPCTL_IMAGE_APT_FAILED 100",
+            "E: The repository is not signed.\nKPCTL_IMAGE_APT_FAILED 100",
+            "dpkg: error processing package p\nKPCTL_IMAGE_APT_FAILED 100",
+        ):
+            with self.subTest(ending=ending):
+                self.assertFalse(env.image_archive_error(output + ending))
+
+        def interrupted(argv, log, timeout):
+            log.write(output + "KPCTL_IMAGE_APT_FAILED 100\n")
+            raise subprocess.CalledProcessError(125, argv)
+
+        locked = dict(base="ubuntu", compiler_package="gcc-15=1", cxx_package="g++-15=1",
+                      snapshot_id="20261120T122658Z")
+        with tempfile.TemporaryDirectory() as directory, patch.object(env, "run_podman_build", side_effect=interrupted):
+            with self.assertRaises(subprocess.CalledProcessError):
+                env.build_image(Path(directory), locked, True)
+
+    def test_initial_image_503_rechecks_pins_and_shares_image_deadline(self):
+        snapshot = "20261120T122658Z"
+        gcc, cxx = "gcc-15=15.2.0-16ubuntu1", "g++-15=15.2.0-16ubuntu1"
+        settings = {
+            "base": "ubuntu@sha256:" + "a" * 64, "compiler_identity": "(Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+            "compiler_package": gcc, "cxx_package": cxx,
+            "snapshot_id": snapshot, "snapshot_time_basis": {"kind": "kernel_package_publication_time", "tag": "Ubuntu-tag"},
+        }
+        args = SimpleNamespace(snapshot="auto", sources=None, allow_live_fallback=True,
+                               image_timeout_minutes=10, snapshot_timeout_minutes=2)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe").mkdir()
+            recipe = Path(env.__file__).parent / "build-environment/install-packages.sh"
+            # Only the network/guest configuration calls are stubbed. Run the actual APT failure trap.
+            script = recipe.read_text().replace('bash /tmp/environment/configure-apt.sh "${4:-}"', ':')
+            fake_apt = root / "apt-get"
+            fake_apt.write_text('#!/bin/sh\n[ "$1" != update ] || exit 0\necho "$FETCH_ERROR" >&2\nexit 100\n')
+            fake_apt.chmod(0o755)
+            builds = []
+            clock = [50.0]
+
+            def build(argv, log, timeout):
+                builds.append((next(a for a in argv if a.startswith("SNAPSHOT_ID=")), timeout))
+                if len(builds) == 1:
+                    result = subprocess.run(["bash", "-ec", script, "install", "0", gcc, cxx, snapshot],
+                                            stdout=log, stderr=subprocess.STDOUT,
+                                            env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                                                     FETCH_ERROR=self.fetch_error + "\n" + self.fetch_summary))
+                    self.assertEqual(result.returncode, 100)
+                    clock[0] += 120.25
+                    raise subprocess.CalledProcessError(125, argv)
+                (root / "image.iid").write_text("sha256:" + "b" * 64)
+                print("live image build", file=log)
+
+            pins = "KPCTL_TOOLCHAIN_PIN " + gcc + "\nKPCTL_TOOLCHAIN_PIN " + cxx
+            def recheck(argv, name, archive, log_path, timeout_minutes, timeout_option):
+                self.assertEqual(timeout_minutes, 2)
+                self.assertEqual(timeout_option, "--snapshot-timeout-minutes")
+                clock[0] += 61.5
+                return 0, pins
+
+            with patch.object(env, "run_podman_build", side_effect=build), patch.object(
+                env, "run_snapshot_probe", side_effect=recheck
+            ) as probe, patch.object(env.time, "monotonic", side_effect=lambda: clock[0]), patch.object(
+                env, "image_probe", return_value={"gcc": "gcc " + settings["compiler_identity"]}
+            ), patch.object(env, "image_packages", return_value=gcc + "\n"), patch.object(env, "remember_image"):
+                env.build_initial_image(args, root, settings)
+            self.assertEqual(builds, [("SNAPSHOT_ID=" + snapshot, 600), ("SNAPSHOT_ID=", 418.25)])
+            self.assertEqual(probe.call_args.args[0][-3:], ["", gcc, cxx])
+            self.assertEqual(settings["snapshot_id"], "")
+            self.assertEqual(settings["compiler_family"], [gcc, cxx])
+            basis = settings["snapshot_time_basis"]
+            self.assertEqual((basis["kind"], basis["failed_stage"], basis["tag"]),
+                             ("live_archive_fallback", "image_build", "Ubuntu-tag"))
+            self.assertEqual(basis["unavailable_snapshots"], [snapshot])
+            self.assertIn(self.fetch_error, (root / basis["failed_log"]).read_text())
+            self.assertIn("live image build", (root / "image-build.log").read_text())
+
+    def test_image_deadline_stops_fallback_before_another_container_starts(self):
+        for first_build_seconds in (599.75, 600):
+            with self.subTest(first_build_seconds=first_build_seconds), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "recipe").mkdir()
+                args = SimpleNamespace(snapshot="auto", sources=None, allow_live_fallback=True, image_timeout_minutes=10)
+                settings = dict(base="ubuntu", snapshot_id="20261120T122658Z", snapshot_time_basis={},
+                                compiler_package="gcc-15=1", cxx_package="g++-15=1")
+                clock = [50.0]
+
+                def first_build(*_):
+                    (root / "image-build.log").write_text("snapshot returned 503")
+                    clock[0] += first_build_seconds
+                    raise env.ArchiveUnavailable("503")
+
+                def recheck(argv, **options):
+                    self.assertEqual(options["timeout"], 0.25)
+                    log = options["stdout"]
+                    log.write("KPCTL_TOOLCHAIN_PIN gcc-15=1\nKPCTL_TOOLCHAIN_PIN g++-15=1\n")
+                    clock[0] += 0.25
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with (
+                    patch.object(env.time, "monotonic", side_effect=lambda: clock[0]),
+                    patch.object(env, "build_image", side_effect=first_build) as build,
+                    patch.object(env.subprocess, "run", side_effect=recheck) as probe,
+                ):
+                    with self.assertRaisesRegex(ValueError, "--image-timeout-minutes"):
+                        env.build_initial_image(args, root, settings)
+                build.assert_called_once()
+                if first_build_seconds < 600:
+                    probe.assert_called_once()
+                    self.assertIn("KPCTL_TOOLCHAIN_PIN", (root / "snapshot-probe.log").read_text())
+                else:
+                    probe.assert_not_called()
+                self.assertEqual(settings["snapshot_id"], "20261120T122658Z")
+                failed_log, = root.glob("image-build-*.log")
+                self.assertEqual(failed_log.read_text(), "snapshot returned 503")
+
+    def test_image_outage_without_permission_or_after_live_selection_stops(self):
+        for allowed, snapshot in ((False, "20261120T122658Z"), (True, "")):
+            args = SimpleNamespace(snapshot="auto", sources=None, allow_live_fallback=allowed)
+            with patch.object(env, "build_image", side_effect=env.ArchiveUnavailable("503")) as build:
+                with self.assertRaisesRegex(env.ArchiveUnavailable, "503"):
+                    env.build_initial_image(args, Path("/unused"), {"snapshot_id": snapshot})
+                self.assertEqual(build.call_count, 1)
+
+    @unittest.skipUnless(Path("/usr/lib/apt/apt-helper").is_file(), "requires Ubuntu APT")
+    def test_snapshot_503_retry_preserves_expected_hash(self):
+        payload = b"archive fixture\n"
+        requests = []
+
+        class Archive(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                status = 503 if requests.count(self.path) <= 2 else 200
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        try:
+            server = HTTPServer(("127.0.0.1", 0), Archive)
+        except PermissionError:
+            self.skipTest("sandbox does not permit loopback sockets")
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for subdir in ("apt.conf.d", "sources.list.d", "preferences.d"):
+                (root / subdir).mkdir()
+            (root / "os-release").write_text("VERSION_CODENAME=resolute\n")
+            configure = Path(env.__file__).parent / "build-environment/configure-apt.sh"
+            script = configure.read_text().replace("/etc/apt/", directory + "/").replace(
+                "/tmp/environment/", directory + "/environment/"
+            ).replace("/etc/os-release", str(root / "os-release"))
+            subprocess.run(["bash", "-ec", script, "probe", "20261120T122658Z"], check=True)
+            options = [
+                "-c", str(root / "apt.conf.d/99kpctl-archive"),
+                "-o", "Acquire::http::Proxy::127.0.0.1=DIRECT",
+                "-o", "Acquire::Retries::Delay=false", "-o", "APT::Sandbox::User=root",
+            ]
+            config = subprocess.check_output(["apt-config", *options, "dump"], text=True)
+            self.assertIn('APT::Update::Error-Mode "any";', config)
+            url = f"http://127.0.0.1:{server.server_port}"
+            for name, digest in (("index", hashlib.sha256(payload).hexdigest()), ("corrupt", "0" * 64)):
+                path = root / name
+                result = subprocess.run(
+                    ["/usr/lib/apt/apt-helper", *options, "download-file", url + "/" + name,
+                     str(path), "SHA256:" + digest],
+                    capture_output=True, timeout=15,
+                )
+                self.assertGreaterEqual(requests.count("/" + name), 3)
+                if name == "index":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(path.read_bytes(), payload)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
+
+
 class SnapshotSelection(unittest.TestCase):
+    candidates = ["20260701T000000Z", "20260702T000000Z", "20260630T000000Z"]
+    settings = {
+        "base": "ubuntu@sha256:" + "a" * 64,
+        "compiler_package": "gcc-13=13.3.0-6ubuntu2~24.04.1",
+        "cxx_package": "g++-13=13.3.0-6ubuntu2~24.04.1",
+    }
+
+    def select_with_probes(self, root, probe, **options):
+        args = {"snapshot": "auto", "sources": None, "allow_live_fallback": False, **options}
+        with patch.object(
+            env, "snapshot_candidates", return_value=(self.candidates.copy(), {"kind": "test"})
+        ), patch.object(env.subprocess, "run", side_effect=probe):
+            return env.select_snapshot(SimpleNamespace(**args), root, self.settings)
+
+    @staticmethod
+    def probe_result(argv, log, code, *lines):
+        # Write through the descriptor just as the child process does.
+        os.write(log.fileno(), ("\n".join(lines) + "\n").encode())
+        return subprocess.CompletedProcess(argv, code)
+
+    def run_probes(self, attempts, responses, **options):
+        def probe(argv, **kwargs):
+            attempts.append(argv[-3])
+            status, output = responses[len(attempts) - 1]
+            return self.probe_result(argv, kwargs["stdout"], status, output)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe").mkdir()
+            return self.select_with_probes(root, probe, **options)
+
+    def update_failure(self, reason, *other_errors):
+        uri = f"https://snapshot.ubuntu.com/ubuntu/{self.candidates[0]}/dists/resolute-security/InRelease"
+        return 100, "\n".join((
+            "== apt-get update (binary package indexes) ==",
+            "Ign:1 " + uri, "  404  NOT FOUND [IP: 192.0.2.11 443]",
+            "E: Failed to fetch " + uri + "  " + reason + " [IP: 192.0.2.12 443]",
+            *other_errors,
+            "E: Some index files failed to download. They have been ignored, or old ones used instead.",
+        ))
+
+    def test_auto_outage_tries_one_other_snapshot(self):
+        pins = [self.settings["compiler_package"], self.settings["cxx_package"]]
+        ready = (0, "\n".join("KPCTL_TOOLCHAIN_PIN " + pin for pin in pins))
+        for reason in ("503  Service Unavailable", "429  Too Many Requests"):
+            with self.subTest(reason=reason):
+                attempts = []
+                selected = self.run_probes(attempts, [self.update_failure(reason), ready])
+                self.assertEqual(attempts, self.candidates[:2])
+                self.assertEqual(selected["snapshot_id"], self.candidates[1])
+                self.assertEqual(selected["snapshot_time_basis"]["unavailable_snapshots"], self.candidates[:1])
+
+        unavailable = self.update_failure("503  Service Unavailable")
+        attempts = []
+        with self.assertRaises(env.ArchiveUnavailable) as caught:
+            self.run_probes(attempts, [unavailable, unavailable])
+        self.assertEqual(attempts, self.candidates[:2])
+        self.assertIn("503", str(caught.exception))
+        self.assertNotIn("exact GCC packages unavailable", str(caught.exception))
+
+    def test_opt_in_live_fallback_requires_exact_pins(self):
+        failed = self.update_failure("503  Service Unavailable")
+        pins = [self.settings["compiler_package"], self.settings["cxx_package"]]
+        exact = (0, "\n".join("KPCTL_TOOLCHAIN_PIN " + pin for pin in pins))
+        attempts = []
+        selected = self.run_probes(attempts, [failed, exact], allow_live_fallback=True)
+        self.assertEqual(attempts, [self.candidates[0], ""])
+        self.assertEqual(selected["snapshot_id"], "")
+        self.assertEqual(selected["compiler_family"], pins)
+        self.assertEqual(selected["snapshot_time_basis"]["kind"], "live_archive_fallback")
+        self.assertEqual(selected["snapshot_time_basis"]["unavailable_snapshots"], self.candidates[:1])
+        self.assertNotIn("allow_live_fallback", json.dumps(selected))
+
+        attempts = []
+        with self.assertRaises(ValueError):
+            self.run_probes(attempts, [failed, (0, "KPCTL_TOOLCHAIN_PIN " + pins[0])],
+                            allow_live_fallback=True)
+        self.assertEqual(attempts, [self.candidates[0], ""])
+
+        attempts = []
+        missing = (3, "required package unavailable")
+        with self.assertRaisesRegex(ValueError, "no compiler substitution"):
+            self.run_probes(attempts, [missing] * len(self.candidates), allow_live_fallback=True)
+        self.assertEqual(attempts, self.candidates)
+
+    def test_503_does_not_override_explicit_sources_or_other_errors(self):
+        failed = self.update_failure("503  Service Unavailable")
+        cases = [
+            ({"snapshot": self.candidates[0]}, failed),
+            ({"sources": "/custom.sources"}, failed),
+            ({}, self.update_failure("404  Not Found")),
+            ({}, self.update_failure("503  Service Unavailable", "E: Failed to fetch https://mirror/Packages  Hash Sum mismatch")),
+            ({}, self.update_failure("503  Service Unavailable", "E: The repository 'https://mirror/ stable InRelease' is not signed.")),
+            ({}, self.update_failure("503  Service Unavailable", "E: Failed to fetch https://mirror/Packages  404  Not Found")),
+        ]
+        for options, response in cases:
+            with self.subTest(options=options, output=response[1]):
+                attempts = []
+                with self.assertRaises(ValueError) as caught:
+                    self.run_probes(attempts, [response], allow_live_fallback=True, **options)
+                self.assertEqual(isinstance(caught.exception, env.ArchiveUnavailable), bool(options))
+                self.assertEqual(attempts, self.candidates[:1])
+
+    def test_unchecked_candidate_keeps_outage_retryable(self):
+        missing = (3, "exact pins unavailable here")
+        with self.assertRaisesRegex(env.ArchiveUnavailable, self.candidates[0]):
+            self.run_probes([], [self.update_failure("503  Service Unavailable"), missing, missing])
+
+    def test_helper_reports_only_known_temporary_conditions_with_reserved_exit_codes(self):
+        for error, code in (
+            (env.ArchiveUnavailable("HTTP 503"), 69),
+            (env.DiskSpaceError("4 GiB free"), 73),
+            (OSError(errno.EDQUOT, "quota exceeded while writing result"), 73),
+            (OSError(errno.ENOSPC, "no space left while writing result"), 73),
+            (OSError(errno.EACCES, "permission denied"), 1),
+            (env.BuildBusy("locked"), 75),
+            (ValueError("Hash Sum mismatch"), 1),
+        ):
+            with self.subTest(error=error), patch.object(env, "main", side_effect=error), \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                self.assertEqual(env.cli(), code)
+                self.assertIn(str(error), diagnostic.getvalue())
+
     def test_kernel_package_tag_time_selects_bounded_snapshot_candidates(self):
         args = SimpleNamespace(
             snapshot="auto",
@@ -1140,10 +1585,11 @@ class SnapshotSelection(unittest.TestCase):
         def probe(argv, **kwargs):
             snapshot = argv[-3]
             if snapshot < "20241212T151524Z":
-                return SimpleNamespace(returncode=3, stdout="", stderr="package version unavailable")
-            return SimpleNamespace(
-                returncode=0, stderr="",
-                stdout="".join("KPCTL_TOOLCHAIN_PIN " + settings[key] + "\n" for key in ("compiler_package", "cxx_package")),
+                return self.probe_result(argv, kwargs["stdout"], 3, "package version unavailable")
+            return self.probe_result(
+                argv, kwargs["stdout"], 0,
+                "KPCTL_TOOLCHAIN_PIN " + settings["compiler_package"],
+                "KPCTL_TOOLCHAIN_PIN " + settings["cxx_package"],
             )
 
         published = env.dt.datetime(2024, 12, 16, 13, 36, 19, tzinfo=env.dt.timezone.utc)
@@ -1177,38 +1623,113 @@ class SnapshotSelection(unittest.TestCase):
             publication.assert_not_called()
 
     def test_snapshot_probe_accepts_only_successful_exact_package_plan(self):
+        pins = [self.settings["compiler_package"], self.settings["cxx_package"]]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "recipe").mkdir()
-            candidates = ["20260701T000000Z", "20260702T000000Z"]
-            settings = {
-                "base": "ubuntu@sha256:" + "a" * 64,
-                "compiler_package": "gcc-13=13.3.0-6ubuntu2~24.04.1",
-                "cxx_package": "g++-13=13.3.0-6ubuntu2~24.04.1",
-            }
-            failed = SimpleNamespace(
-                returncode=100, stdout="", stderr="package version unavailable"
-            )
-            good = SimpleNamespace(
-                returncode=0,
-                stdout="KPCTL_TOOLCHAIN_PIN "
-                + settings["compiler_package"]
-                + "\nKPCTL_TOOLCHAIN_PIN "
-                + settings["cxx_package"]
-                + "\n",
-                stderr="",
-            )
-            with patch.object(
-                env, "snapshot_candidates", return_value=(candidates, {"kind": "test"})
-            ), patch.object(env.subprocess, "run", side_effect=[failed, good]):
-                selected = env.select_snapshot(SimpleNamespace(), root, settings)
-            self.assertEqual(selected["snapshot_id"], candidates[1])
-            self.assertEqual(len(selected["compiler_family"]), 2)
-            with patch.object(
-                env, "snapshot_candidates", return_value=(candidates, {})
-            ), patch.object(env.subprocess, "run", return_value=failed):
-                with self.assertRaisesRegex(ValueError, "no compiler substitution"):
-                    env.select_snapshot(SimpleNamespace(), root, settings)
+
+            def unavailable(argv, **kwargs):
+                return self.probe_result(argv, kwargs["stdout"], 3, "package version unavailable")
+
+            def second_date_has_pins(argv, **kwargs):
+                if argv[-3] == self.candidates[0]:
+                    return unavailable(argv, **kwargs)
+                return self.probe_result(
+                    argv, kwargs["stdout"], 0,
+                    "KPCTL_TOOLCHAIN_PIN " + pins[0], "KPCTL_TOOLCHAIN_PIN " + pins[1],
+                )
+
+            selected = self.select_with_probes(root, second_date_has_pins)
+            self.assertEqual(selected["snapshot_id"], self.candidates[1])
+            self.assertEqual(selected["compiler_family"], pins)
+            with self.assertRaisesRegex(ValueError, "no compiler substitution"):
+                self.select_with_probes(root, unavailable)
+
+            def missing_cxx(argv, **kwargs):
+                return self.probe_result(argv, kwargs["stdout"], 0, "KPCTL_TOOLCHAIN_PIN " + pins[0])
+
+            # A previous successful run has both pins in the same on-disk log.
+            with self.assertRaises(ValueError):
+                self.select_with_probes(root, missing_cxx)
+
+    def test_apt_update_failure_reports_apt_error_without_trying_other_dates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe").mkdir()
+            attempts = []
+            failure = "E: Failed to fetch InRelease: Connection timed out"
+            run = subprocess.run
+
+            def failed_update(argv, **kwargs):
+                attempts.append(argv[-3])
+                # Run the guest script, substituting only the tools that configure
+                # /etc/apt or contact a repository.
+                setup = 'bash() { :; }\napt-get() { printf "%s\\n" "$@"; echo "$APT_ERROR" >&2; return 100; }\n'
+                script = argv[argv.index("-ec") + 1]
+                return run(
+                    ["bash", "-ec", setup + script, *argv[-4:]],
+                    env=dict(os.environ, APT_ERROR=failure), **kwargs,
+                )
+
+            with self.assertRaises(ValueError) as caught:
+                self.select_with_probes(root, failed_update)
+            self.assertEqual(attempts, self.candidates[:1])
+            log = root / "snapshot-probe.log"
+            for expected in (failure, self.candidates[0], str(log)):
+                self.assertIn(expected, str(caught.exception))
+            output = log.read_text()
+            for expected in (
+                failure,
+                "Acquire::IndexTargets::deb-src::Sources::DefaultEnabled=false", "Acquire::Languages=none",
+            ):
+                self.assertIn(expected, output)
+
+    def test_partial_probe_output_survives_timeout_and_named_container_is_removed(self):
+        for options, minutes in (({}, 20), ({"snapshot_timeout_minutes": 45}, 45)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "recipe").mkdir()
+                calls = []
+                last_line = "Get:5 https://snapshot.ubuntu.com/ubuntu/ resolute/main amd64 Packages"
+
+                def timeout(argv, **kwargs):
+                    calls.append(argv)
+                    if "rm" in argv:
+                        return subprocess.CompletedProcess(argv, 0)
+                    self.assertEqual(kwargs["timeout"], minutes * 60)
+                    self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+                    os.write(kwargs["stdout"].fileno(), (last_line + "\n").encode())
+                    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+                with self.assertRaises(ValueError) as caught:
+                    self.select_with_probes(root, timeout, **options)
+                attempt, cleanup = calls
+                self.assertEqual(attempt[-3], self.candidates[0])
+                name = attempt[attempt.index("--name") + 1]
+                self.assertEqual(cleanup[cleanup.index("rm"):], ["rm", "--force", "--ignore", name])
+                log = root / "snapshot-probe.log"
+                self.assertIn(last_line, log.read_text())
+                for expected in (last_line, self.candidates[0], str(log)):
+                    self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("mapfile -t", str(caught.exception))
+
+    def test_cancelled_probe_removes_its_container_and_propagates_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe").mkdir()
+            calls = []
+
+            def interrupted(argv, **kwargs):
+                calls.append(argv)
+                if "run" in argv:
+                    raise env.BuildCancelled("service stopped")
+                return subprocess.CompletedProcess(argv, 0)
+
+            with self.assertRaisesRegex(env.BuildCancelled, "service stopped"):
+                self.select_with_probes(root, interrupted)
+            attempt, cleanup = calls
+            self.assertEqual(cleanup[-1], attempt[attempt.index("--name") + 1])
+            self.assertIn("rm", cleanup)
 
 
 class EnvironmentRetention(unittest.TestCase):
@@ -1362,6 +1883,52 @@ class EnvironmentRetention(unittest.TestCase):
                     env.pinned_base(
                         directory, "docker.io/library/ubuntu@sha256:" + "b" * 64
                     )
+
+    def test_first_pin_uses_local_digest_without_registry_access(self):
+        requested = "docker.io/library/ubuntu@sha256:" + "a" * 64
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            env.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)
+        ) as lookup, patch.object(env, "command") as registry:
+            directory = Path(tmp)
+            self.assertEqual(env.pinned_base(directory, requested), requested)
+            self.assertEqual(json.loads((directory / "base-image.json").read_text())["base_image"], requested)
+            self.assertEqual(lookup.call_args.args[0], ["podman", "image", "exists", requested])
+            registry.assert_not_called()
+
+    def test_prepare_pulls_missing_explicit_digest_without_substituting_another_reference(self):
+        requested = "docker.io/library/ubuntu@sha256:" + "a" * 64
+        other = "registry.example/ubuntu@sha256:" + "b" * 64
+        args = SimpleNamespace(base_image=requested, min_free_gib=8, package=[])
+        settings = {"compiler_package": "gcc=1", "cxx_package": "g++=1"}
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(env, "require_space"),
+            patch.object(env.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)),
+            patch.object(
+                env, "command", side_effect=["", json.dumps([{"RepoDigests": [other, requested]}])]
+            ) as command,
+            patch.object(env, "stage_recipe", side_effect=RuntimeError("recipe reached")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "recipe reached"):
+                env.prepare_locked(args, Path(tmp), settings)
+            self.assertEqual(settings["base"], requested)
+            command.assert_called_once_with(["podman", "pull", requested])
+
+    def test_base_image_lookup_failure_reports_storage_error_without_pull(self):
+        requested = "docker.io/library/ubuntu@sha256:" + "a" * 64
+        failed = subprocess.CompletedProcess(
+            ["podman", "image", "exists", requested], 125, stderr="cannot access overlay storage"
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(env.subprocess, "run", return_value=failed),
+            patch.object(env, "command") as registry,
+        ):
+            directory = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "cannot access overlay storage"):
+                env.pinned_base(directory, requested)
+            registry.assert_not_called()
+            self.assertFalse((directory / "base-image.json").exists())
 
 
 class KernelPurge(unittest.TestCase):

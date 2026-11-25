@@ -93,7 +93,8 @@ type Config struct {
 	// MaxPrereqs: CVE 커밋 하나에 딸려 들어갈 수 있는 선행 커밋 수 한도 (0 = 12).
 	// 넘으면 자동으로 묶지 않고 관리자 검토를 기다립니다 (prereq.go)
 	MaxPrereqs int `json:"max_prereqs"`
-	// BuildTimeoutMinutes: kpatch-build 한 번의 최대 시간
+	// BuildTimeoutMinutes: kpatch-build 한 번의 최대 시간. 격리 빌드는 커널마다 처음 한 번 하는
+	// 패치 없는 기준 빌드(ccache 준비)에도 같은 시간을 따로 줍니다.
 	BuildTimeoutMinutes int `json:"build_timeout_minutes"`
 
 	// Series: 이 빌드 서버가 맡는 Ubuntu LTS 시리즈 (jammy, noble, resolute).
@@ -134,15 +135,17 @@ type SandboxConfig struct {
 }
 
 type SandboxPreparation struct {
-	BaseImage     string   `json:"base_image,omitempty"`
-	MemoryMiB     int      `json:"memory_mib"`
-	PIDs          int      `json:"pids"`
-	MinFreeGiB    int      `json:"min_free_gib"`
-	CacheGiB      *int     `json:"cache_gib,omitempty"`
-	CacheTotalGiB int      `json:"cache_total_gib"`
-	Snapshot      string   `json:"snapshot,omitempty"`
-	Sources       string   `json:"sources,omitempty"`
-	Packages      []string `json:"packages,omitempty"`
+	BaseImage              string   `json:"base_image,omitempty"`
+	MemoryMiB              int      `json:"memory_mib"`
+	PIDs                   int      `json:"pids"`
+	MinFreeGiB             int      `json:"min_free_gib"`
+	CacheGiB               *int     `json:"cache_gib,omitempty"`
+	CacheTotalGiB          int      `json:"cache_total_gib"`
+	Snapshot               string   `json:"snapshot,omitempty"`
+	SnapshotTimeoutMinutes *int     `json:"snapshot_timeout_minutes,omitempty"`
+	ImageTimeoutMinutes    *int     `json:"image_timeout_minutes,omitempty"`
+	Sources                string   `json:"sources,omitempty"`
+	Packages               []string `json:"packages,omitempty"`
 }
 
 func intp(n int) *int { return &n }
@@ -304,6 +307,12 @@ func ParseConfig(data []byte) (*Config, error) {
 			if _, err := time.Parse("20060102T150405Z", p.Snapshot); err != nil {
 				return nil, fmt.Errorf("sandbox.prepare.snapshot ID가 잘못됐습니다: %w", err)
 			}
+		}
+		if n := p.SnapshotTimeoutMinutes; n != nil && (*n < 1 || *n > 1440) {
+			return nil, fmt.Errorf("sandbox.prepare.snapshot_timeout_minutes는 1~1440분이어야 합니다")
+		}
+		if n := p.ImageTimeoutMinutes; n != nil && (*n < 10 || *n > 1440) {
+			return nil, fmt.Errorf("sandbox.prepare.image_timeout_minutes는 10~1440분이어야 합니다")
 		}
 		if p.MemoryMiB < 1024 || p.MemoryMiB > 1048576 || p.PIDs < 128 || p.PIDs > 32768 || p.MinFreeGiB < 8 || p.MinFreeGiB > 65536 ||
 			*p.CacheGiB < 0 || *p.CacheGiB > 1024 || p.CacheTotalGiB < *p.CacheGiB || p.CacheTotalGiB > 4096 || (p.Sources != "" && !filepath.IsAbs(p.Sources)) {

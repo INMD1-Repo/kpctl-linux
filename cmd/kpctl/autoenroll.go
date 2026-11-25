@@ -1,6 +1,6 @@
 // 이 파일: kpctl autoenroll — 클라이언트 키로 들어가지는 미등록 서버에 에이전트를 자동 설치 (질문 없음)
 //
-// 대상: 관리망 DHCP 임대 + 호스트 목록 파일(/etc/kpctl/autoenroll-hosts, DHCP 를 안 쓰는 환경용).
+// 대상: 관리망 DHCP의 동적 임대 + 호스트 목록 파일(/etc/kpctl/autoenroll-hosts).
 // kpctl-autoenroll.timer 가 1분마다 한 번씩 실행합니다. 실패한 호스트는 다음 실행 때 다시 시도합니다.
 // 커널마다 첫 호스트는 카나리 그룹(링 1), 나머지는 일반 그룹으로 등록해서 단계 배포가 되게 합니다.
 // 자동 등록하면 안 되는 호스트(빌드 서버 등)는 -ignore-file 에 적습니다.
@@ -31,7 +31,8 @@ import (
 const autoenrollUsage = `사용법: kpctl autoenroll [옵션]
 
   아직 등록되지 않은 호스트에 질문 없이 에이전트를 설치합니다 (한 번 돌고 끝남, 타이머가 1분마다 실행).
-  대상은 관리망 DHCP 임대와 호스트 목록 파일(기본 /etc/kpctl/autoenroll-hosts, 한 줄에 IP 또는 이름)입니다.
+  관리망 DHCP에서는 고정 IP를 제외한 동적 임대를 찾습니다.
+  호스트 목록 파일(기본 /etc/kpctl/autoenroll-hosts)에 직접 적은 IP 또는 이름도 대상에 포함합니다.
   클라이언트 키로 로그인되는 호스트에만 설치하고, 키가 없는 호스트는 키가 들어올 때까지 기다립니다.
   빌드 서버 전용 키(kpctl ssh-key add -role builder)로는 설치하지 않습니다.
   컨트롤러·빌드 서버(/etc/kpctl/{controller,builder}.json 이 있는 서버)는 건너뜁니다.
@@ -55,26 +56,23 @@ func cmdAutoenroll(c *client.Client, args []string) error {
 	if err := c.Do("GET", "/api/status", nil, &st); err != nil {
 		return fmt.Errorf("컨트롤러 등록 정보를 읽지 못했습니다: %w", err)
 	}
-	leases, err := dhcp.ReadLeases(getDHCPPaths().leases)
-	if err != nil {
-		return err
-	}
 	// DHCP 를 안 쓰는 환경: 호스트 목록 파일의 주소도 대상으로 (파일이 없으면 건너뜀)
 	if r.hostsFile == "" {
 		r.hostsFile = defaultAutoenrollHosts()
 	}
-	if _, err := os.Stat(r.hostsFile); err == nil {
-		listed, err := readHostsFile(r.hostsFile)
-		if err != nil {
-			return err
-		}
-		leases = append(leases, listedLeases(listed, leases)...)
+	listed, err := readHostsFile(r.hostsFile)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	leases, err := getDHCPPaths().installLeases(listed, time.Now())
+	if err != nil {
+		return err
 	}
 	ignore, err := readIgnoreFile(*ignoreFile)
 	if err != nil {
 		return err
 	}
-	targets := autoenrollTargets(leases, st.Hosts, ignore, time.Now())
+	targets := autoenrollTargets(leases, st.Hosts, ignore)
 	// 지난 실행에서 등록을 확인한 대상(이름 없는 임대·IP 로 적은 호스트)은 다시 접속하지 않습니다.
 	doneFile := filepath.Join(r.logDir, "enrolled")
 	done := readDone(doneFile)
@@ -272,25 +270,14 @@ func writeWaiting(path string, m map[string]bool) {
 	_ = os.WriteFile(path, []byte(data), 0o600)
 }
 
-// autoenrollTargets 는 임대 중 설치 대상을 IP 순서로 돌려줍니다.
-// 한 MAC 에 임대가 여러 줄이면 (IP 가 바뀐 경우) 가장 늦게 만료되는 것만 씁니다. 옛 IP 는 응답하지 않기 때문입니다.
-func autoenrollTargets(leases []dhcp.Lease, hosts []*model.Host, ignore map[string]bool, now time.Time) []dhcp.Lease {
-	newest := map[string]dhcp.Lease{}
-	for _, l := range leases {
-		if !l.Active(now) {
-			continue
-		}
-		old, seen := newest[l.MAC]
-		if !seen || l.Expires.IsZero() || (!old.Expires.IsZero() && l.Expires.After(old.Expires)) {
-			newest[l.MAC] = l
-		}
-	}
+// autoenrollTargets 는 설치 후보 중 이미 등록되었거나 제외된 호스트를 빼고 IP 순서로 돌려줍니다.
+func autoenrollTargets(leases []dhcp.Lease, hosts []*model.Host, ignore map[string]bool) []dhcp.Lease {
 	registered := map[string]bool{}
 	for _, h := range hosts {
 		registered[shortName(h.Hostname)] = true
 	}
 	var out []dhcp.Lease
-	for _, l := range newest {
+	for _, l := range leases {
 		name := shortName(l.Name)
 		if ignore[l.IP] || ignore[l.MAC] || (name != "" && (ignore[name] || registered[name])) {
 			continue

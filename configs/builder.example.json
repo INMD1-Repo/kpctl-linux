@@ -29,7 +29,9 @@
       "min_free_gib": 60,
       "cache_gib": 20,
       "cache_total_gib": 40,
-      "snapshot": "auto"
+      "snapshot": "auto",
+      "snapshot_timeout_minutes": 20,
+      "image_timeout_minutes": 180
     }
   },
 

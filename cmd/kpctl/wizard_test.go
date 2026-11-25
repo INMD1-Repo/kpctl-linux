@@ -97,13 +97,13 @@ func TestRunWizardChecksThenInstalls(t *testing.T) {
 	w := &wizardPlan{command: "install", flags: []string{"-group", "canary"}, hosts: []string{"node-01"}}
 	var calls []string
 	fails := 1
-	run := func(_ *client.Client, args []string) error {
+	run := func(_ *client.Client, args []string) ([]hostResult, error) {
 		calls = append(calls, "run "+strings.Join(args, " "))
 		if args[0] == "-check" && fails > 0 {
 			fails--
-			return errors.New("1대 중 1대 실패")
+			return []hostResult{{target: "node-01", result: "접속 실패"}}, errors.New("1대 중 1대 실패")
 		}
-		return nil
+		return []hostResult{{target: "node-01", ok: true}}, nil
 	}
 	sshKey := func(_ *client.Client, args []string) error {
 		calls = append(calls, "ssh-key "+strings.Join(args, " "))
@@ -121,7 +121,7 @@ func TestRunWizardChecksThenInstalls(t *testing.T) {
 		t.Errorf("다시 쓸 명령줄이 없습니다:\n%s", out)
 	}
 
-	// 점검 실패 후 키 등록을 거절하면 설치하지 않음
+	// 통과한 서버가 한 대도 없으면 설치하지 않음
 	calls, fails = nil, 1
 	p, _ = scripted("n")
 	if err := runWizard(nil, p, w, run, sshKey); err == nil || len(calls) != 1 {
@@ -132,5 +132,97 @@ func TestRunWizardChecksThenInstalls(t *testing.T) {
 	p, _ = scripted("n")
 	if err := runWizard(nil, p, w, run, sshKey); err != nil || len(calls) != 1 {
 		t.Fatalf("err=%v calls=%q", err, calls)
+	}
+}
+
+func TestRunWizardInstallsOnlyHostsThatPassed(t *testing.T) {
+	const kernel = "6.8.0-136-generic"
+	for _, tt := range []struct {
+		name        string
+		plan        wizardPlan
+		partial     bool
+		confirm     string
+		wantInstall []string
+	}{
+		{
+			name:    "DHCP 일부 접속 실패",
+			plan:    wizardPlan{command: "install", source: []string{"-from-dhcp"}, flags: []string{"-group", "server"}},
+			partial: true, confirm: "Y", wantInstall: []string{"-group", "server", "10.0.0.8"},
+		},
+		{
+			name:    "목록 파일에서 모두 통과",
+			plan:    wizardPlan{command: "install", source: []string{"-hosts-file", "hosts.txt"}, flags: []string{"-group", "canary"}},
+			confirm: "Y", wantInstall: []string{"-group", "canary", "10.0.0.8", "ops@node-02"},
+		},
+		{
+			name: "빌더 일부 접속 실패",
+			plan: wizardPlan{command: "install-builder", hosts: []string{"10.0.0.8", "ops@node-02", "node-03"},
+				kernels: []string{kernel}, setup: []string{"--memory-mib", "16384"}},
+			partial: true, confirm: "Y", wantInstall: []string{"10.0.0.8", kernel, "--", "--memory-mib", "16384"},
+		},
+		{
+			name: "일부 통과 후 설치 취소",
+			plan: wizardPlan{command: "install", source: []string{"-from-dhcp"}}, partial: true, confirm: "N",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			results := []hostResult{{target: "10.0.0.8", hostname: "node-01", ok: true}, {target: "ops@node-02", hostname: "node-02", ok: true}}
+			var checkErr error
+			answers := []string{tt.confirm}
+			if tt.partial {
+				results[1] = hostResult{target: "ops@node-02", result: "접속 실패"}
+				results = append(results, hostResult{target: "node-03", result: "점검 실패"})
+				checkErr = errors.New("3대 중 2대 실패")
+				answers = []string{"N", tt.confirm}
+			}
+			var calls [][]string
+			wantCalls := [][]string{tt.plan.args(true)}
+			if tt.wantInstall != nil {
+				wantCalls = append(wantCalls, tt.wantInstall)
+			}
+			p, _ := scripted(answers...)
+			run := func(_ *client.Client, args []string) ([]hostResult, error) {
+				calls = append(calls, append([]string(nil), args...))
+				if args[0] == "-check" {
+					return results, checkErr
+				}
+				return nil, nil
+			}
+			sshKey := func(_ *client.Client, args []string) error {
+				t.Fatalf("키 등록을 요청하지 않았습니다: %v", args)
+				return nil
+			}
+			if err := runWizard(nil, p, &tt.plan, run, sshKey); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(calls, wantCalls) {
+				t.Fatalf("명령줄\n got %q\nwant %q", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestRunWizardWithoutCheckedHosts(t *testing.T) {
+	for _, checkErr := range []error{nil, errors.New("예약 파일 읽기 실패")} {
+		plan := &wizardPlan{command: "install", source: []string{"-from-dhcp"}}
+		p, _ := scripted("Y")
+		calls := 0
+		run := func(_ *client.Client, args []string) ([]hostResult, error) {
+			calls++
+			if calls != 1 || args[0] != "-check" {
+				t.Fatalf("설치 대상이 없습니다: %v", args)
+			}
+			return nil, checkErr
+		}
+		sshKey := func(_ *client.Client, args []string) error {
+			t.Fatalf("키 등록 대상이 없습니다: %v", args)
+			return nil
+		}
+		if err := runWizard(nil, p, plan, run, sshKey); !errors.Is(err, checkErr) || calls != 1 {
+			t.Fatalf("err=%v, want=%v, calls=%d", err, checkErr, calls)
+		}
+		if answer, _ := p.in.ReadString('\n'); answer != "Y\n" {
+			t.Fatalf("점검 결과가 비어 있는데 확인 입력을 소비했습니다")
+		}
 	}
 }

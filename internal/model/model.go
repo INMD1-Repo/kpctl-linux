@@ -354,6 +354,8 @@ type NextJobRequest struct {
 	Series string `json:"series,omitempty"`
 	// Kernels: 설정에 직접 적은 커널. 시리즈와 달라도 이 커널 작업은 받습니다.
 	Kernels []string `json:"kernels,omitempty"`
+	// Jobs waiting for this builder's APT cooldown. Applies only to this poll.
+	DeferredJobIDs []int `json:"deferred_job_ids,omitempty"`
 	// CanRefresh: 이 빌드 서버는 BuildTask.Refresh(바로 수집 요청)를 처리할 수 있음. 예전 빌드 서버에는 주지 않음
 	CanRefresh bool `json:"can_refresh,omitempty"`
 	// CanPurge: 이 빌드 서버는 BuildTask.Purge(범위 밖 커널의 빌드 서버 자료 삭제)를 처리할 수 있음
@@ -540,7 +542,7 @@ type UpstreamReport struct {
 
 type BuildResult struct {
 	Success      bool       `json:"success"`
-	Deferred     bool       `json:"deferred,omitempty"` // temporary build-account contention or low disk space
+	Deferred     bool       `json:"deferred,omitempty"` // temporary archive, lock or disk failure
 	Builder      string     `json:"builder,omitempty"`
 	JobStartedAt *time.Time `json:"job_started_at,omitempty"` // start time from the job assignment
 	Error        string     `json:"error,omitempty"`

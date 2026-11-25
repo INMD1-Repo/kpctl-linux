@@ -14,7 +14,9 @@ sudo kpctl install -group canary node-01
 sudo kpctl hosts
 ```
 
-터미널에서 인자 없이 `sudo kpctl install`만 실행하면 질문형으로 설치합니다. 호스트 지정 방법(직접 입력·목록 파일·DHCP 미등록 호스트), SSH 접속 계정, 등록 그룹을 묻고 점검 → 확인 → 설치 순서로 진행하며, 같은 설치를 다시 할 명령줄도 보여 줍니다. 그룹은 등록 토큰의 링과 재부팅 정책을 선택합니다. `kpctl install`은 접속·권한·커널 기능·컨트롤러 접근을 점검하고 설치 묶음을 보내 등록을 확인합니다. 추가 SSH 키 관리는 `kpctl ssh-key list`와 `kpctl ssh-key add`를 사용합니다. 실제 옵션은 [CLI 정의](../../cmd/kpctl/install.go)와 [SSH 옵션](../../cmd/kpctl/sshflags.go), [질문형 설치](../../cmd/kpctl/wizard.go)에 있습니다.
+터미널에서 인자 없이 `sudo kpctl install`만 실행하면 질문형으로 설치합니다. 호스트 지정 방법(직접 입력·목록 파일·DHCP 동적 IP를 받은 미등록 호스트), SSH 접속 계정, 등록 그룹을 묻고 점검 → 확인 → 설치 순서로 진행하며, 같은 설치를 다시 할 명령줄도 보여 줍니다. 일부 서버의 점검이 실패하면 SSH 키 재등록 질문에서 `N`을 선택해 실패한 서버를 건너뜁니다. 마지막으로 표시된 목록을 확인하고 Enter를 누르면 점검을 통과한 서버에만 설치합니다.
+
+그룹은 등록 토큰의 링과 재부팅 정책을 선택합니다. `kpctl install`은 접속·권한·커널 기능·컨트롤러 접근을 점검하고 설치 묶음을 보내 등록을 확인합니다. 추가 SSH 키 관리는 `kpctl ssh-key list`와 `kpctl ssh-key add`를 사용합니다. 실제 옵션은 [CLI 정의](../../cmd/kpctl/install.go)와 [SSH 옵션](../../cmd/kpctl/sshflags.go), [질문형 설치](../../cmd/kpctl/wizard.go)에 있습니다.
 
 ### 점검 항목
 

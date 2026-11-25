@@ -21,7 +21,7 @@ import (
 
 const problemDiskSpace = "disk_space"
 
-var errDiskSpace = fmt.Errorf("%w: 디스크 부족 · 빌드 보류", errBuildBusy)
+var errDiskSpace = fmt.Errorf("%w: 디스크 공간 부족", errBuildDeferred)
 
 var diskFreeBytes = func(dir string) (uint64, error) {
 	var st syscall.Statfs_t

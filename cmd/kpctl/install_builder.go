@@ -155,6 +155,11 @@ func cmdInstallBuilder(c *client.Client, args []string) error {
 	if wantsWizard(args) { // 터미널에서 인자 없이 실행 → 질문형 (wizard.go)
 		return builderWizard(c)
 	}
+	_, err := runBuilderInstall(c, args)
+	return err
+}
+
+func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	fs := flag.NewFlagSet("install-builder", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprintln(os.Stderr, installBuilderUsage); fs.PrintDefaults() }
 	r := addRemoteFlags(fs)
@@ -175,68 +180,68 @@ func cmdInstallBuilder(c *client.Client, args []string) error {
 	buildUser := fs.String("build-user", "", "빌드 서비스 실행 계정 (비우면 kpbuild, 재설치 때는 기존 서비스 계정). 없으면 만듭니다")
 	timeout := fs.Duration("timeout", 4*time.Hour, "설치 명령 하나의 최대 시간 (커널 git clone·이미지 준비 포함)")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return nil, err
 	}
 	if r.fromDHCP {
-		return fmt.Errorf("install-builder 에는 -from-dhcp 를 쓸 수 없습니다 (빌드 서버를 직접 지정하세요)")
+		return nil, fmt.Errorf("install-builder 에는 -from-dhcp 를 쓸 수 없습니다 (빌드 서버를 직접 지정하세요)")
 	}
 	hosts, kernels, setupArgs, err := splitBuilderArgs(fs.Args())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if r.hostsFile != "" {
 		fromFile, err := readHostsFile(r.hostsFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		hosts = append(hosts, fromFile...)
 	}
 	hosts = unique(hosts)
 	if *buildUser != "" {
 		if !buildUserName.MatchString(*buildUser) || *buildUser == "root" {
-			return fmt.Errorf("잘못된 빌드 계정 %q (소문자·숫자·_·- 32자 이내, root 불가)", *buildUser)
+			return nil, fmt.Errorf("잘못된 빌드 계정 %q (소문자·숫자·_·- 32자 이내, root 불가)", *buildUser)
 		}
 		setupArgs = append([]string{"--user", *buildUser}, setupArgs...)
 	}
 	if len(hosts) == 0 {
-		return fmt.Errorf("빌드 서버 호스트를 주세요 (kpctl install-builder -h)")
+		return nil, fmt.Errorf("빌드 서버 호스트를 주세요 (kpctl install-builder -h)")
 	}
 	if r.parallel < 1 {
 		r.parallel = 1
 	}
 	if err := r.build(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := checkReadable(r.ssh.KeyFile, "SSH 키"); err != nil {
-		return err
+		return nil, err
 	}
 	r.ssh.Timeout = *timeout
 	bundle, err := remote.OpenBuilderBundle(r.bundleDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(r.logDir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
 	if *ctrlURL == "" {
-		return fmt.Errorf("-controller-url 이 필요합니다 (기본값 KPCTL_URL 이 비어 있음)")
+		return nil, fmt.Errorf("-controller-url 이 필요합니다 (기본값 KPCTL_URL 이 비어 있음)")
 	}
 
 	var config []byte
 	if !*checkOnly {
 		if err := checkReadable(*tokenFile, "빌더 토큰"); err != nil {
-			return err
+			return nil, err
 		}
 		data, err := os.ReadFile(*tokenFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		token := strings.TrimSpace(string(data))
 		if len(token) < 16 {
-			return fmt.Errorf("빌더 토큰이 너무 짧습니다 (%s)", *tokenFile)
+			return nil, fmt.Errorf("빌더 토큰이 너무 짧습니다 (%s)", *tokenFile)
 		}
 		if config, err = builderConfig(bundle, *ctrlURL, token, *caFile); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -246,7 +251,7 @@ func cmdInstallBuilder(c *client.Client, args []string) error {
 	if len(kernels) == 0 && !hostMode {
 		var st model.StatusResponse
 		if err := c.Do("GET", "/api/status", nil, &st); err != nil {
-			return fmt.Errorf("대상 커널을 고르려고 컨트롤러 상태를 읽지 못했습니다 (커널을 직접 지정하세요): %w", err)
+			return nil, fmt.Errorf("대상 커널을 고르려고 컨트롤러 상태를 읽지 못했습니다 (커널을 직접 지정하세요): %w", err)
 		}
 		registered = registeredKernels(&st)
 	}
@@ -333,7 +338,7 @@ func cmdInstallBuilder(c *client.Client, args []string) error {
 		res.note = fmt.Sprintf("%s, 시리즈 %s, 커널 %s", b.Name, b.Series, strings.Join(b.Kernels, " "))
 		return res
 	})
-	return printResults(results, r.logDir)
+	return results, printResults(results, r.logDir)
 }
 
 // waitBuilder 는 빌드 서버가 컨트롤러에 최근 작업 확인(보고)을 했는지 기다립니다.

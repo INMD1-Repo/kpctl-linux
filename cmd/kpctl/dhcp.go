@@ -163,19 +163,61 @@ func shortName(n string) string {
 	return n
 }
 
-// dhcpInstallTargets 는 DHCP 임대 중 아직 컨트롤러에 등록되지 않은 호스트의 IP 목록입니다.
-// (kpctl install -from-dhcp, kpctl ssh-key copy -from-dhcp 가 사용)
-func dhcpInstallTargets(c *client.Client) (targets []string, registered int, err error) {
-	leases, err := dhcp.ReadLeases(getDHCPPaths().leases)
+// installLeases 는 설치에 쓸 동적 임대와 명시한 호스트를 모읍니다.
+func (p dhcpPaths) installLeases(listed []string, now time.Time) ([]dhcp.Lease, error) {
+	leases, err := dhcp.ReadLeases(p.leases)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	hosts := registeredHosts(c)
-	now := time.Now()
+	if len(leases) == 0 {
+		return listedLeases(listed, nil), nil
+	}
+	reservations, err := dhcp.ReadReservations(p.hosts)
+	if err != nil {
+		return nil, err
+	}
+	reservedMAC, reservedIP := map[string]bool{}, map[string]bool{}
+	for _, r := range reservations {
+		if r.MAC != "" {
+			reservedMAC[r.MAC] = true
+			reservedIP[r.IP] = true
+		}
+	}
+	// 같은 MAC의 이전 주소로 접속하지 않도록 현재 임대를 먼저 고릅니다.
+	newest := map[string]dhcp.Lease{}
 	for _, l := range leases {
 		if !l.Active(now) {
 			continue
 		}
+		old, seen := newest[l.MAC]
+		if !seen || l.Expires.IsZero() || (!old.Expires.IsZero() && l.Expires.After(old.Expires)) {
+			newest[l.MAC] = l
+		}
+	}
+	explicit := map[string]bool{}
+	for _, host := range listed {
+		explicit[host] = true
+	}
+	var targets []dhcp.Lease
+	for _, l := range newest {
+		fixed := l.Expires.IsZero() || reservedMAC[l.MAC] || reservedIP[l.IP]
+		if !fixed || explicit[l.IP] {
+			targets = append(targets, l)
+		}
+	}
+	// 목록 파일에 남은 옛 DHCP 주소가 수동 호스트로 다시 추가되지 않게 합니다.
+	return append(targets, listedLeases(listed, leases)...), nil
+}
+
+// dhcpInstallTargets 는 동적 임대 중 아직 컨트롤러에 등록되지 않은 호스트의 IP 목록입니다.
+// (kpctl install -from-dhcp, kpctl ssh-key copy -from-dhcp 가 사용)
+func dhcpInstallTargets(c *client.Client) (targets []string, registered int, err error) {
+	leases, err := getDHCPPaths().installLeases(nil, time.Now())
+	if err != nil {
+		return nil, 0, err
+	}
+	hosts := registeredHosts(c)
+	for _, l := range leases {
 		if l.Name != "" && hosts[shortName(l.Name)] != nil {
 			registered++
 			continue

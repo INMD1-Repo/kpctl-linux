@@ -6,8 +6,8 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 HOST_MODE=0 START=1 PLAN=0 CONFIG_INPUT="" CA_INPUT="" SOURCES=""
-MEMORY_MIB=12288 CACHE_GIB=20 MIN_FREE_GIB=60 JOBS="" IMAGE_TIMEOUT_MINUTES=180
-CACHE_TOTAL_GIB=40 SNAPSHOT=auto CACHE_SELECTED=0
+MEMORY_MIB=12288 CACHE_GIB=20 MIN_FREE_GIB=60 JOBS="" IMAGE_TIMEOUT_MINUTES=180 SNAPSHOT_TIMEOUT_MINUTES=20
+CACHE_TOTAL_GIB=40 SNAPSHOT=auto CACHE_SELECTED=0 ALLOW_LIVE_FALLBACK=0
 BUILD_USER="" BUILD_USER_GIVEN=0
 KERNELS=() EXTRA_PACKAGES=()
 usage() {
@@ -21,6 +21,9 @@ usage() {
   --no-cache          ccache 끄기 (--cache-gib 0과 같음)
   --cache-total-gib N sandbox 공통 봉인 캐시 전체 한도 (기본 40 GiB)
   --snapshot ID       GCC용 서명 스냅샷 (기본 auto, none은 지정 저장소)
+  --allow-live-fallback 이번 설치에서 자동 스냅샷 서버 장애 시 Ubuntu 일반 저장소의 서명·정확한 GCC 버전 검증 허용
+  --snapshot-timeout-minutes N
+                      스냅샷 후보 한 개의 GCC 패키지 확인 제한 시간 (기본 20분)
   --min-free-gib N    빌드 시작 여유 공간 (기본 60)
   --image-timeout-minutes N
                       컴파일러 이미지 빌드 제한 시간 (기본 180분, 저장소가 느리면 늘림)
@@ -39,7 +42,8 @@ while [ $# -gt 0 ]; do
     --no-start) START=0; shift ;;
     --plan) PLAN=1; shift ;;
     --no-cache) CACHE_GIB=0; CACHE_SELECTED=1; shift ;;
-    --config|--ca-file|--memory-mib|--jobs|--cache-gib|--cache-total-gib|--snapshot|--min-free-gib|--sources|--package|--user|--image-timeout-minutes)
+    --allow-live-fallback) ALLOW_LIVE_FALLBACK=1; shift ;;
+    --config|--ca-file|--memory-mib|--jobs|--cache-gib|--cache-total-gib|--snapshot|--min-free-gib|--sources|--package|--user|--image-timeout-minutes|--snapshot-timeout-minutes)
       [ $# -ge 2 ] || { echo "$1 값이 필요합니다" >&2; exit 2; }
       case "$1" in
         --config) CONFIG_INPUT=$2 ;; --ca-file) CA_INPUT=$2 ;;
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
         --sources) SOURCES=$2 ;; --package) EXTRA_PACKAGES+=("$2") ;;
         --user) BUILD_USER=$2; BUILD_USER_GIVEN=1 ;;
         --image-timeout-minutes) IMAGE_TIMEOUT_MINUTES=$2 ;;
+        --snapshot-timeout-minutes) SNAPSHOT_TIMEOUT_MINUTES=$2 ;;
       esac
       shift 2 ;;
     --help|-h) usage; exit 0 ;;
@@ -57,7 +62,11 @@ while [ $# -gt 0 ]; do
        KERNELS+=("$1"); shift ;;
   esac
 done
-for value in "$MEMORY_MIB" "$CACHE_GIB" "$MIN_FREE_GIB" "$CACHE_TOTAL_GIB" "$IMAGE_TIMEOUT_MINUTES"; do
+if [[ "$ALLOW_LIVE_FALLBACK" = 1 && ( "$HOST_MODE" = 1 || -n "$SOURCES" || "$SNAPSHOT" != auto ) ]]; then
+  echo '--allow-live-fallback은 --snapshot auto를 쓰는 기본 sandbox 저장소에서만 사용할 수 있습니다' >&2
+  exit 2
+fi
+for value in "$MEMORY_MIB" "$CACHE_GIB" "$MIN_FREE_GIB" "$CACHE_TOTAL_GIB" "$IMAGE_TIMEOUT_MINUTES" "$SNAPSHOT_TIMEOUT_MINUTES"; do
   [[ "$value" =~ ^[0-9]+$ ]] || { echo '자원 한도는 정수여야 합니다' >&2; exit 2; }
 done
 # 빌드 계정: 지정값 → 이미 설치된 서비스의 User= → kpbuild. 설치된 계정과 다르면 거부 (파일 소유자가 갈라지므로).
@@ -71,6 +80,7 @@ fi
 [[ -z "$JOBS" || "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo '--jobs는 1 이상이어야 합니다' >&2; exit 2; }
 (( MEMORY_MIB >= 1024 && MEMORY_MIB <= 1048576 && CACHE_GIB <= 1024 && MIN_FREE_GIB >= 8 && MIN_FREE_GIB <= 65536 )) || { echo '잘못된 자원 한도' >&2; exit 2; }
 (( IMAGE_TIMEOUT_MINUTES >= 10 && IMAGE_TIMEOUT_MINUTES <= 1440 )) || { echo '--image-timeout-minutes 는 10~1440 이어야 합니다' >&2; exit 2; }
+(( 10#$SNAPSHOT_TIMEOUT_MINUTES >= 1 && 10#$SNAPSHOT_TIMEOUT_MINUTES <= 1440 )) || { echo '--snapshot-timeout-minutes 는 1~1440 이어야 합니다' >&2; exit 2; }
 (( CACHE_TOTAL_GIB <= 4096 && (HOST_MODE == 1 || CACHE_TOTAL_GIB >= CACHE_GIB) )) || { echo '공통 캐시 한도가 잘못됐습니다' >&2; exit 2; }
 if [ "$PLAN" = 0 ] && [ "$CACHE_SELECTED" = 0 ] && [ -t 0 ]; then
   if [ "$HOST_MODE" = 1 ]; then
@@ -225,23 +235,60 @@ fi
 
 echo "■ Ubuntu 커널 git ($CODENAME)"
 GIT_DIR="$GIT_ROOT/ubuntu-$CODENAME"
-if [ -d "$GIT_DIR/.git" ]; then
-  echo "  이미 있음: $GIT_DIR"
-else
+(
+  builder_git() { sudo -u "$BUILD_USER" -H sh -c 'cd "$HOME" && exec git "$@"' sh "$@"; }
+  valid_worktree() {
+    local top
+    top=$(builder_git -C "$1" rev-parse --show-toplevel 2>/dev/null) &&
+      [[ "$1" -ef "$top" ]] && builder_git -C "$1" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null
+  }
+  use_existing() {
+    if valid_worktree "$GIT_DIR"; then
+      echo "  이미 있음: $GIT_DIR"
+      return 0
+    fi
+    echo "!! $GIT_DIR 에서 빌드 사용자가 유효한 git 체크아웃과 HEAD를 확인할 수 없습니다. 기존 경로를 복구하거나 다른 위치로 옮긴 뒤 재시도하세요." >&2
+    return 1
+  }
+  if [ -e "$GIT_DIR" ] || [ -L "$GIT_DIR" ]; then
+    use_existing
+    exit
+  fi
+  mkdir -p -- "$GIT_ROOT"
+  stage=$(mktemp -d -- "$GIT_ROOT/.ubuntu-$CODENAME.clone.XXXXXXXX")
+  trap 'rm -rf -- "$stage"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  chmod 0711 "$stage"
   # Launchpad 의 HTTPS 앞단은 큰 저장소에서 "Path translation timed out" / 504 를 자주 냅니다 (서버 측 일시 오류).
   # 몇 번 다시 시도하고, 그래도 안 되면 HTTP 앞단을 거치지 않는 git:// 로 받습니다.
   # origin 은 마지막에 https 로 맞춰 두어, 이후 fetch 는 방화벽에서 막히기 쉬운 9418 포트를 쓰지 않습니다.
   LP_PATH="git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/${CODENAME}"
-  cloned=""
-  for url in "https://$LP_PATH" "https://$LP_PATH" "https://$LP_PATH" "git://$LP_PATH" "git://$LP_PATH"; do
-    rm -rf "$GIT_DIR"; install -d -o "$BUILD_USER" -g "$BUILD_GROUP" "$GIT_DIR"
+  urls=("https://$LP_PATH" "https://$LP_PATH" "https://$LP_PATH" "git://$LP_PATH" "git://$LP_PATH")
+  for index in "${!urls[@]}"; do
+    url=${urls[index]}
+    checkout="$stage/checkout"
+    install -d -o "$BUILD_USER" -g "$BUILD_GROUP" "$checkout"
     echo "  clone: $url"
-    if sudo -u "$BUILD_USER" -H sh -c 'cd "$HOME"; exec git "$@"' sh clone "$url" "$GIT_DIR"; then cloned=1; break; fi
-    echo "  !! 실패. 30초 뒤 다시 시도합니다"; sleep 30
+    if builder_git clone "$url" "$checkout" && valid_worktree "$checkout"; then
+      builder_git -C "$checkout" remote set-url origin "https://$LP_PATH"
+      if ! mv -nT -- "$checkout" "$GIT_DIR"; then
+        [ -e "$GIT_DIR" ] || [ -L "$GIT_DIR" ] || exit 1
+      fi
+      # mv -n 은 다른 설치가 경로를 먼저 만들었을 때도 성공을 반환할 수 있습니다.
+      if [ -e "$checkout" ]; then use_existing; fi
+      exit 0
+    fi
+    rm -rf -- "$checkout"
+    if (( index + 1 < ${#urls[@]} )); then
+      echo "  !! 실패. 30초 뒤 다시 시도합니다"
+      sleep 30
+    fi
   done
-  [ -n "$cloned" ] || { echo "!! 커널 git clone 실패 (Launchpad 일시 장애일 수 있음). 나중에 이 스크립트를 다시 실행하세요"; exit 1; }
-  sudo -u "$BUILD_USER" -H sh -c 'cd "$HOME"; exec git "$@"' sh -C "$GIT_DIR" remote set-url origin "https://$LP_PATH"
-fi
+  echo "!! 커널 git clone 실패 (Launchpad 일시 장애일 수 있음). 나중에 이 스크립트를 다시 실행하세요" >&2
+  exit 1
+)
 
 profiles="/var/lib/kpctl-builder/environments/$CODENAME"
 if [ "$HOST_MODE" = 0 ]; then
@@ -251,7 +298,8 @@ if [ "$HOST_MODE" = 0 ]; then
            --base-image "docker.io/library/ubuntu:$VERSION_ID" --memory-mib "$MEMORY_MIB"
            --pids 4096 --min-free-gib "$MIN_FREE_GIB" --cache-gib "$CACHE_GIB"
            --cache-total-gib "$CACHE_TOTAL_GIB" --snapshot "$SNAPSHOT" --git-dir "$GIT_DIR"
-           --image-timeout-minutes "$IMAGE_TIMEOUT_MINUTES")
+           --snapshot-timeout-minutes "$SNAPSHOT_TIMEOUT_MINUTES" --image-timeout-minutes "$IMAGE_TIMEOUT_MINUTES")
+  if [ "$ALLOW_LIVE_FALLBACK" = 1 ]; then prepare+=(--allow-live-fallback); fi
   source_copy=""
   if [ -n "$SOURCES" ]; then
     source_copy=$(mktemp /var/lib/kpctl-builder/environments/.sources.XXXXXXXX)
@@ -296,7 +344,8 @@ if [ -z "$JOBS" ]; then
   JOBS=$(( MEMORY_MIB / 1536 )); (( JOBS > 0 )) || JOBS=1
   cpus=$(nproc); (( JOBS <= cpus )) || JOBS=$cpus
 fi
-python3 - "$config_source" "$HOST_MODE" "$profiles" "$CODENAME" "$GIT_ROOT" "$JOBS" "$CA_INPUT" "$MEMORY_MIB" "$CACHE_GIB" "$CACHE_TOTAL_GIB" "$MIN_FREE_GIB" "$SNAPSHOT" "$source_for_config" "$base_for_config" "$BUILD_GROUP" "${EXTRA_PACKAGES[@]}" <<'PY'
+python3 - "$config_source" "$HOST_MODE" "$profiles" "$CODENAME" "$GIT_ROOT" "$JOBS" "$CA_INPUT" "$MEMORY_MIB" "$CACHE_GIB" "$CACHE_TOTAL_GIB" "$MIN_FREE_GIB" "$SNAPSHOT" \
+  "$SNAPSHOT_TIMEOUT_MINUTES" "$IMAGE_TIMEOUT_MINUTES" "$source_for_config" "$base_for_config" "$BUILD_GROUP" "${EXTRA_PACKAGES[@]}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -304,7 +353,8 @@ import grp
 import sys
 import tempfile
 
-source, host, profiles, series, git_root, jobs, ca, memory, cache, total, minimum, snapshot, sources, base, group, *packages = sys.argv[1:]
+(source, host, profiles, series, git_root, jobs, ca, memory, cache, total, minimum, snapshot,
+ snapshot_timeout, image_timeout, sources, base, group, *packages) = sys.argv[1:]
 config = json.loads(Path(source).read_text())
 if config.get("series") not in (None, "", series):
     raise SystemExit("설정의 series가 설치할 Ubuntu 시리즈와 다릅니다")
@@ -319,6 +369,7 @@ else:
     config["sandbox"] = {"profiles_dir": profiles, "retry_clean": True, "auto_prepare": True,
                          "prepare": {"base_image": base, "memory_mib": int(memory), "pids": 4096, "min_free_gib": int(minimum),
                                      "cache_gib": int(cache), "cache_total_gib": int(total), "snapshot": snapshot,
+                                     "snapshot_timeout_minutes": int(snapshot_timeout), "image_timeout_minutes": int(image_timeout),
                                      "sources": sources, "packages": packages}}
 target = Path("/etc/kpctl/builder.json")
 fd, name = tempfile.mkstemp(prefix=".builder-", dir=target.parent)
