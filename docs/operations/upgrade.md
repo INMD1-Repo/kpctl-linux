@@ -4,6 +4,8 @@
 
 컨트롤러, CLI, 에이전트 설치 묶음, 빌더 바이너리와 외부 도우미를 같은 배포본으로 관리합니다. 프로그램 갱신은 호스트 재부팅 승인을 만들지 않습니다. 배포 전 현재 설정·상태·적용 버전과 진행 작업을 기록합니다.
 
+**외부 서명기를 사용하는 운영자**는 업그레이드 전에 실제 서명자에 대응하는 공개 DER가 설정되어 있는지 확인하세요. 검증할 DER를 찾을 수 없는 래퍼·HSM 명령 또는 `cert`가 없는 명시적 키는 업그레이드 직후부터 해당 키의 서명 승인이 차단됩니다. 시작 감사 로그와 `sudo kpctl signing list`에 승인 불가 사유가 표시됩니다. 기존 최상위 래퍼는 동일한 키 ID `default`와 DER를 사용해 아래 절차로 이전합니다.
+
 <a id="backup"></a>
 
 ## 일관된 백업
@@ -33,6 +35,14 @@ sudo kpctl signing list
 
 명령 사이의 파일 설치는 [컨트롤러 설치](../install/controller.md)의 배포 묶음 절차를 따릅니다. 시작 중 인증서 ID의 DER pin이 다르다고 거부되면 새 ID로 교체 절차를 설계합니다. 상태 파일에서 pin을 지워 통과시키지 않습니다. 중단된 VM 시험은 시작 복구에서 정리되고 실패로 표시됩니다.
 
+### 서명 필요 호스트의 업그레이드 점검
+
+업그레이드 전에 `sudo kpctl hosts`와 `sudo kpctl signing list`로 서명 필요·상태 미확인 호스트와 현재 서명 설정을 대조합니다. 새 에이전트가 Secure Boot on, lockdown, 강제 서명 또는 보안 신호의 `unknown`을 보고하면, 서명 미설정에서는 이후 누적본 배포가 `blocked_signing_disabled`로 제외됩니다. 서명 메타데이터가 없는 이전 승인 작업은 `blocked_artifact`가 될 수 있습니다. 기존 적용 모듈은 계속 보호하지만 제외가 풀릴 때까지 새 CVE 패치는 적용되지 않습니다. 모든 보고 신호가 off/none이면 기존 미서명 배포를 유지합니다. 보안 필드를 생략한 구 에이전트는 호환 경로를 사용합니다. 과거 상태 파일에 저장된 서명 필요 값은 다음 에이전트 보고에서 갱신됩니다.
+
+서명 명령이 있는 경우 컨트롤러의 OpenSSL CMS, 대상 ABI용 `sign-file`, 실제 서명자와 일치하는 공개 DER를 먼저 준비합니다. 기존 최상위 `sign_command`의 정적 `.der` 경로를 읽을 수 있으면 같은 명령을 유지할 수 있습니다. 처음 지문을 고정해야 할 때 추정한 DER를 읽지 못하면 시작은 계속하지만 서명과 인증서 배포는 보류됩니다. DER 복구 후에도 `sudo kpctl signing list`에 재시작 필요 경고가 남아 있으면 컨트롤러를 재시작해 `default` 지문을 저장한 뒤 재승인하세요. 이미 지문이 보존된 ID에서는 복구한 DER가 저장된 지문과 일치해야 합니다. 래퍼 뒤에 인증서 경로가 숨겨져 있으면 기존 명령을 `signing.keys[].sign_command`로 옮기고 `id: default`, `active: true`, `cert`에 같은 인증서를 지정합니다. 새 승인부터 서명자·원본 검증을 수행합니다. 업그레이드만으로 과거 released 작업을 다시 검사하지 않으므로 이전 호스트로 배포하거나 롤백하기 전에 검증된 기준 버전을 확보하세요.
+
+시험 컨트롤러의 canary에서 새 누적본 승인·서명 SHA·실제 적용까지 확인한 뒤 운영 호스트를 갱신합니다. [등록과 적용 확인](secure-boot.md#mok-enrollment)
+
 ## 빌더와 에이전트
 
 빌더 자동 갱신은 `self_update=true`, 제공 바이너리 존재, 서비스의 `KPCTL_BUILDER_UPDATE_PATH`가 모두 필요합니다. 빌더는 인증된 HTTPS로 받은 SHA를 확인하고 `-h` 실행 시험 후 staging 파일을 남겨 종료 코드 75로 재시작합니다. 서비스는 `kpbuild` 소유 단일 링크 일반 파일만 root 설치 대상으로 허용합니다. 이 경로는 Python 도우미·컨테이너 레시피·서비스 설정을 자동 갱신하지 않으므로 별도로 같은 배포본을 설치합니다.
@@ -44,6 +54,8 @@ sudo kpctl signing list
 ```sh
 sudo -u kpbuild -H /usr/local/bin/kpctl-builder -config /etc/kpctl/builder.json -check-config
 ```
+
+MOK의 `awaiting_agent`가 지속되면 에이전트 연결과 버전을 확인하고 기존 요청 결과를 먼저 받습니다. 구 에이전트의 `mok_pending: false`에는 빈 MokNew를 확인한 증거가 없어 실패한 키에서 다른 키로 자동 전환하거나 `-replace-request`를 실행할 수 없습니다. 에이전트 갱신 후 최근 빈 목록 보고를 확인하세요. [MOK 예약 복구](secure-boot.md#mok-enrollment)
 
 에이전트는 새 묶음을 사용하는 `kpctl install` 또는 호스트 설치 스크립트 재실행으로 갱신합니다. 설치는 등록 정보·적용 패치·기존 재부팅 훅을 보존하지만 `agent.json`을 생성하므로 커스텀 설정을 사전에 비교·백업합니다. 갱신 후 security·enrollment·설치 SHA 보고와 실제 활성 상태를 확인합니다. MOK 자동 예약은 명시적인 선택이며 재부팅을 뜻하지 않습니다.
 

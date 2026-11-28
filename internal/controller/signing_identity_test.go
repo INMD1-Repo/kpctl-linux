@@ -94,3 +94,61 @@ func TestSigningIdentityLegacyPinnedCertChangeBlocksApproval(t *testing.T) {
 		t.Fatal("pinned legacy DER replacement must block signing")
 	}
 }
+
+func TestLegacyDERAppearingAfterStartupNeedsPersistentPin(t *testing.T) {
+	s := newAutoServer(t, AutoRollout{})
+	key := testSigningKey(t, "default", true)
+	path := filepath.Join(t.TempDir(), "legacy.der")
+	s.cfg.SignCommand = []string{"external", path, "{module}"}
+	running, err := NewServer(s.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := os.ReadFile(key.Cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, der, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if certs, err := running.signingCerts(); err == nil || len(certs) != 0 {
+		t.Fatal("unbound legacy ID advertised")
+	}
+	if status := running.signingStatus(); !strings.Contains(status.Keys[0].Warning, "재시작 필요") {
+		t.Fatal(status)
+	}
+	restarted, err := NewServer(s.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := restarted.signingStatus(); strings.Contains(status.Keys[0].Warning, "재시작 필요") {
+		t.Fatal(status)
+	}
+	certs, err := restarted.signingCerts()
+	if err != nil || len(certs) != 1 || restarted.signingCertSHA256["default"] != signingBytesSHA256(der) {
+		t.Fatal("restarted service did not pin DER", err)
+	}
+}
+
+func TestMissingSignerCertWarnsBeforeFirstApproval(t *testing.T) {
+	for _, legacy := range []bool{true, false} {
+		s := newAutoServer(t, AutoRollout{})
+		cmd := []string{"external-signer", "{module}"}
+		if legacy {
+			s.cfg.SignCommand = cmd
+		} else {
+			s.cfg.Signing = &SigningConfig{Keys: []SigningKey{{ID: "new", Active: true, SignCommand: cmd}}}
+		}
+		restarted, err := NewServer(s.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info := restarted.signingStatus().Keys[0]; !strings.Contains(info.Warning, "승인 불가") {
+			t.Fatal(info)
+		}
+		audit, err := os.ReadFile(filepath.Join(s.cfg.DataDir, "audit.log"))
+		if err != nil || !strings.Contains(string(audit), "공개 DER") {
+			t.Fatal("missing startup audit", err)
+		}
+	}
+}

@@ -96,8 +96,7 @@ func enableApprovalVM(t *testing.T, s *Server, r testvm.Runner) {
 	if err := s.store.Update(func(st *State) error { st.Hosts["gpu-test"].Status.Firmware = "bios"; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	// Signing appends a marker so the test can assert retries use the original.
-	s.cfg.SignCommand = []string{vmScript(t, dir, "sign.sh", `printf '%s' ':signed' >> "$1"`), "{module}"}
+	s.cfg.SignCommand = testSigningKey(t, "default", true).SignCommand
 }
 
 func TestVMApprovalTestsAndReleasesExactSignedArtifact(t *testing.T) {
@@ -117,7 +116,7 @@ func TestVMApprovalTestsAndReleasesExactSignedArtifact(t *testing.T) {
 			t.Errorf("VMs survived successful test: %+v", st.TestVMs)
 		}
 		actual, err := os.ReadFile(s.artifactFile(j.Kernel, j.ModuleName))
-		if err != nil || string(actual) != "module:signed" || !r.sawCopy(actual) {
+		if err != nil || string(actual) != expectedPayload(t, s, "module", "default") || !r.sawCopy(actual) {
 			t.Errorf("tested artifact differs from release: %q / %q (%v)", r.copied, actual, err)
 		}
 	})
@@ -165,7 +164,7 @@ func TestVMFailureBlocksApprovalAndRetrySignsFreshCandidate(t *testing.T) {
 	if _, _, _, err := s.approveJob(id, "tester"); err != nil {
 		t.Fatal(err)
 	}
-	if !r.sawCopy([]byte("module:signed")) {
+	if !r.sawCopy([]byte(expectedPayload(t, s, "module", "default"))) {
 		t.Fatalf("retry appended duplicate signatures: %q", r.copied)
 	}
 }

@@ -40,8 +40,11 @@ func (s *Server) desired(st *State, h *model.Host) model.DesiredPatch {
 		blocked := model.DesiredPatch{Blocked: true, Warning: eligibility.Reason}
 		// blocked를 모르는 이전 에이전트도 현재 보호를 v0로 내리지 않게 합니다.
 		if current := st.releasedJob(h.Status.Kernel, h.Status.Version); h.Status.Version != 0 && current != nil {
-			blocked.Version, blocked.ModuleName, blocked.SHA256 = current.Version, current.ModuleName, current.SHA256
-			blocked.URL = fmt.Sprintf("/artifacts/%s/%s.ko", current.Kernel, current.ModuleName)
+			blocked.Version, blocked.ModuleName = current.Version, current.ModuleName
+			if !reportedSigningStatus(h.Status) {
+				blocked.SHA256 = current.SHA256
+				blocked.URL = fmt.Sprintf("/artifacts/%s/%s.ko", current.Kernel, current.ModuleName)
+			}
 		}
 		return blocked
 	}
@@ -141,6 +144,12 @@ func hostSignatureRequired(status model.HostStatus) bool {
 	return required
 }
 
+// Older agents omitted all signing fields. An explicit "unknown" is still a report.
+func reportedSigningStatus(h model.HostStatus) bool {
+	return h.SignatureRequired || h.SecureBoot != "" || h.Lockdown != "" || h.SigEnforce != "" ||
+		h.Firmware != "" || h.ModuleSHA256 != "" || len(h.EnrolledCerts) != 0 || h.MOKPending || h.MOKImport != nil
+}
+
 // rolloutEligibility는 키 선택과 제외 사유를 결정하는 유일한 정책 함수입니다.
 func (s *Server) rolloutEligibility(h *model.Host, j *model.Job) model.RolloutEligibility {
 	result := model.RolloutEligibility{Status: "eligible"}
@@ -165,6 +174,16 @@ func (s *Server) rolloutEligibility(h *model.Host, j *model.Job) model.RolloutEl
 		result.Warning = result.Reason
 		return result
 	}
+	if reportedSigningStatus(h.Status) {
+		if len(cfg.Keys) == 0 {
+			result.Status, result.Reason = "blocked_signing_disabled", "서명이 필요한 호스트: 컨트롤러 서명 키·명령 설정 필요"
+			return result
+		}
+		if j != nil && len(j.SigningArtifacts) == 0 {
+			result.Status, result.Reason = "blocked_artifact", "서명 사본을 확인할 수 없는 이전 작업: 새 누적 빌드·승인 필요"
+			return result
+		}
+	}
 	// 설치 해시와 키 등록 상태가 없는 이전 에이전트는 첫 적용부터 작업의 기본 사본을 씁니다.
 	// 처음에는 현재 active, 적용 후에는 작업 기본 키를 고르면 같은 이름의 설치 SHA가 바뀝니다.
 	if j != nil && h.Status.ModuleSHA256 == "" && len(h.Status.EnrolledCerts) == 0 {
@@ -188,6 +207,9 @@ func (s *Server) rolloutEligibility(h *model.Host, j *model.Job) model.RolloutEl
 			artifact, ok := j.SigningArtifacts[key.ID]
 			if ok && artifact.Signed && artifact.SHA256 == h.Status.ModuleSHA256 && h.Status.EnrolledCerts[key.ID] != "not_enrolled" {
 				result.KeyID = key.ID
+				if h.Status.EnrolledCerts[key.ID] != "enrolled" {
+					result.Warning = joinSecurityWarnings(result.Warning, "기존 서명 사본의 인증서 등록 상태 미확인")
+				}
 				if key.ID != active {
 					result.Warning = joinSecurityWarnings(result.Warning, "동일 버전의 기존 서명 사본 유지: active 키는 새 누적본부터 반영")
 				}
@@ -232,9 +254,13 @@ func (s *Server) rolloutEligibility(h *model.Host, j *model.Job) model.RolloutEl
 		return result
 	}
 	if unknown {
-		if s.cfg.Signing != nil && j != nil && len(j.SigningArtifacts) > 0 {
+		if j != nil && len(j.SigningArtifacts) > 0 {
 			if artifact, ok := j.SigningArtifacts[active]; !ok || !artifact.Signed {
 				result.Status, result.Reason = "blocked_artifact", "active 키의 서명 사본이 없어 새 누적 빌드·승인 필요"
+				return result
+			}
+			if h.Status.Version == j.Version && h.Status.ModuleSHA256 != "" && j.SigningArtifacts[active].SHA256 != h.Status.ModuleSHA256 {
+				result.Status, result.Reason = "blocked_artifact", "동일 버전의 서명 사본 교체 대신 새 누적본 빌드·승인 필요"
 				return result
 			}
 		}

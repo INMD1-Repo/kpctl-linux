@@ -182,7 +182,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 	resp.SigningCerts = certs
 	var jumped *model.RebootApproval
 	var rebootDone, kernelChanged, blockedLegacy bool
-	var name, oldKernel string
+	var name, oldKernel, scheduledMOK string
 	err := s.store.Update(func(st *State) error {
 		h := st.Hosts[hostID]
 		if h == nil {
@@ -192,20 +192,25 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 		kernelChanged = oldKernel != "" && oldKernel != req.Status.Kernel
 
 		h.Status = req.Status
-		h.Status.SignatureRequired, h.Status.SecurityWarning = hostSecurityPolicy(req.Status)
-		h.Status.SecurityWarning = joinSecurityWarnings(h.Status.SecurityWarning, req.Status.SecurityWarning)
+		// Preserve the reported policy bit. Eligibility and the status API compute
+		// effective policy, including the conservative default for older agents.
 		if certErr != nil {
 			h.Status.SecurityWarning = joinSecurityWarnings(h.Status.SecurityWarning, "서명 인증서 목록을 읽지 못했습니다: 관리자 확인 필요")
 		}
-		if record := st.MOKRequests[hostID]; record != nil && req.Status.MOKImport != nil && record.Request.ID == req.Status.MOKImport.ID {
+		if record := st.MOKRequests[hostID]; record != nil && req.Status.MOKImport != nil && record.Request.ID == req.Status.MOKImport.ID && record.Request.KeyID == req.Status.MOKImport.KeyID {
 			cp := *req.Status.MOKImport
 			record.Result = &cp
 		}
-		if req.AutoImportCert && hostSignatureRequired(h.Status) && st.MOKRequests[hostID] == nil {
+		h.LastSeen = time.Now()
+		if req.AutoImportCert && hostSignatureRequired(h.Status) {
 			for _, cert := range certs {
 				if cert.Active && h.Status.EnrolledCerts[cert.ID] == "not_enrolled" {
-					if err := s.scheduleMOK(st, h, cert.ID); err != nil {
+					if scheduled, warning, err := s.scheduleMOK(st, h, cert, false, ""); err != nil {
 						h.Status.SecurityWarning = joinSecurityWarnings(h.Status.SecurityWarning, "MOK 자동 예약 미지원: 수동 등록 필요")
+					} else if warning != "" {
+						h.Status.SecurityWarning = joinSecurityWarnings(h.Status.SecurityWarning, warning)
+					} else if scheduled {
+						scheduledMOK = cert.ID
 					}
 				}
 			}
@@ -214,7 +219,6 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 			cp := record.Request
 			resp.MOKImport = &cp
 		}
-		h.LastSeen = time.Now()
 		if len(s.cfg.Scheduler.VMCountCommand) == 0 {
 			h.VMCount = -1
 			if req.Status.LocalVMCount != nil {
@@ -257,6 +261,9 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if scheduledMOK != "" {
+		s.audit("agent", "MOK 인증서 자동 예약 host=%s key=%s", hostID, scheduledMOK)
 	}
 	if blockedLegacy {
 		writeErr(w, fail(http.StatusConflict, "배포 제외: 기존 보호를 유지하세요. 에이전트 갱신과 서명 설정 확인 필요"))
@@ -305,7 +312,7 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	key := r.URL.Query().Get("key")
-	if key != "" && !signingKeyID.MatchString(key) {
+	if key != "" && !model.ValidSigningKeyID(key) {
 		writeErr(w, fail(http.StatusBadRequest, "서명 키 ID 가 잘못됐습니다"))
 		return
 	}

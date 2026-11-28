@@ -43,6 +43,18 @@ mkdir -p "$BIN"
 export PATH="$BIN:$FAKE:$PATH"   # 실제 APT 상태와 격리한 가짜 배포 색인도 사용
 pass "바이너리 4개"
 
+mkdir -m 0700 "$W/signing"
+env -u KPCTL_URL -u KPCTL_TOKEN kpctl signing init-key -dir "$W/signing" temp-e2e > "$W/key-info"
+check "관리자 토큰 없이 임시 모듈 서명 인증서 생성" test -s "$W/signing/temp-e2e/module.der"
+
+CERT="$W/signing/temp-e2e/module.der"
+CERT_SHA=$(sha256sum "$CERT" | cut -d ' ' -f1)
+check "init-key 지문과 DER 바이트 일치" grep -Fq "$CERT_SHA" "$W/key-info"
+SIGNER="$FAKE/sign-file"
+for tool in /usr/src/linux-headers-*/scripts/sign-file; do
+  if [ -x "$tool" ]; then SIGNER="$tool"; break; fi
+done
+
 echo "■ 가짜 Ubuntu 커널 git 준비"
 U="$W/upstream"
 mkdir -p "$U"/{arch/x86/kvm,virt/kvm,fs/ext4,drivers/vfio}
@@ -86,7 +98,8 @@ cat > "$W/controller.json" <<EOF
     {"name": "fleet",  "token": "enroll-fleet-01234567890", "ring": 2, "reboot_policy": "drain"}
   ],
   "rings": [1, 2],
-  "sign_command": ["$FAKE/sign-file", "{module}"],
+  "signing": {"mode":"when_required","keys":[{"id":"temp-e2e","active":true,"cert":"$CERT",
+    "sign_command":["$SIGNER","sha256","$W/signing/temp-e2e/module.priv","$CERT","{module}"]}]},
   "scheduler": {"vm_count_command": ["$FAKE/vm-count", "{host}"]},
   "drain_check_seconds": 1
 }
@@ -109,6 +122,15 @@ EOF
 make_host() {
   local h=$1 tok=$2 kernel=$3 sig=$4
   local R="$W/host-$h"; mkdir -p "$R/proc"
+  mkdir -p "$R/sys/firmware/efi/efivars" "$R/sys/kernel/security" "$R/sys/module/module/parameters"
+  printf '\007\000\000\000\001' > "$R/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+  echo 'none [integrity] confidentiality' > "$R/sys/kernel/security/lockdown"
+  echo Y > "$R/sys/module/module/parameters/sig_enforce"
+  if [ "$h" != gpu-01 ]; then
+    printf '\007\000\000\000\000' > "$R/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    echo '[none] integrity confidentiality' > "$R/sys/kernel/security/lockdown"
+    echo N > "$R/sys/module/module/parameters/sig_enforce"
+  fi
   echo "$kernel" > "$R/proc/osrelease"; echo "$sig" > "$R/proc/version_signature"; echo 32768 > "$R/proc/tainted"
   printf '#!/bin/sh\ntouch %s/rebooted\n' "$R" > "$R/reboot-hook.sh"
   python3 "$FAKE/prepare-boot.py" "$R" "$kernel"
@@ -117,6 +139,7 @@ make_host() {
   "controller_url": "$KPCTL_URL", "enroll_token": "$tok", "hostname": "$h",
   "state_dir": "$R/state", "kpatch_bin": "$FAKE/kpatch", "kpatch_install_dir": "$R/installed", "reboot_hook": "$R/reboot-hook.sh",
   "livepatch_sysfs": "$R/sys/livepatch", "module_sysfs": "$R/sys/module",
+  "sysfs_root": "$R/sys", "mokutil_bin": "$FAKE/mokutil",
   "tainted_path": "$R/proc/tainted", "osrelease_path": "$R/proc/osrelease",
   "signature_path": "$R/proc/version_signature", "boot_id_path": "$R/proc/boot_id", "proc_dir": "$R/proc",
   "boot_dir": "$R/boot", "grub_config": "$R/boot/grub.cfg", "grub_env": "$R/grubenv",
@@ -174,10 +197,26 @@ kpctl auto clear "$KERNEL" >/dev/null
 
 echo "■ 3. 승인 → 링 1"
 kpctl approve 1 >/dev/null
-check "서명 명령 실행됨" grep -q '~SIGNED~' "$W/ctl-data/artifacts/$KERNEL/$(modname 1).ko"
-if kpctl promote -kernel $KERNEL -ring 2 >"$W/out" 2>&1; then die "적용 전 promote 가 통과됨"; fi
-check "카나리 미적용 상태에서 promote 차단" grep -q '아직 v0' "$W/out"
+check "승인본 Linux 모듈 서명" grep -aq '~Module signature appended~' "$W/ctl-data/artifacts/$KERNEL/$(modname 1).ko"
+agent gpu-01
+check "미등록 canary 배포 제외" bash -c "kpctl hosts | grep gpu-01 | grep -q blocked_mok_missing"
+check "미등록 canary에 설치 사본 없음" test ! -e "$W/host-gpu-01/installed/$KERNEL/$(modname 1).ko"
+check "에이전트에 동일한 공개 DER 전달" cmp "$CERT" "$W/host-gpu-01/state/certs/$CERT_SHA.der"
+kpctl signing rollout-cert -host gpu-01 temp-e2e > "$W/out"
+check "canary 한 대만 MOK 예약" grep -q '등록 예약: 1대' "$W/out"
+if kpctl hosts mok-password gpu-02 >"$W/out" 2>&1; then die "다른 호스트에도 MOK 요청 생성"; fi
+agent gpu-01
+kpctl hosts mok-status gpu-01 > "$W/out"
+check "예약 후에도 미등록" grep -q 'temp-e2e: not_enrolled' "$W/out"
+check "MOK pending 확인" grep -q 'mok_pending: true' "$W/out"
+check "예약 중 모듈 미적용" test ! -e "$(lp gpu-01)/$(modname 1)"
+check "MOK 예약에 동일한 공개 DER" cmp "$CERT" "$W/host-gpu-01/mok/pending"
+check "MOK 예약으로 재부팅 훅 호출 없음" test ! -e "$W/host-gpu-01/rebooted"
+# 모델의 콘솔 승인 경계. 실제 firmware, MokManager, kernel은 실행하지 않습니다.
+mv "$W/host-gpu-01/mok/pending" "$W/host-gpu-01/mok/enrolled"
 agent gpu-01; agent gpu-02
+check "등록한 키로 서명된 사본과 실제 전송된 바이트 일치" cmp "$W/ctl-data/artifacts/$KERNEL/signed-temp-e2e/$(modname 1).ko" "$W/host-gpu-01/installed/$KERNEL/$(modname 1).ko"
+check "등록 완료 에이전트 보고" bash -c "kpctl hosts mok-status gpu-01 | grep -q 'temp-e2e: enrolled'"
 check "gpu-01(링1) v1 적용" test "$(cat "$(lp gpu-01)/$(modname 1)/enabled")" = 1
 check "gpu-02(링2) 아직 미적용" test ! -e "$(lp gpu-02)/$(modname 1)"
 
@@ -198,6 +237,8 @@ kpctl submit -kernel $KERNEL -urgent -cve CVE-2026-9999 -title "0-day 긴급" "$
 "$BIN/kpctl-builder" -config "$W/builder.json" -once 2>>"$W/builder.log"
 check "v2 는 v1 패치 + 수동 패치 누적" bash -c "grep -q bounds_check '$W/ctl-data/artifacts/$KERNEL/$(modname 2).ko' && grep -q zero_day_fix '$W/ctl-data/artifacts/$KERNEL/$(modname 2).ko'"
 kpctl approve 2 >/dev/null
+if kpctl promote -kernel $KERNEL -ring 2 >"$W/out" 2>&1; then die "적용 전 promote 가 통과됨"; fi
+check "카나리 v2 미적용 상태에서 promote 차단" grep -q '아직 v1' "$W/out"
 agent gpu-01
 check "gpu-01 v2 적용" test -e "$(lp gpu-01)/$(modname 2)"
 check "gpu-01 v1 모듈 내려짐" test ! -e "$W/host-gpu-01/sys/module/$(modname 1)"
@@ -254,7 +295,7 @@ check "감사 로그 기록" grep -q '승인 job 1' "$W/ctl-data/audit.log"
 echo "■ 10. LTS 시리즈별 빌드 서버"
 JAMMY=5.15.0-125-generic
 echo 'CONFIG_LIVEPATCH=y' > "$W/boot/config-$JAMMY"
-make_host gpu-03 enroll-fleet-01234567890 $JAMMY "Ubuntu 5.15.0-125.135-generic 5.15.167"
+make_host gpu-03 enroll-canary-0123456789 $JAMMY "Ubuntu 5.15.0-125.135-generic 5.15.167"
 make_host gpu-04 enroll-fleet-01234567890 $KERNEL "Ubuntu 6.8.0-85.85~22.04.1-generic 6.8.12"   # 22.04 HWE
 agent gpu-03; agent gpu-04
 check "22.04 HWE 호스트에는 24.04 GA 용 모듈을 주지 않음" test -z "$(ls "$(lp gpu-04)" 2>/dev/null)"
@@ -282,6 +323,13 @@ JOB=$(kpctl jobs | awk -v k=$JAMMY '!found && $0 ~ k {print $1; found=1}')
 "$BIN/kpctl-builder" -config "$W/builder-jammy.json" -once 2>>"$W/builder-jammy.log"
 check "정확한 jammy 기준 입력을 준비하면 작업 빌드" bash -c "kpctl jobs | grep -qE '^$JOB .*승인대기'"
 
+kpctl approve "$JOB" >/dev/null
+JMOD="kpctl_5_15_0_125_generic_$(kpctl jobs | awk -v j="$JOB" '$1 == j {print $3}')"
+check "Secure Boot off 전용 커널에서 원본 바이트 보존" cmp "$W/ctl-data/artifacts/$JAMMY/.unsigned-$JMOD.ko" "$W/ctl-data/artifacts/$JAMMY/$JMOD.ko"
+
+agent gpu-03
+check "Secure Boot off canary에 MOK 없이 미서명 사본 적용" cmp "$W/ctl-data/artifacts/$JAMMY/.unsigned-$JMOD.ko" "$W/host-gpu-03/installed/$JAMMY/$JMOD.ko"
+
 echo "■ 11. 자동 배포"
 kill "$CTRL_PID"; wait "$CTRL_PID" 2>/dev/null || true
 sed -i 's/"rings": \[1, 2\],/"rings": [1, 2],\n  "auto_rollout": {"enabled": true, "soak_minutes": 0, "check_seconds": 1},/' "$W/controller.json"
@@ -303,7 +351,7 @@ check "일시 중지 중에는 재개해도 승인하지 않음" bash -c "kpctl 
 kpctl auto resume >/dev/null
 sleep 2
 check "재개하면 사람 없이 승인되고 링 1 배포" bash -c "kpctl jobs | grep -E '^$AUTOJOB ' | grep -q 'auto'"
-check "자동 승인도 서명 명령을 거침" bash -c "grep -l auto_fix '$W/ctl-data/artifacts/$KERNEL/'*.ko | xargs grep -q '~SIGNED~'"
+check "자동 승인도 서명 명령을 거침" bash -c "grep -l auto_fix '$W/ctl-data/artifacts/$KERNEL/'*.ko | xargs grep -aq '~Module signature appended~'"
 AUTOVER=$(kpctl jobs | awk -v j=$AUTOJOB '$1 == j {print $3}')
 check "카나리 적용 전에는 링 2 로 넘어가지 않음" bash -c "! kpctl status | grep -qE '^$KERNEL +$AUTOVER +$AUTOVER'"
 agent gpu-01
@@ -317,7 +365,7 @@ sleep 2
 check "수동 제출 패치는 자동 승인하지 않음" bash -c "kpctl jobs | grep -qE '^$MANUALJOB .*승인대기' && kpctl auto | grep -q '직접 승인'"
 
 echo "■ 12. 관리자 웹"
-check "화면은 토큰 없이 열림" bash -c "curl -sf '$KPCTL_URL/' | grep -q 'kpctl 관리자'"
+check "화면은 토큰 없이 열림" bash -c "curl -sf '$KPCTL_URL/' | grep -q '<title>kpctl-linux 관리자</title>'"
 check "스크립트 제한 헤더" bash -c "curl -sfI '$KPCTL_URL/' | grep -qi \"content-security-policy: .*script-src 'self'\""
 check "데이터 API 는 토큰 필요" test "$(curl -s -o /dev/null -w '%{http_code}' "$KPCTL_URL/api/status")" = 401
 check "감사 로그 API" bash -c "curl -sf -H 'Authorization: Bearer $ADMIN' '$KPCTL_URL/api/audit' | grep -q '승인 job'"

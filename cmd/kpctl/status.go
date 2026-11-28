@@ -122,7 +122,10 @@ func cmdHosts(c *client.Client, args []string) error {
 		if len(args) == 2 && args[0] == "mok-password" {
 			return cmdMOKPassword(c, args[1])
 		}
-		return fmt.Errorf("사용법: kpctl hosts [mok-password <호스트>]")
+		if len(args) == 2 && args[0] == "mok-status" {
+			return cmdMOKStatus(c, args[1])
+		}
+		return fmt.Errorf("사용법: kpctl hosts [mok-status|mok-password <호스트>]")
 	}
 	st, err := getStatus(c)
 	if err != nil {

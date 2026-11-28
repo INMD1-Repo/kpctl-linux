@@ -38,7 +38,7 @@ Go 서버는 표준 라이브러리와 JSON 상태 파일을 사용합니다. �
 
 추가 기능은 설정으로 선택합니다.
 
-- 여러 서명 키와 호스트별 인증서 등록 상태, 재부팅 없는 MOK 등록 예약.
+- Secure Boot 대상은 컨트롤러 서비스 계정으로 `kpctl signing init-key`를 실행해 공통 모듈 서명 키를 준비할 수 있습니다. 각 호스트에는 공개 인증서를 예약하고 계획된 재부팅 때 콘솔에서 승인합니다. [키 생성·컨트롤러 설정](docs/install/controller.md#module-signing-key) · [첫 패치 적용 확인](docs/operations/secure-boot.md#verify-signed-module)
 - 고정 VM 또는 일회용 VM에서 부팅·미서명 거부·교체·롤백·로그·smoke 검사.
 - 자동 배포와 분리한 출시 전 수집. 관리자의 명시 승인과 VM 시험이 필요합니다.
 - 커널 CNA 저장소의 upstream 수정 커밋 대조. 공식 OSV 재고와의 비교는 별도 기능입니다.

@@ -42,9 +42,11 @@ func TestSigningAdminExpiryAndRemovedKeyWarnings(t *testing.T) {
 	certPath := signingAdminCert(t, time.Now().Add(15*24*time.Hour))
 	s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{{ID: "active", Active: true, Cert: certPath, SignCommand: []string{"private-key-secret", "{module}"}}}}
 	addHost(t, s, "current", 1)
+	addHost(t, s, "firmware-db", 1)
 	addHost(t, s, "old-only", 2)
 	_ = s.store.Update(func(st *State) error {
 		st.Hosts["current"].Status.EnrolledCerts = map[string]string{"active": "enrolled"}
+		st.Hosts["firmware-db"].Status.EnrolledCerts = map[string]string{"active": "in_db"}
 		st.Hosts["old-only"].Status.EnrolledCerts = map[string]string{"retired": "enrolled", "active": "not_enrolled"}
 		return nil
 	})
@@ -123,14 +125,57 @@ func TestMOKRolloutStoresOnlyHostPasswordsAndNeverReboots(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+testAdmin)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" || !strings.Contains(rec.Body.String(), password) {
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" || strings.Contains(rec.Body.String(), password) || !strings.Contains(rec.Body.String(), "awaiting_agent") {
 		t.Fatalf("비밀번호 전용 조회 = %d, %s", rec.Code, rec.Body.String())
 	}
+	for _, tc := range []struct {
+		status, detail string
+		reveal, owned  bool
+	}{
+		{"pending_existing", "최초 예약자에게 확인", false, false},
+		{"pending_uncertain", "이 요청 비밀번호가 다를 수 있습니다", true, false},
+		{"pending", "기존 MOK 예약 감지: 콘솔 승인 필요", false, false},
+		{"pending", "다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요", true, false},
+		{"pending", "다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요", true, true},
+	} {
+		if err := s.store.Update(func(st *State) error {
+			st.MOKRequests["a"].Result = &model.MOKImportResult{ID: requestID, KeyID: "prod", Status: tc.status, Detail: tc.detail, PasswordSet: tc.owned}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		result := callAPI(t, s, "GET", "/api/hosts/a/mok-password", "", http.StatusOK)
+		if strings.Contains(result, password) != tc.reveal || tc.reveal && !tc.owned && !strings.Contains(result, "다를 수") {
+			t.Fatalf("unexpected password handling for %s", tc.status)
+		}
+	}
+	callAPI(t, s, "GET", "/api/hosts/enrolled/mok-password", "", http.StatusNotFound)
+	second := s.cfg.Signing.Keys[0]
+	second.ID, second.Active = "next", false
+	s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, second)
+	response := callAPI(t, s, "POST", "/api/signing/next/rollout-cert", "", http.StatusOK)
+	if !strings.Contains(response, "비밀번호 보존") {
+		t.Fatal("other key rollout ignored existing request")
+	}
+	s.store.View(func(st *State) {
+		if st.MOKRequests["a"].Password != password || st.MOKRequests["a"].Request.ID != requestID {
+			t.Fatal("lost password on other key rollout")
+		}
+	})
+	if err := s.store.Update(func(st *State) error { st.MOKRequests["a"].Result.Status = "failed"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	callAPI(t, s, "POST", "/api/signing/prod/rollout-cert", "", http.StatusOK)
+	s.store.View(func(st *State) {
+		retry := st.MOKRequests["a"]
+		if retry.Result != nil || retry.Request.ID == requestID || retry.Password != password {
+			t.Fatal("explicit retry lost the previous password or reused a completed request ID")
+		}
+	})
 	audit, _ := os.ReadFile(filepath.Join(s.cfg.DataDir, "audit.log"))
 	if !strings.Contains(string(audit), "MOK 비밀번호 조회 host=a") || strings.Contains(string(audit), password) {
 		t.Fatal("비밀번호 조회는 감사되지만 비밀번호 원문은 감사 로그에 없어야 함")
 	}
-	callAPI(t, s, "GET", "/api/hosts/enrolled/mok-password", "", http.StatusNotFound)
 	callAPI(t, s, "POST", "/api/signing/missing/rollout-cert", "", http.StatusNotFound)
 }
 

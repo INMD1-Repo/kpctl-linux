@@ -1,0 +1,19 @@
+#!/bin/sh
+# Certificate-specific EFI state in the simulated host directory.
+set -eu
+state=${FAKE_ROOT:?}/mok
+case "$1" in
+  --help) echo '--hash-file --ignore-keyring' ;;
+  --test-key)
+    [ "$3" = "--ignore-keyring" ]
+    if cmp -s "$2" "$state/enrolled"; then echo "$2 is already enrolled"
+    elif cmp -s "$2" "$state/pending"; then echo "$2 is already in the enrollment request"
+    else echo "$2 is not enrolled"; exit 1
+    fi ;;
+  --list-new) if [ -f "$state/pending" ]; then echo '[key 1]'; fi ;;
+  --import)
+    [ "$3" = "--hash-file" ] && [ -s "$4" ] && [ ! -e "$state/pending" ] || exit 1
+    mkdir -p "$state"
+    cp "$2" "$state/pending" ;;
+  *) exit 2 ;;
+esac

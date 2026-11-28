@@ -224,6 +224,7 @@ func newTestAgent(t *testing.T) (*Agent, string) {
 		ModulePrefix:     "kpctl_",
 		LivepatchSysfs:   filepath.Join(root, "sys/livepatch"),
 		ModuleSysfs:      filepath.Join(root, "sys/module"),
+		SysfsRoot:        filepath.Join(root, "sys"),
 		OSReleasePath:    filepath.Join(root, "proc/osrelease"),
 	}
 	for _, dir := range []string{cfg.StateDir, cfg.LivepatchSysfs, cfg.ModuleSysfs} {
