@@ -1,2 +1,26 @@
+# Python 캐시
 __pycache__/
 *.pyc
+
+# 빌드 결과 (make → bin/, make dist → dist/)
+/bin/
+/dist/
+
+# 웹 의존성·시험 결과 (npm ci, vitest, playwright; make clean 이 지우는 경로)
+node_modules/
+/web/coverage/
+/web/test-results/
+/web/playwright-report/
+
+# kpctl install / install-builder 의 호스트별 로그 (기본 -log-dir, 호스트 정보가 담김)
+kpctl-install-logs/
+
+# 로컬 환경 변수 (토큰 등 비밀값). 예시 파일은 추적
+.env
+.env.*
+!.env.example
+
+# 편집기·OS 임시 파일
+*.swp
+*~
+.DS_Store
