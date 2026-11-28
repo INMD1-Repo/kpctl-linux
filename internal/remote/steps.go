@@ -21,17 +21,22 @@ type Session struct {
 
 // Facts 는 사전 점검에서 알아낸 호스트 정보입니다.
 type Facts struct {
-	Hostname   string // 에이전트가 이 이름으로 컨트롤러에 등록됨
-	UID        string
-	Arch       string
-	Kernel     string
-	Sudo       string // ok | no
-	Livepatch  string // yes | no
-	SecureBoot string
-	Controller string // 호스트에서 본 컨트롤러 /healthz 응답 코드 (000 = 접속 실패, nocurl = curl 없음)
-	Agent      string // installed | none
-	Role       string // infra(컨트롤러·빌드 서버) | host
-	Codename   string // /etc/os-release 의 VERSION_CODENAME (예: noble)
+	Hostname           string // 에이전트가 이 이름으로 컨트롤러에 등록됨
+	UID                string
+	Distro             string
+	ReleaseType        string
+	ReleaseDescription string
+	NativePackage      string
+	Release            string
+	Arch               string
+	Kernel             string
+	Sudo               string // ok | no
+	Livepatch          string // yes | no
+	SecureBoot         string
+	Controller         string // 호스트에서 본 컨트롤러 /healthz 응답 코드 (000 = 접속 실패, nocurl = curl 없음)
+	Agent              string // installed | none
+	Role               string // infra(컨트롤러·빌드 서버) | host
+	Codename           string // /etc/os-release 의 VERSION_CODENAME (예: noble)
 
 	// 빌드 서버 설치(kpctl install-builder)용
 	BuilderActive string // yes | no — kpctl-builder 서비스가 돌고 있는지
@@ -140,7 +145,24 @@ if [ -n "$1" ]; then
 fi
 if [ -x /usr/local/bin/kpctl-agent ]; then echo "agent=installed"; else echo "agent=none"; fi
 if [ -e /etc/kpctl/controller.json ] || [ -e /etc/kpctl/builder.json ]; then echo "role=infra"; else echo "role=host"; fi
-echo "codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+. /etc/os-release
+echo "distro=${ID:-unknown}"
+echo "release=${VERSION_ID:-}"
+echo "release_type=${RELEASE_TYPE:-}"
+echo "release_description=${VERSION:-}"
+echo "codename=${VERSION_CODENAME:-}"
+abi=$(uname -r)
+case "$ID" in
+  debian)
+    read -r installed name arch ver <<<"$(dpkg-query -W -f='${db:Status-Eflag}.${db:Status-Status} ${Package} ${Architecture} ${Version}' "linux-image-$abi" 2>/dev/null)"
+    if [ "$installed" = ok.installed ] && [ "$name" = "linux-image-$abi" ] && [ "$arch" = amd64 ] && grep -Fq " Debian $ver " /proc/sys/kernel/version; then
+      echo "nativepackage=$ver"
+    fi ;;
+  rocky)
+    if [ "$(rpm -q "kernel-core-$abi" --qf '%{NAME} %{EPOCHNUM} %{ARCH} %{VERSION}-%{RELEASE}.%{ARCH}' 2>/dev/null)" = "kernel-core 0 x86_64 $abi" ]; then
+      echo "nativepackage=${abi%.x86_64}"
+    fi ;;
+esac
 c=$(systemd-detect-virt --container 2>/dev/null)
 if [ -z "$c" ] && { [ -e /.dockerenv ] || [ -e /run/.containerenv ]; }; then c=container; fi
 echo "container=${c:-none}"
@@ -154,7 +176,7 @@ echo "bootfs=${bfs:-none} $(readlink -f "${bdev:-none}" 2>/dev/null)"
 # $4 = 설치 묶음의 mirrors.list. 이 호스트 아키텍처의 미러를 위에서부터 시도합니다. 미러는 IP 가 여럿이고
 # 일부가 막힌 망이 있어 (apt 는 다른 IP 로 넘어감) 미러마다 세 번 중 한 번만 되면 접속 가능으로 봅니다
 case "$(uname -m)" in x86_64) darch=amd64 ;; aarch64) darch=arm64 ;; *) darch=$(uname -m) ;; esac
-if [ -n "${4:-}" ] && command -v curl >/dev/null 2>&1; then
+if [ "$ID" = ubuntu ] && [ -n "${4:-}" ] && command -v curl >/dev/null 2>&1; then
   code="" via=""
   while read -r name arch url _; do
     case "$name" in ""|"#"*) continue ;; esac
@@ -168,7 +190,7 @@ fi
 echo "bootfree=$(df -Pk /boot 2>/dev/null | awk 'NR==2{print $4}')"
 echo "varfree=$(df -Pk /var 2>/dev/null | awk 'NR==2{print $4}')"
 if command -v python3 >/dev/null 2>&1; then echo "python3=yes"; else echo "python3=no"; fi
-if [ -n "$(dpkg --audit 2>/dev/null)" ]; then echo "dpkg=broken"; else echo "dpkg=ok"; fi
+if [ "$ID" = ubuntu ] && [ -n "$(dpkg --audit 2>/dev/null)" ]; then echo "dpkg=broken"; else echo "dpkg=ok"; fi
 echo "now=$(date +%s)"
 if systemctl is-active --quiet kpctl-builder 2>/dev/null; then echo "builderactive=yes"; else echo "builderactive=no"; fi
 if [ -e /etc/kpctl/builder.json ]; then echo "builderconfig=yes"; else echo "builderconfig=no"; fi
@@ -212,7 +234,8 @@ func (s *Session) Preflight(o PreflightOptions) (problems, warnings []string, er
 		}
 	}
 	s.Facts = Facts{
-		Hostname: kv["hostname"], UID: kv["uid"], Arch: kv["arch"], Kernel: kv["kernel"],
+		Distro: kv["distro"], ReleaseType: kv["release_type"], ReleaseDescription: kv["release_description"],
+		Release: kv["release"], NativePackage: kv["nativepackage"], Hostname: kv["hostname"], UID: kv["uid"], Arch: kv["arch"], Kernel: kv["kernel"],
 		Sudo: kv["sudo"], Livepatch: kv["livepatch"], SecureBoot: kv["secureboot"],
 		Controller: kv["controller"], Agent: kv["agent"], Role: kv["role"], Codename: kv["codename"],
 		BuilderActive: kv["builderactive"], BuilderConfig: kv["builderconfig"],
@@ -250,7 +273,7 @@ func (s *Session) Preflight(o PreflightOptions) (problems, warnings []string, er
 	if o.ForBuilder {
 		supported := false
 		for _, c := range o.Series {
-			supported = supported || c == f.Codename
+			supported = supported || c == f.Codename && f.Distro == "ubuntu"
 		}
 		if !supported {
 			problems = append(problems, fmt.Sprintf("지원하지 않는 Ubuntu 시리즈 %q (지원: %s). 빌더는 대상 LTS 와 같은 Ubuntu 에 설치합니다", f.Codename, strings.Join(o.Series, ", ")))

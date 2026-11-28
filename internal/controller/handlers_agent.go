@@ -170,7 +170,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 	}
 	// A scoped automatic approval uses the same drain/approval lock as manual
 	// maintenance. Refresh scheduler evidence before the atomic state update.
-	if s.autoJumpKernelHost(hostID) {
+	if req.Status.ManagementBlock() == "" && s.autoJumpKernelHost(hostID) {
 		s.rebootMu.Lock()
 		defer s.rebootMu.Unlock()
 		if req.Status.BootTarget != nil {
@@ -188,8 +188,8 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 		if h == nil {
 			return fail(http.StatusNotFound, "호스트 등록이 지워졌습니다")
 		}
-		name, oldKernel = h.Hostname, h.Status.Kernel
-		kernelChanged = oldKernel != "" && oldKernel != req.Status.Kernel
+		name, oldKernel = h.Hostname, h.Status.TrackKey()
+		kernelChanged = oldKernel != "" && oldKernel != req.Status.TrackKey()
 
 		h.Status = req.Status
 		// Preserve the reported policy bit. Eligibility and the status API compute
@@ -202,6 +202,11 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 			record.Result = &cp
 		}
 		h.LastSeen = time.Now()
+		if h.Status.ManagementBlock() != "" {
+			resp.Desired = s.desired(st, h)
+			blockedLegacy = req.Status.IdentityError == "" && req.Status.Distribution == nil
+			return nil
+		}
 		if req.AutoImportCert && hostSignatureRequired(h.Status) {
 			for _, cert := range certs {
 				if cert.Active && h.Status.EnrolledCerts[cert.ID] == "not_enrolled" {
@@ -234,7 +239,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 		jumped = s.maybeApproveKernelJump(st, h, time.Now())
 
 		resp.Desired = s.desired(st, h)
-		if resp.Desired.Blocked && len(req.Status.EnrolledCerts) == 0 && req.Status.Version != 0 && resp.Desired.Version == 0 {
+		if req.Status.Distribution == nil && resp.Desired.Blocked && len(req.Status.EnrolledCerts) == 0 && req.Status.Version != 0 && resp.Desired.Version == 0 {
 			blockedLegacy = true
 		}
 		resp.PrepareKernel = s.shouldPrepareKernel(st, h)
@@ -270,7 +275,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, hostID str
 		return
 	}
 	if kernelChanged {
-		s.audit("agent", "%s 커널 변경 %s → %s", name, oldKernel, req.Status.Kernel)
+		s.audit("agent", "%s 커널 변경 %s → %s", name, oldKernel, req.Status.TrackKey())
 	}
 	if jumped != nil {
 		s.audit("auto-kernel-jump", "%s 공식 커널 자동 점프 승인 요청 #%d %s → %s target=%s expires=%s", name, jumped.ID, jumped.FromKernel, jumped.Target.Kernel, jumped.Target.ID, jumped.ExpiresAt.Format(time.RFC3339))
@@ -317,15 +322,44 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := s.signingArtifactFile(kernel, module, key)
-	if key == "" {
+	_, native := model.DistributionTrack(kernel)
+	if reason := model.KernelBuildBlock(kernel); reason != "" {
+		writeErr(w, fail(http.StatusConflict, "%s", reason))
+		return
+	}
+	if !native && key == "" {
 		http.ServeFile(w, r, path)
 		return
 	}
 	var expected string
+	// Native artifacts can share uname -r across package updates. An agent may
+	// only download the signed bytes selected for its current report and ring.
+	hostID := ""
+	if native && s.adminName(bearer(r)) == "" {
+		hostID = s.hostIDByToken(bearer(r))
+		if hostID == "" {
+			writeErr(w, fail(http.StatusUnauthorized, "인증이 필요합니다"))
+			return
+		}
+	}
 	s.store.View(func(st *State) {
+		if hostID != "" {
+			h := st.Hosts[hostID]
+			if h == nil {
+				return
+			}
+			desired := s.desired(st, h)
+			if desired.Blocked || desired.Track != kernel || desired.ModuleName != module || desired.URL != r.URL.RequestURI() {
+				return
+			}
+			expected = desired.SHA256
+			return
+		}
 		for _, job := range st.Jobs {
-			if job.Kernel == kernel && job.ModuleName == module && job.Status == model.JobReleased {
-				if artifact, ok := job.SigningArtifacts[key]; ok {
+			if job.Kernel == kernel && job.ModuleName == module && job.Status == model.JobReleased && (!native || job.CandidateProofVerified) {
+				if native && key == "" {
+					expected = job.SHA256
+				} else if artifact, ok := job.SigningArtifacts[key]; ok {
 					expected = artifact.SHA256
 				}
 			}

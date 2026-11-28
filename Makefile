@@ -60,7 +60,7 @@ dist: web
 	   configs/controller.example.json configs/host-mgmt-netplan.example.yaml dist/controller/
 	cp -R deploy/testvm dist/controller/
 	cp bin/kpctl-builder deploy/setup-builder.sh deploy/kpctl-kernel-debug.sh deploy/systemd/kpctl-builder.service configs/builder.example.json dist/builder/
-	cp deploy/kpctl-kernel-inputs.py dist/builder/
+	cp deploy/kpctl-kernel-inputs.py deploy/kpctl-native-builder.py deploy/native_inputs.py dist/builder/
 	cp deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py dist/builder/
 	cp -R deploy/kpatch-fixes dist/builder/
 	cp deploy/setup-build-environment.sh deploy/kpctl-build-environment.py dist/builder/

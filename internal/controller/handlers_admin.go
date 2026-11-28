@@ -56,6 +56,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, who string
 
 		for _, h := range st.Hosts {
 			cp := *h
+			cp.TrackKey = h.Status.TrackKey()
 			cp.TokenHash = "" // 토큰 해시는 내보내지 않음
 			if e := st.MOKRequests[h.ID]; e != nil {
 				cp.MOKRequest = &model.MOKImportResult{ID: e.Request.ID, KeyID: e.Request.KeyID, Status: "awaiting_agent"}
@@ -65,10 +66,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, who string
 			}
 			cp.Status.SignatureRequired, cp.Status.SecurityWarning = hostSecurityPolicy(cp.Status)
 			cp.Status.SecurityWarning = joinSecurityWarnings(cp.Status.SecurityWarning, h.Status.SecurityWarning)
-			if t := st.Tracks[h.Status.Kernel]; t != nil {
-				j := st.releasedJob(h.Status.Kernel, t.TargetVersion(h.Ring))
+			if h.Status.ManagementBlock() != "" {
+				e := s.rolloutEligibility(h, nil)
+				cp.RolloutEligibility = &e
+			} else if t := st.Tracks[h.Status.TrackKey()]; t != nil {
+				j := st.releasedJob(h.Status.TrackKey(), t.TargetVersion(h.Ring))
 				eligibility := s.rolloutEligibility(h, j)
 				cp.RolloutEligibility = &eligibility
+			} else if h.Status.Distribution != nil {
+				cp.RolloutEligibility = &model.RolloutEligibility{Status: "blocked_unverified", Reason: nativeUnverified}
 			}
 			resp.Hosts = append(resp.Hosts, &cp)
 		}
@@ -101,6 +107,10 @@ func (s *Server) handleSubmitPatch(w http.ResponseWriter, r *http.Request, who s
 	kernel := r.PathValue("kernel")
 	if !validKernel(kernel) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))
+		return
+	}
+	if _, native := model.DistributionTrack(kernel); native {
+		writeErr(w, fail(http.StatusBadRequest, "공식 소스의 검토한 변경을 native builder의 collect로 제출하세요"))
 		return
 	}
 	var req model.SubmitPatchRequest
@@ -241,9 +251,18 @@ func (s *Server) approveJobWithPrerelease(id int, who string, allowPrerelease, a
 		switch {
 		case j == nil:
 			checkErr = fail(http.StatusNotFound, "작업 %d 이 없습니다", id)
+
+		case model.KernelBuildBlock(j.Kernel) != "":
+			checkErr = fail(http.StatusConflict, "%s", model.KernelBuildBlock(j.Kernel))
 		case j.Status != model.JobBuilt:
 			checkErr = fail(http.StatusConflict, "작업 %d 은 %s 상태라 승인할 수 없습니다 (built 만 가능)", id, j.Status)
 		default:
+			if strings.HasPrefix(j.Kernel, "native__") {
+				if err := s.checkDistributionProof(st, j); err != nil {
+					checkErr = fail(http.StatusConflict, "공식 서명 패키지 증거 검증 실패: %v", err)
+					return
+				}
+			}
 			checkErr = s.prereleaseApprovalProblem(st, j, allowPrerelease, automated)
 			if checkErr == nil && automated {
 				checkErr = s.autoApprovalProblem(st, j)
@@ -271,6 +290,11 @@ func (s *Server) approveJobWithPrerelease(id int, who string, allowPrerelease, a
 		j := st.job(id)
 		if j == nil || j.Status != model.JobBuilt || j.Kernel != kernel || j.ModuleName != module {
 			return fail(http.StatusConflict, "작업 %d 의 상태가 그 사이에 바뀌었습니다", id)
+		}
+		if _, native := model.DistributionTrack(j.Kernel); native {
+			if err := s.checkDistributionProof(st, j); err != nil {
+				return fail(http.StatusConflict, "공식 서명 패키지 증거 검증 실패: %v", err)
+			}
 		}
 		if err := s.prereleaseApprovalProblem(st, j, allowPrerelease, automated); err != nil {
 			return err
@@ -334,6 +358,7 @@ func (s *Server) approveJobWithPrerelease(id int, who string, allowPrerelease, a
 		j.SigningArtifacts, j.ActiveSigningKey, j.VMTest = artifacts, activeKey, combinedVMResult(active, artifacts)
 
 		now := time.Now()
+		_, j.CandidateProofVerified = model.DistributionTrack(j.Kernel)
 		j.Status = model.JobReleased
 		j.SHA256 = sum
 		j.ApprovedBy = who
@@ -598,6 +623,10 @@ func (s *Server) handleHostUpdate(w http.ResponseWriter, r *http.Request, who st
 // 아직 빌드하지 않은 활성 패치가 있으면 수집을 기다리지 않고 바로 빌드 작업도 만듭니다.
 func (s *Server) handleKernelRefresh(w http.ResponseWriter, r *http.Request, who string) {
 	kernel := r.PathValue("kernel")
+	if _, native := model.DistributionTrack(kernel); native {
+		writeErr(w, fail(http.StatusBadRequest, "배포판 빌더의 history·changes·collect에서 서명된 수정 릴리스를 선택하세요"))
+		return
+	}
 	if !validKernel(kernel) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))
 		return
@@ -633,6 +662,10 @@ func (s *Server) handleKernelRefresh(w http.ResponseWriter, r *http.Request, who
 // body {"cancel": true} 면 아직 가져가지 않은 요청을 취소합니다.
 func (s *Server) handleKernelPurge(w http.ResponseWriter, r *http.Request, who string) {
 	kernel := r.PathValue("kernel")
+	if _, native := model.DistributionTrack(kernel); native {
+		writeErr(w, fail(http.StatusBadRequest, "배포판 아카이브 캐시는 해당 빌더에서 관리합니다"))
+		return
+	}
 	if !validKernel(kernel) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))
 		return
@@ -715,7 +748,7 @@ func (s *Server) handleHostUpdateNow(w http.ResponseWriter, r *http.Request, who
 		if h == nil {
 			return fail(http.StatusNotFound, "호스트 %s 가 없습니다", id)
 		}
-		name, kernel = h.Hostname, h.Status.Kernel
+		name, kernel = h.Hostname, h.Status.TrackKey()
 		if req.Cancel {
 			h.UpdateNowKernel, h.UpdateNowVersion = "", 0
 			msg = name + ": 즉시 업데이트를 취소했습니다. 다시 링 목표를 따릅니다."

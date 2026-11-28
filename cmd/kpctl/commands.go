@@ -116,10 +116,21 @@ func cmdPatches(c *client.Client, args []string) error {
 	fmt.Fprintln(tw, "ID\t상태\t출처\tCVE\t제목\t비고")
 	for _, p := range patches {
 		src := p.Source
+		if p.FixedRelease != nil {
+			src += " " + p.FixedRelease.Version
+		}
 		if p.Prerelease {
 			src += " (출시 전)"
 		}
-		if p.Commit != "" {
+		if p.CandidateID != "" {
+			src += " " + p.CandidateID + " " + strings.Join(p.Paths, ",")
+			if p.ParentCandidate != "" {
+				src += " 선행 " + p.ParentCandidate
+			}
+			if p.FixedRelease != nil {
+				src += " " + p.FixedRelease.Signer
+			}
+		} else if p.Commit != "" {
 			src += " " + p.Commit[:min(12, len(p.Commit))]
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.ID, p.State, src, strings.Join(p.CVEs, ","), cut(p.Title, 50), p.Reason)

@@ -150,7 +150,7 @@ func printHosts(st *model.StatusResponse) {
 	excluded := 0
 	for _, h := range st.Hosts {
 		target := 0
-		if t := tracks[h.Status.Kernel]; t != nil && !model.HWEWithGAName(h.Status) {
+		if t := tracks[h.Status.TrackKey()]; t != nil && !model.HWEWithGAName(h.Status) {
 			target = t.TargetVersion(h.Ring)
 		}
 		state := hostState(h, target, st.Now)
@@ -158,6 +158,9 @@ func printHosts(st *model.StatusResponse) {
 			state = "HWE 미지원"
 		}
 		prepared := "준비 필요"
+		if h.Status.Distribution != nil {
+			prepared = "배포판 유지보수"
+		}
 		if h.Status.BootTarget != nil {
 			prepared = h.Status.BootTarget.Kernel
 		}
@@ -188,7 +191,7 @@ func printHosts(st *model.StatusResponse) {
 			eligibility += " / 경고: " + warning
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			h.Hostname, h.ID, h.Ring, h.Status.Kernel, model.VersionLabel(h.Status.Version), model.VersionLabel(target),
+			h.Hostname, h.ID, h.Ring, h.Status.TrackKey(), model.VersionLabel(h.Status.Version), model.VersionLabel(target),
 			state, drainState(h), h.RebootPolicy, ago(st.Now, h.LastSeen), prepared, yes(required), eligibility)
 	}
 	tw.Flush()
@@ -202,6 +205,8 @@ func hostState(h *model.Host, target int, now time.Time) string {
 	switch {
 	case now.Sub(h.LastSeen) > 10*time.Minute:
 		return "연락끊김"
+	case h.RolloutEligibility != nil && strings.HasPrefix(h.RolloutEligibility.Status, "blocked_"):
+		return "배포 제외"
 	case h.Status.Error != "":
 		return "오류: " + cut(h.Status.Error, 40)
 	case h.Status.Version != target:

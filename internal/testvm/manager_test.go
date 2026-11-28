@@ -451,3 +451,20 @@ func TestIPv6CreateEndpoint(t *testing.T) {
 		t.Fatalf("IPv6 endpoint rejected: %+v %v", e, err)
 	}
 }
+
+func TestNativeVMBootMatchesPackageRevisionAndRunningBuildID(t *testing.T) {
+	track := "native__debian__12__amd64__6.1.0-57-amd64__6.1.192-3__" + strings.Repeat("a", 40)
+	m, _, runner, _, _ := managerFixture(t, nil)
+	for _, observed := range []string{track, strings.Replace(track, "192-3", "192-1", 1), track[:len(track)-1] + "b", "6.1.0-57-amd64"} {
+		runner.run = func(_ context.Context, _ Endpoint, probe, _ string) (string, error) {
+			if !strings.Contains(probe, "/usr/local/bin/kpctl-agent -identify") {
+				t.Fatal("native VM did not check installed package and running identity")
+			}
+			return observed + "\nuefi\non\nintegrity\non\n", nil
+		}
+		err := m.waitBoot(context.Background(), Endpoint{}, track, "sb_on", time.Second)
+		if (err == nil) != (observed == track) {
+			t.Fatalf("probe %q: %v", observed, err)
+		}
+	}
+}

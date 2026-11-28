@@ -1,11 +1,11 @@
 # kpctl-linux
 
-Ubuntu GA 커널의 선택한 CVE 수정을 누적 라이브패치 모듈로 만들어 관리자가 승인한 호스트에 적용합니다. 실행 커널을 교체해야 하는 작업은 디스크 커널 준비와 별도의 재부팅 승인 절차로 처리합니다.
+Ubuntu GA와 Debian 12·Rocky Linux 9/10의 공식 기본 AMD64 커널을 대상으로, 검토한 수정을 누적 라이브패치 모듈로 만들어 승인한 호스트에 적용합니다. Debian 13 기본 커널은 식별과 공식 소스 조사를 지원합니다. 실행 커널을 교체해야 하는 작업은 디스크 커널 준비와 별도의 재부팅 승인 절차로 처리합니다.
 
 | 구성 요소 | 역할 |
 |---|---|
 | `kpctl-controller` | 패치·버전·호스트 상태 저장, 서명, VM 시험, 링 배포와 승인 |
-| `kpctl-builder` | Ubuntu 소스 수집, 의존 패치 확인, 누적 모듈 빌드·ABI 검사 |
+| `kpctl-builder` · `kpctl-native-builder.py` | Ubuntu Git 또는 Debian·Rocky의 공식 Git·서명 패키지에서 후보 수집, 누적 모듈 빌드와 대상 검증 |
 | `kpctl-agent` | 호스트 상태 보고, 받은 파일의 해시 확인, 모듈 적용·부팅용 설치 |
 | `kpctl` | 운영자가 사용하는 관리자 CLI |
 
@@ -22,7 +22,7 @@ Go 서버는 표준 라이브러리와 JSON 상태 파일을 사용합니다. �
 
 ## 기본 커널 식별표
 
-현재 코드의 지원 표는 다음과 같습니다. HWE는 `version_signature`로 구별해 같은 이름의 GA 모듈을 배포하지 않습니다.
+Ubuntu GA 식별에는 다음 표를 사용합니다. HWE는 `version_signature`로 구별해 같은 이름의 GA 모듈을 배포하지 않습니다.
 
 | Ubuntu 시리즈 | GA generic 계열 |
 |---|---|
@@ -31,6 +31,8 @@ Go 서버는 표준 라이브러리와 JSON 상태 파일을 사용합니다. �
 | 26.04 `resolute` | `7.0.0-*-generic` |
 
 식별 근거는 [지원 모델](internal/model/lts.go)입니다. 직접 커널을 지정하는 빌더 설정은 기본 지원 범위를 확대하는 보증이 아닙니다.
+
+Debian 12 및 Rocky Linux 9/10 AMD64 공식 기본 커널에는 배포판별 입력 검증과 별도 빌더를 사용합니다. Debian 13 stock AMD64는 식별·공식 소스 조사만 지원합니다. IBT를 유지하는 라이브패치 빌더가 없어 정식 보안 커널 업데이트와 계획된 재부팅이 필요합니다. 릴리스별 실제 컴파일 결과, 차단 사유, 설치 및 Secure Boot canary 절차는 [배포판 커널 운영 기록](docs/operations/distribution-kernels.md)에 있습니다.
 
 ## 설치와 운영
 

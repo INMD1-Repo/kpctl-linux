@@ -24,17 +24,21 @@ const (
 // Patch 는 누적 패치를 구성하는 패치 하나입니다.
 // 패치 본문(diff)은 컨트롤러 data_dir/patches/<ID>.patch 파일에 따로 저장됩니다.
 type Patch struct {
-	Prerelease bool      `json:"prerelease,omitempty"` // 정식 수집·누적본과 분리한 출시 전 입력
-	ID         string    `json:"id"`                   // 예: p0007
-	Kernel     string    `json:"kernel"`               // 예: 6.8.0-85-generic
-	Source     string    `json:"source"`               // "ubuntu" (자동 수집) 또는 "manual" (kpctl submit)
-	Commit     string    `json:"commit,omitempty"`     // Ubuntu 커널 git 커밋 해시 (manual 이면 비어 있음)
-	CVEs       []string  `json:"cves"`
-	Title      string    `json:"title"`
-	State      string    `json:"state"`
-	Reason     string    `json:"reason,omitempty"` // rejected/disabled 이유
-	AddedBy    string    `json:"added_by"`
-	AddedAt    time.Time `json:"added_at"`
+	Paths           []string      `json:"paths,omitempty"`
+	ParentCandidate string        `json:"parent_candidate,omitempty"`
+	CandidateID     string        `json:"candidate_id,omitempty"` // Package commit and hash of the reviewed diff.
+	FixedRelease    *FixedRelease `json:"fixed_release,omitempty"`
+	Prerelease      bool          `json:"prerelease,omitempty"` // 정식 수집·누적본과 분리한 출시 전 입력
+	ID              string        `json:"id"`                   // 예: p0007
+	Kernel          string        `json:"kernel"`               // 예: 6.8.0-85-generic
+	Source          string        `json:"source"`               // "ubuntu" (자동 수집) 또는 "manual" (kpctl submit)
+	Commit          string        `json:"commit,omitempty"`     // Ubuntu 커널 git 커밋 해시 (manual 이면 비어 있음)
+	CVEs            []string      `json:"cves"`
+	Title           string        `json:"title"`
+	State           string        `json:"state"`
+	Reason          string        `json:"reason,omitempty"` // rejected/disabled 이유
+	AddedBy         string        `json:"added_by"`
+	AddedAt         time.Time     `json:"added_at"`
 }
 
 // Unpatchable은 기존 불가 판정 이력과 미해결 커밋의 관리자 제외를 보관합니다.
@@ -104,27 +108,29 @@ const (
 
 // Job 은 "커널 하나에 대한 누적 패치 한 버전"을 만드는 작업입니다.
 type Job struct {
-	Prerelease        bool      `json:"prerelease,omitempty"`
-	PrereleaseVersion int       `json:"prerelease_version,omitempty"` // 출시 전 전용 양수 번호; Version은 충돌 없는 음수 전송 식별자
-	ID                int       `json:"id"`
-	Kernel            string    `json:"kernel"`
-	Version           int       `json:"version"`       // 정식은 커널별 양수 순번, 출시 전은 별도 음수 식별자
-	PatchIDs          []string  `json:"patch_ids"`     // 이 버전에 포함된 모든 패치
-	NewPatchIDs       []string  `json:"new_patch_ids"` // 직전 배포 버전에 없던 패치
-	Urgent            bool      `json:"urgent"`
-	Status            string    `json:"status"`
-	Builder           string    `json:"builder,omitempty"`
-	Error             string    `json:"error,omitempty"`
-	ModuleName        string    `json:"module_name,omitempty"`     // 커널 모듈 이름 (= .ko 파일 이름)
-	SHA256            string    `json:"sha256,omitempty"`          // 배포되는 .ko 파일의 해시
-	UnsignedSHA256    string    `json:"unsigned_sha256,omitempty"` // 업로드된 서명 전 원본 바이트 고정
-	RequestedBy       string    `json:"requested_by"`
-	ApprovedBy        string    `json:"approved_by,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	StartedAt         time.Time `json:"started_at"`
-	HeartbeatAt       time.Time `json:"heartbeat_at,omitempty"` // 실행 중인 빌더의 마지막 상태 보고
-	FinishedAt        time.Time `json:"finished_at"`
-	ReleasedAt        time.Time `json:"released_at"`
+	CandidateProofVerified bool               `json:"candidate_proof_verified,omitempty"`
+	DistributionProof      *DistributionProof `json:"distribution_proof,omitempty"`
+	Prerelease             bool               `json:"prerelease,omitempty"`
+	PrereleaseVersion      int                `json:"prerelease_version,omitempty"` // 출시 전 전용 양수 번호; Version은 충돌 없는 음수 전송 식별자
+	ID                     int                `json:"id"`
+	Kernel                 string             `json:"kernel"`
+	Version                int                `json:"version"`       // 정식은 커널별 양수 순번, 출시 전은 별도 음수 식별자
+	PatchIDs               []string           `json:"patch_ids"`     // 이 버전에 포함된 모든 패치
+	NewPatchIDs            []string           `json:"new_patch_ids"` // 직전 배포 버전에 없던 패치
+	Urgent                 bool               `json:"urgent"`
+	Status                 string             `json:"status"`
+	Builder                string             `json:"builder,omitempty"`
+	Error                  string             `json:"error,omitempty"`
+	ModuleName             string             `json:"module_name,omitempty"`     // 커널 모듈 이름 (= .ko 파일 이름)
+	SHA256                 string             `json:"sha256,omitempty"`          // 배포되는 .ko 파일의 해시
+	UnsignedSHA256         string             `json:"unsigned_sha256,omitempty"` // 업로드된 서명 전 원본 바이트 고정
+	RequestedBy            string             `json:"requested_by"`
+	ApprovedBy             string             `json:"approved_by,omitempty"`
+	CreatedAt              time.Time          `json:"created_at"`
+	StartedAt              time.Time          `json:"started_at"`
+	HeartbeatAt            time.Time          `json:"heartbeat_at,omitempty"` // 실행 중인 빌더의 마지막 상태 보고
+	FinishedAt             time.Time          `json:"finished_at"`
+	ReleasedAt             time.Time          `json:"released_at"`
 	// UpToTag: 이 버전이 반영한 Ubuntu 태그. 예: "Ubuntu-7.0.0-42.42" → 호스트 커널이 28 이어도 42 까지의 수정이 들어 있음
 	UpToTag          string                     `json:"up_to_tag,omitempty"`
 	VMTest           *VMTestResult              `json:"vm_test,omitempty"`
@@ -172,18 +178,20 @@ type LoadedPatch struct {
 
 // HostStatus 는 에이전트가 주기적으로 보고하는 호스트 상태입니다.
 type HostStatus struct {
-	ModuleSHA256      string            `json:"module_sha256,omitempty"` // 현재 부팅용 설치 사본의 실제 해시; 동일 버전 키 교체 때 기존 보호 유지
-	Kernel            string            `json:"kernel"`                  // uname -r
-	Firmware          string            `json:"firmware"`                // uefi, bios, unknown
-	SecureBoot        string            `json:"secure_boot"`             // on, off, unknown
-	Lockdown          string            `json:"lockdown"`                // none, integrity, confidentiality, unknown
-	SigEnforce        string            `json:"sig_enforce"`             // on, off, unknown
-	SignatureRequired bool              `json:"signature_required"`      // 정책 활성 또는 보안 신호 미확인이면 true
-	SecurityWarning   string            `json:"security_warning,omitempty"`
-	EnrolledCerts     map[string]string `json:"enrolled_certs,omitempty"`
-	MOKPending        bool              `json:"mok_pending,omitempty"`
-	MOKListEmpty      bool              `json:"mok_list_empty,omitempty"` // Successful --list-new, empty, and no per-cert pending.
-	MOKImport         *MOKImportResult  `json:"mok_import,omitempty"`
+	IdentityError     string              `json:"identity_error,omitempty"`
+	Distribution      *DistributionKernel `json:"distribution,omitempty"`
+	ModuleSHA256      string              `json:"module_sha256,omitempty"` // 현재 부팅용 설치 사본의 실제 해시; 동일 버전 키 교체 때 기존 보호 유지
+	Kernel            string              `json:"kernel"`                  // uname -r
+	Firmware          string              `json:"firmware"`                // uefi, bios, unknown
+	SecureBoot        string              `json:"secure_boot"`             // on, off, unknown
+	Lockdown          string              `json:"lockdown"`                // none, integrity, confidentiality, unknown
+	SigEnforce        string              `json:"sig_enforce"`             // on, off, unknown
+	SignatureRequired bool                `json:"signature_required"`      // 정책 활성 또는 보안 신호 미확인이면 true
+	SecurityWarning   string              `json:"security_warning,omitempty"`
+	EnrolledCerts     map[string]string   `json:"enrolled_certs,omitempty"`
+	MOKPending        bool                `json:"mok_pending,omitempty"`
+	MOKListEmpty      bool                `json:"mok_list_empty,omitempty"` // Successful --list-new, empty, and no per-cert pending.
+	MOKImport         *MOKImportResult    `json:"mok_import,omitempty"`
 	// KernelSignature: /proc/version_signature. 예: "Ubuntu 6.8.0-85.85-generic 6.8.12"
 	// 빌드 서버가 정확한 기준 태그(Ubuntu-6.8.0-85.85)를 고르고 HWE 커널을 가려낼 때 씁니다.
 	KernelSignature string               `json:"kernel_signature,omitempty"`
@@ -212,6 +220,7 @@ type KernelPrepareStatus struct {
 
 // Host 는 컨트롤러에 등록된 물리 노드입니다.
 type Host struct {
+	TrackKey         string          `json:"track_key,omitempty"` // Controller-derived key in administrative status.
 	ID               string          `json:"id"`
 	Hostname         string          `json:"hostname"`
 	Ring             int             `json:"ring"`
@@ -284,6 +293,7 @@ type ReportRequest struct {
 // DesiredPatch 는 컨트롤러가 "이 호스트는 이 버전이어야 한다"고 알려주는 값입니다.
 // Version 이 0 이면 우리 패치를 모두 내려야 합니다.
 type DesiredPatch struct {
+	Track      string `json:"track,omitempty"`
 	Blocked    bool   `json:"blocked,omitempty"`
 	Warning    string `json:"warning,omitempty"`
 	Version    int    `json:"version"`
@@ -349,6 +359,7 @@ type RebootClaim struct {
 // --- 빌드 서버 ---
 
 type NextJobRequest struct {
+	NativeTrack   string `json:"native_track,omitempty"`
 	CanPrerelease bool   `json:"can_prerelease,omitempty"` // 음수 버전·출시 전 모듈 이름을 처리하는 빌더만 수신
 	Builder       string `json:"builder"`
 	// Series: 빌드 서버의 Ubuntu 시리즈 (예: noble). 컨트롤러는 이 시리즈의 커널 작업만 줍니다.
@@ -543,14 +554,15 @@ type UpstreamReport struct {
 }
 
 type BuildResult struct {
-	Success      bool       `json:"success"`
-	Deferred     bool       `json:"deferred,omitempty"` // temporary archive, lock or disk failure
-	Builder      string     `json:"builder,omitempty"`
-	JobStartedAt *time.Time `json:"job_started_at,omitempty"` // start time from the job assignment
-	Error        string     `json:"error,omitempty"`
-	Log          string     `json:"log"`
-	ModuleName   string     `json:"module_name,omitempty"`
-	ModuleBase64 string     `json:"module_base64,omitempty"`
+	DistributionProof *DistributionProof `json:"distribution_proof,omitempty"`
+	Success           bool               `json:"success"`
+	Deferred          bool               `json:"deferred,omitempty"` // temporary archive, lock or disk failure
+	Builder           string             `json:"builder,omitempty"`
+	JobStartedAt      *time.Time         `json:"job_started_at,omitempty"` // start time from the job assignment
+	Error             string             `json:"error,omitempty"`
+	Log               string             `json:"log"`
+	ModuleName        string             `json:"module_name,omitempty"`
+	ModuleBase64      string             `json:"module_base64,omitempty"`
 }
 
 type KnownCommitsResponse struct {
@@ -559,16 +571,20 @@ type KnownCommitsResponse struct {
 }
 
 type DiscoveredPatch struct {
-	Commit  string   `json:"commit"`
-	CVEs    []string `json:"cves"`
-	Title   string   `json:"title"`
-	Content string   `json:"content"`
+	CandidateID     string        `json:"candidate_id,omitempty"`
+	ParentCandidate string        `json:"parent_candidate,omitempty"`
+	FixedRelease    *FixedRelease `json:"fixed_release,omitempty"`
+	Commit          string        `json:"commit"`
+	CVEs            []string      `json:"cves"`
+	Title           string        `json:"title"`
+	Content         string        `json:"content"`
 }
 
 type DiscoveredRequest struct {
-	Prerelease  bool              `json:"prerelease,omitempty"`
-	Patches     []DiscoveredPatch `json:"patches"`
-	Unpatchable []Unpatchable     `json:"unpatchable"`
+	ExpectedActive []string          `json:"expected_active"`
+	Prerelease     bool              `json:"prerelease,omitempty"`
+	Patches        []DiscoveredPatch `json:"patches"`
+	Unpatchable    []Unpatchable     `json:"unpatchable"`
 	// LatestTag: 이번에 이 태그까지의 CVE 수정을 수집함 (새 빌드 작업이 "어디까지 반영"했는지 기록)
 	LatestTag string `json:"latest_tag,omitempty"`
 }

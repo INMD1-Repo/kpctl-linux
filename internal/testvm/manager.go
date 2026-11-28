@@ -566,7 +566,11 @@ func (m *Manager) waitBoot(ctx context.Context, e Endpoint, kernel, mode string,
 	var last string
 	for {
 		probeCtx, probeCancel := context.WithTimeout(bootCtx, 15*time.Second)
-		out, err := m.runner.Run(probeCtx, e, bootProbeScript, "")
+		probe := bootProbeScript
+		if _, ok := model.DistributionTrack(kernel); ok {
+			probe = strings.Replace(probe, "uname -r", "/usr/local/bin/kpctl-agent -identify", 1)
+		}
+		out, err := m.runner.Run(probeCtx, e, probe, "")
 		probeCancel()
 		if err == nil {
 			fields := strings.Fields(out)

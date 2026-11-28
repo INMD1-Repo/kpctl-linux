@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"kpctl/internal/model"
 )
 
 // ── HTTP 오류 ──
@@ -85,7 +87,13 @@ var (
 	cveRe    = regexp.MustCompile(`(?i)CVE-\d{4}-\d{4,}`)
 )
 
-func validKernel(k string) bool { return kernelRe.MatchString(k) && !strings.Contains(k, "..") }
+func validKernel(k string) bool {
+	if strings.HasPrefix(k, "native__") {
+		_, ok := model.DistributionTrack(k)
+		return ok
+	}
+	return kernelRe.MatchString(k) && !strings.Contains(k, "..")
+}
 func validModule(m string) bool { return moduleRe.MatchString(m) }
 
 // normalizeCVEs 는 CVE 목록을 대문자로 맞추고 중복을 없앱니다.

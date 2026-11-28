@@ -17,11 +17,24 @@ import (
 	"time"
 
 	"kpctl/internal/klpcheck"
+	"kpctl/internal/model"
 )
 
 // verifyModule 은 도구의 성공 여부와 별도로 실제 ELF·타깃 ABI·심볼 CRC 를 확인합니다.
 // Ubuntu 의 가변 길이 __versions 는 예전 libkmod 로 읽을 수 없어 직접 해석합니다.
 func (b *Builder) verifyModule(k KernelConfig, out buildOutput) (string, error) {
+	return verifyWithInputs(k.Kernel, out, filepath.Join(b.cfg.BootDir, "config-"+k.Kernel), "", []string{filepath.Join("/usr/src/linux-headers-"+k.Kernel, "Module.symvers"), filepath.Join("/lib/modules", k.Kernel, "build/Module.symvers")})
+}
+
+func VerifyDistributionModule(track string, version int, path, config, symvers, reference string) (string, error) {
+	k, ok := model.DistributionTrack(track)
+	if !ok || version < 1 || reference == "" {
+		return "", fmt.Errorf("invalid native module target")
+	}
+	return verifyWithInputs(k.ABI, buildOutput{ModulePath: path, ModuleName: model.NativeModuleName(track, version)}, config, reference, []string{symvers})
+}
+
+func verifyWithInputs(kernel string, out buildOutput, configPath, referencePath string, symvers []string) (string, error) {
 	f, err := elf.Open(out.ModulePath)
 	if err != nil {
 		return "", fmt.Errorf("커널 모듈 ELF 읽기 실패: %w", err)
@@ -54,36 +67,60 @@ func (b *Builder) verifyModule(k KernelConfig, out buildOutput) (string, error) 
 		info[key] = value
 	}
 	magic := strings.Fields(info["vermagic"])
-	if len(magic) == 0 || magic[0] != k.Kernel || info["name"] != out.ModuleName || info["livepatch"] != "Y" {
-		return "", fmt.Errorf("모듈 정보 불일치: name=%q vermagic=%q livepatch=%q (대상 %s/%s)", info["name"], info["vermagic"], info["livepatch"], out.ModuleName, k.Kernel)
+	if len(magic) == 0 || magic[0] != kernel || info["name"] != out.ModuleName || info["livepatch"] != "Y" {
+		return "", fmt.Errorf("모듈 정보 불일치: name=%q vermagic=%q livepatch=%q (대상 %s/%s)", info["name"], info["vermagic"], info["livepatch"], out.ModuleName, kernel)
 	}
 	if err := klpcheck.Verify(f); err != nil {
 		return "", err
 	}
-	config, err := os.ReadFile(filepath.Join(b.cfg.BootDir, "config-"+k.Kernel))
+	config, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", fmt.Errorf("대상 커널 설정을 읽을 수 없습니다: %w", err)
+	}
+	if referencePath != "" && !strings.Contains("\n"+string(config)+"\n", "\nCONFIG_LIVEPATCH=y\n") {
+		return "", fmt.Errorf("정식 대상 커널의 CONFIG_LIVEPATCH=y가 필요합니다")
 	}
 	wantVersions := strings.Contains("\n"+string(config)+"\n", "\nCONFIG_MODVERSIONS=y\n")
 	if err := verifyVermagicFlags(magic[1:], string(config)); err != nil {
 		return "", err
 	}
-	if !wantVersions {
+	if !wantVersions && referencePath == "" {
 		return fmt.Sprintf("모듈 검증: %s %s livepatch=Y\n", out.ModuleName, info["vermagic"]), nil
 	}
-	referenceMagic, err := targetModuleVermagic(k.Kernel)
+	var referenceMagic string
+	if referencePath != "" {
+		referenceMagic, err = readVermagic(kernel, referencePath)
+	} else {
+		referenceMagic, err = targetModuleVermagic(kernel)
+	}
 	if err != nil {
 		return "", err
 	}
 	if info["vermagic"] != referenceMagic {
 		return "", fmt.Errorf("대상 정식 모듈의 전체 vermagic 과 다릅니다: %q != %q", info["vermagic"], referenceMagic)
 	}
+	if !wantVersions {
+		return fmt.Sprintf("모듈 검증: %s %s livepatch=Y\n", out.ModuleName, info["vermagic"]), nil
+	}
 	versions, format, err := moduleVersions(f)
 	if err != nil {
 		return "", err
 	}
+	if referencePath != "" {
+		symbols, err := f.Symbols()
+		if err != nil {
+			return "", err
+		}
+		for _, symbol := range symbols {
+			if symbol.Section == elf.SHN_UNDEF && elf.ST_BIND(symbol.Info) == elf.STB_GLOBAL {
+				if _, ok := versions[symbol.Name]; !ok {
+					return "", fmt.Errorf("모듈에서 참조하는 외부 심볼의 CRC가 없습니다: %s", symbol.Name)
+				}
+			}
+		}
+	}
 	var reference []byte
-	for _, path := range []string{filepath.Join("/usr/src/linux-headers-"+k.Kernel, "Module.symvers"), filepath.Join("/lib/modules", k.Kernel, "build/Module.symvers")} {
+	for _, path := range symvers {
 		reference, err = os.ReadFile(path)
 		if err == nil {
 			break
@@ -136,6 +173,10 @@ func targetModuleVermagic(kernel string) (string, error) {
 	if err != nil || module == "" {
 		return "", fmt.Errorf("대상 정식 커널 모듈이 필요합니다: %s (%v)", kernel, err)
 	}
+	return readVermagic(kernel, module)
+}
+
+func readVermagic(kernel, module string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "modinfo", "-F", "vermagic", module).Output()

@@ -161,7 +161,11 @@ func signingBytesSHA256(data []byte) string {
 }
 
 func signModule(key SigningKey, kernel, path, unsignedSum string, certDER []byte) (string, error) {
-	out, err := runCommand(key.SignCommand, map[string]string{"module": path, "kernel": kernel}, 5*time.Minute)
+	abi := kernel
+	if k, ok := model.DistributionTrack(kernel); ok {
+		abi = k.ABI
+	}
+	out, err := runCommand(key.SignCommand, map[string]string{"module": path, "kernel": abi, "track": kernel}, 5*time.Minute)
 	if err != nil {
 		if filepath.Base(key.SignCommand[0]) == "sign-file" && (errors.Is(err, os.ErrNotExist) || errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrPermission)) {
 			return "", fail(http.StatusInternalServerError, "키 %s: 컨트롤러의 linux-headers-%s 및 서비스 계정의 sign-file 실행 권한 확인: %v", key.ID, kernel, err)
@@ -306,7 +310,7 @@ func (s *Server) prepareSigningArtifactsWithRotations(id int, kernel, module str
 	}
 	s.store.View(func(st *State) {
 		for _, h := range st.Hosts {
-			if h.Status.Kernel != kernel || !hostSignatureRequired(h.Status) {
+			if h.Status.TrackKey() != kernel || !hostSignatureRequired(h.Status) {
 				continue
 			}
 			for _, key := range keys {
@@ -448,6 +452,13 @@ func (s *Server) previousSigningCandidate(kernel string, key SigningKey, candida
 		}
 		return path, nil, err
 	}
+	if _, native := model.DistributionTrack(kernel); native {
+		var proofErr error
+		s.store.View(func(st *State) { proofErr = s.checkDistributionProof(st, previous) })
+		if proofErr != nil {
+			return "", nil, proofErr
+		}
+	}
 	if previous.UnsignedSHA256 == "" {
 		return "", nil, fmt.Errorf("이전 누적 v%d에 키 %s 사본과 서명 전 원본 pin이 없어 안전한 키 교체·롤백 시험을 할 수 없습니다", previous.Version, key.ID)
 	}
@@ -508,6 +519,11 @@ func (s *Server) publishSigningRotationsLocked(st *State, id int, rotations []si
 		if previous == nil || previous.Status != model.JobReleased || previous.Kernel != rotation.Kernel || previous.Kernel != current.Kernel || previous.ModuleName != rotation.Module ||
 			previous.UnsignedSHA256 == "" || previous.UnsignedSHA256 != rotation.UnsignedSHA256 || previous.ActiveSigningKey != rotation.PreviousActiveKey || previous.SHA256 != rotation.PreviousSHA256 {
 			return nil, fmt.Errorf("키 교체 시험 뒤 이전 누적본 상태가 바뀌었습니다")
+		}
+		if _, native := model.DistributionTrack(previous.Kernel); native {
+			if err := s.checkDistributionProof(st, previous); err != nil {
+				return nil, err
+			}
 		}
 		stored, exists := previous.SigningArtifacts[rotation.KeyID]
 		if rotation.PrivateOnly {

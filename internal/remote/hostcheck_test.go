@@ -11,7 +11,7 @@ import (
 
 func TestHostChecks(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	good := Facts{
+	good := Facts{Distro: "ubuntu",
 		Kernel: "6.8.0-85-generic", Livepatch: "yes", SecureBoot: "SecureBoot disabled",
 		Container: "none", Systemd: "yes", Modules: "yes", Lockdown: "none",
 		BootFreeKB: "900000", VarFreeKB: "5000000", Python3: "yes", Dpkg: "ok", Now: fmt.Sprint(now.Unix()),
@@ -31,7 +31,7 @@ func TestHostChecks(t *testing.T) {
 		{"systemd 없음", func(f *Facts) { f.Systemd = "no" }, "P", "systemd"},
 		{"livepatch 없음", func(f *Facts) { f.Livepatch = "no" }, "P", "CONFIG_LIVEPATCH"},
 		{"커널 모듈 없음", func(f *Facts) { f.Modules = "no" }, "P", "재부팅"},
-		{"/var 부족", func(f *Facts) { f.VarFreeKB = "100000" }, "P", "/var 여유 97MB: apt 설치와 패치 보관에 500MB"},
+		{"/var 부족", func(f *Facts) { f.VarFreeKB = "100000" }, "P", "/var 여유 97MB: 패키지 설치와 패치 보관에 500MB"},
 		{"HWE 커널", func(f *Facts) { f.Kernel = "6.11.0-29-generic" }, "W", "자동으로 빌드되지"},
 		{"Secure Boot", func(f *Facts) { f.SecureBoot = "SecureBoot enabled"; f.Lockdown = "integrity" }, "W", "MOK"},
 		{"lockdown", func(f *Facts) { f.Lockdown = "confidentiality" }, "W", "lockdown(confidentiality)"},
@@ -96,5 +96,33 @@ func TestPreflightScriptReportsHostFacts(t *testing.T) {
 	}
 	if sec := kv["now"]; len(sec) < 10 {
 		t.Errorf("now=%q", sec)
+	}
+}
+
+func TestNativePreflightProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		d, r, c, abi, kind, arch string
+		accept                   bool
+	}{
+		{"rocky", "10.3", "", "6.12.0-264.21.1.el10_3.x86_64", "stable", "x86_64", true},
+		{"rocky", "9.9", "", "5.14.0-741.27.1.el9_9.x86_64", "stable", "x86_64", true},
+		{"debian", "13", "trixie", "6.12.118+deb13-amd64", "", "x86_64", true},
+		{"debian", "12", "bookworm", "6.1.0-57-amd64", "", "x86_64", true},
+		{"rocky", "10.0", "", "6.12.0-1.el10.x86_64", "development", "x86_64", false},
+		{"debian", "13", "testing", "6.12.118+deb13-amd64", "", "x86_64", false},
+		{"rocky", "9.9", "", "5.14.0-741.27.1.el9_9.x86_64", "stable", "aarch64", false},
+	} {
+		f := Facts{Distro: tc.d, Release: tc.r, Codename: tc.c, Kernel: tc.abi, ReleaseType: tc.kind, NativePackage: "verified package", Arch: tc.arch, Livepatch: "yes", Archive: "000", BootFreeKB: "1"}
+		p, w := hostChecks(f, time.Now())
+		if (len(p) == 0) != tc.accept || (len(w) > 0) != (tc.c == "trixie") || tc.c == "trixie" && !strings.Contains(strings.Join(w, " "), "IBT") {
+			t.Fatalf("profile %+v: %v %v", tc, p, w)
+		}
+		if tc.accept {
+			f.NativePackage = ""
+			problems, _ := hostChecks(f, time.Now())
+			if len(problems) == 0 {
+				t.Fatal("native image package mismatch passed preflight")
+			}
+		}
 	}
 }

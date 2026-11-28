@@ -29,6 +29,46 @@ func CheckFile(path string) error {
 	return Verify(f)
 }
 
+// CheckTarget also binds the module's own name and vermagic to an exact target.
+func CheckTarget(path, kernel, name string) error {
+	f, err := elf.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := Verify(f); err != nil {
+		return err
+	}
+	section := f.Section(".modinfo")
+	if section == nil {
+		return fmt.Errorf("missing .modinfo")
+	}
+	data, err := section.Data()
+	if err != nil {
+		return err
+	}
+	want := map[string]string{"name": name, "livepatch": "Y", "vermagic": kernel}
+	seen := map[string]bool{}
+	for _, entry := range strings.Split(string(data), "\x00") {
+		k, v, ok := strings.Cut(entry, "=")
+		expected, required := want[k]
+		if !ok || !required {
+			continue
+		}
+		if k == "vermagic" {
+			v, _, _ = strings.Cut(v, " ")
+		}
+		if seen[k] || v != expected {
+			return fmt.Errorf("module %s mismatch: got %q, expected %q", k, v, expected)
+		}
+		seen[k] = true
+	}
+	if len(seen) != len(want) {
+		return fmt.Errorf("incomplete module identity")
+	}
+	return nil
+}
+
 // Verify checks the ELF64 x86-64 format supported here, livepatch relocation
 // metadata, and relocations that could corrupt host-wide ftrace state.
 // https://docs.kernel.org/livepatch/module-elf-format.html

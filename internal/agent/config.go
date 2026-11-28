@@ -42,13 +42,14 @@ type Config struct {
 	MokutilBin       string `json:"mokutil_bin,omitempty"`     // MOK 조회·예약 도구, 생략 시 mokutil
 
 	// 아래는 테스트용으로 바꿀 수 있게 둔 경로입니다. 운영에서는 기본값 그대로 두세요.
-	LivepatchSysfs    string   `json:"livepatch_sysfs"` // /sys/kernel/livepatch
-	ModuleSysfs       string   `json:"module_sysfs"`    // /sys/module
-	SysfsRoot         string   `json:"sysfs_root"`      // /sys (펌웨어·서명 정책 보고)
-	TaintedPath       string   `json:"tainted_path"`    // /proc/sys/kernel/tainted
-	OSReleasePath     string   `json:"osrelease_path"`  // /proc/sys/kernel/osrelease (= uname -r)
-	SignaturePath     string   `json:"signature_path"`  // /proc/version_signature (Ubuntu 패키지 버전)
-	Hostname          string   `json:"hostname"`        // 비우면 시스템 hostname
+	LivepatchSysfs    string   `json:"livepatch_sysfs"`               // /sys/kernel/livepatch
+	ModuleSysfs       string   `json:"module_sysfs"`                  // /sys/module
+	SysfsRoot         string   `json:"sysfs_root"`                    // /sys (펌웨어·서명 정책 보고)
+	TaintedPath       string   `json:"tainted_path"`                  // /proc/sys/kernel/tainted
+	DistroReleasePath string   `json:"distro_release_path,omitempty"` // os-release fixture override
+	OSReleasePath     string   `json:"osrelease_path"`                // /proc/sys/kernel/osrelease (= uname -r)
+	SignaturePath     string   `json:"signature_path"`                // /proc/version_signature (Ubuntu 패키지 버전)
+	Hostname          string   `json:"hostname"`                      // 비우면 시스템 hostname
 	BootIDPath        string   `json:"boot_id_path"`
 	BootTargetPath    string   `json:"boot_target_path"`
 	BootDir           string   `json:"boot_dir"`

@@ -29,7 +29,7 @@ func hostChecks(f Facts, now time.Time) (problems, warnings []string) {
 		problem("컨테이너(%s) 안입니다. 라이브패치는 커널 모듈이라 VM·물리 서버에 설치하세요", f.Container)
 	}
 	if f.Systemd == "no" {
-		problem("systemd 로 부팅하지 않은 시스템입니다 (kpatch.service·kpctl-agent.service 필요)")
+		problem("systemd 로 부팅하지 않은 시스템입니다 (kpctl-agent.service 필요)")
 	}
 	if f.Livepatch != "yes" {
 		problem("커널 %s 에 CONFIG_LIVEPATCH=y 가 없습니다", f.Kernel)
@@ -37,7 +37,19 @@ func hostChecks(f Facts, now time.Time) (problems, warnings []string) {
 	if f.Modules == "no" {
 		problem("/lib/modules/%s 가 없습니다. 실행 중인 커널 패키지가 지워졌으니 설치된 커널로 재부팅한 뒤 다시 하세요", f.Kernel)
 	}
-	if model.LTSForKernel(f.Kernel) == nil {
+	ubuntu := f.Distro == "ubuntu"
+	if f.Distro == "debian" && f.Release == "13" && f.Codename == "trixie" {
+		warn("%s", model.TrixieBlocked)
+	}
+	if !ubuntu {
+		release, _, _ := strings.Cut(f.Release, ".")
+		if f.Distro == "rocky" && !model.RockyStable(f.ReleaseType, f.ReleaseDescription) || !model.SupportsDistributionABI(f.Distro, release, f.Arch, f.Kernel) || f.Distro == "debian" && !(f.Release == "12" && f.Codename == "bookworm" || f.Release == "13" && f.Codename == "trixie") {
+			problem("지원하지 않는 배포판 기본 AMD64 커널: %s %s %s %s", f.Distro, f.Release, f.Arch, f.Kernel)
+		} else if f.NativePackage == "" {
+			problem("실행 커널 %s와 일치하는 정식 배포판 이미지 패키지를 확인할 수 없습니다", f.Kernel)
+		}
+	}
+	if ubuntu && model.LTSForKernel(f.Kernel) == nil {
 		var names []string
 		for _, l := range model.SupportedLTS {
 			names = append(names, l.Codename)
@@ -50,9 +62,9 @@ func hostChecks(f Facts, now time.Time) (problems, warnings []string) {
 		warn("커널 lockdown(%s): 서명된 패치 모듈만 올라갑니다 (서명 인증서를 커널 키링에 등록 필요)", f.Lockdown)
 	}
 	if lp := strings.TrimSpace(f.OtherPatches); lp != "" {
-		warn("다른 라이브패치가 올라가 있습니다 (%s). 설치하며 Canonical Livepatch 를 끄지만 재부팅으로 빠지기 전까지 kpctl 패치는 적용되지 않습니다", lp)
+		warn("다른 라이브패치가 올라가 있습니다 (%s). 기존 패치가 활성인 동안 kpctl 패치는 적용되지 않습니다", lp)
 	}
-	if fs, dev, _ := strings.Cut(f.BootFS, " "); f.BootFS != "" {
+	if fs, dev, _ := strings.Cut(f.BootFS, " "); ubuntu && f.BootFS != "" {
 		switch {
 		case fs == "none":
 			warn("/boot/grub/grubenv 가 없어(GRUB 아님) 다음 GA 커널 자동 준비를 할 수 없습니다")
@@ -61,22 +73,22 @@ func hostChecks(f Facts, now time.Time) (problems, warnings []string) {
 		}
 	}
 	switch ok := strings.HasPrefix(f.Archive, "2") || strings.HasPrefix(f.Archive, "3"); {
-	case f.Archive == "":
+	case !ubuntu || f.Archive == "":
 	case !ok:
 		warn("mirrors.list 의 Ubuntu 미러에 모두 접속하지 못해(응답 %s) 다음 GA 커널 자동 준비가 실패합니다 (목록의 미러 중 하나에 HTTP 허용 필요)", f.Archive)
 	case f.ArchiveVia != "official":
 		warn("Ubuntu 공식 저장소에 접속하지 못해 %s 미러를 씁니다 (설치·커널 준비 모두 자동 전환)", f.ArchiveVia)
 	}
-	if kb, err := strconv.Atoi(f.BootFreeKB); err == nil && kb < minBootFreeKB {
+	if kb, err := strconv.Atoi(f.BootFreeKB); ubuntu && err == nil && kb < minBootFreeKB {
 		warn("/boot 여유 %dMB: 다음 GA 커널 준비에 %dMB 이상 필요합니다 (sudo apt autoremove --purge 로 옛 커널 정리)", kb>>10, minBootFreeKB>>10)
 	}
 	if kb, err := strconv.Atoi(f.VarFreeKB); err == nil && kb < minVarFreeKB {
-		problem("/var 여유 %dMB: apt 설치와 패치 보관에 %dMB 이상 필요합니다", kb>>10, minVarFreeKB>>10)
+		problem("/var 여유 %dMB: 패키지 설치와 패치 보관에 %dMB 이상 필요합니다", kb>>10, minVarFreeKB>>10)
 	}
 	if f.Dpkg == "broken" {
 		warn("dpkg 가 설치 도중 멈춘 상태입니다. 설치하며 dpkg --configure -a 로 먼저 복구합니다")
 	}
-	if f.Python3 == "no" {
+	if ubuntu && f.Python3 == "no" {
 		warn("python3 가 없어 설치하며 함께 설치합니다 (커널 준비 도우미에 필요)")
 	}
 	if sec, err := strconv.ParseInt(f.Now, 10, 64); err == nil {

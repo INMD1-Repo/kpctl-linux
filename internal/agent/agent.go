@@ -25,6 +25,9 @@ import (
 const retryAfterFailure = 10 * time.Minute
 
 type Agent struct {
+	imageCheck      KernelImageCheck
+	identityError   string
+	distribution    *model.DistributionKernel
 	cfg             *Config
 	c               *client.Client
 	st              *localState
@@ -45,7 +48,33 @@ func New(cfg *Config) (*Agent, error) {
 	if err := a.loadState(); err != nil {
 		return nil, fmt.Errorf("상태 파일 읽기 실패: %w", err)
 	}
+	c.SetToken(a.st.HostToken)
+	if err := a.refreshIdentity(true); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (a *Agent) refreshIdentity(startup bool) error {
+	cfg := a.cfg
 	current := a.kernelRelease()
+	var err error
+	a.distribution, err = IdentifyKernel(current, filepath.Join(cfg.SysfsRoot, "kernel/notes"), cfg.DistroReleasePath, filepath.Join(cfg.ProcDir, "sys/kernel/version"))
+	if err == nil && a.distribution != nil {
+		err = a.imageCheck.Verify(a.distribution, cfg.BootDir, "/lib/modules")
+	}
+
+	a.identityError = ""
+	if err != nil {
+		a.identityError = fmt.Sprintf("실행 커널 %s 식별 실패: %v", current, err)
+		return nil
+	}
+	if a.distribution.BuildBlock() != "" {
+		return nil
+	}
+	if a.distribution != nil {
+		current = a.distribution.Track()
+	}
 	if current != "" && a.st.Kernel != current {
 		if a.st.Kernel != "" {
 			a.st.Version = 0
@@ -57,24 +86,23 @@ func New(cfg *Config) (*Agent, error) {
 		a.st.KernelPrepare = nil
 		a.st.Kernel = current
 		if err := a.saveState(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	if p := a.st.KernelPrepare; p != nil && p.State == "preparing" {
+	if p := a.st.KernelPrepare; startup && a.distribution == nil && p != nil && p.State == "preparing" {
 		if target, _ := a.bootTarget(); target != nil {
 			p.State, p.Error, p.NextAttemptAt = "prepared", "", time.Time{}
 		} else {
 			a.failKernelPrepare(fmt.Errorf("에이전트 재시작으로 커널 준비 완료를 확인하지 못했습니다"))
 		}
 		if err := a.saveState(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	if !a.st.FailedAt.IsZero() {
+	if startup && !a.st.FailedAt.IsZero() {
 		a.lastErr = "이전 라이브패치 적용 실패: 재시도 대기 중"
 	}
-	c.SetToken(a.st.HostToken)
-	return a, nil
+	return nil
 }
 
 func (a *Agent) Run(ctx context.Context) {
@@ -105,10 +133,20 @@ func (a *Agent) RunOnce() error {
 }
 
 func (a *Agent) cycle(allowPrepare bool) error {
-	a.pollKernelPrepare()
-	if err := a.expireBootChoice(); err != nil {
-		a.lastErr = err.Error()
+	if err := a.refreshIdentity(false); err != nil {
 		return err
+	}
+	blocked := a.identityError != "" || a.distribution.BuildBlock() != ""
+	if !blocked {
+		a.pollKernelPrepare()
+	} else if a.prepareCancel != nil {
+		a.prepareCancel()
+	}
+	if !blocked && a.distribution == nil {
+		if err := a.expireBootChoice(); err != nil {
+			a.lastErr = err.Error()
+			return err
+		}
 	}
 	if err := a.ensureRegistered(); err != nil {
 		return fmt.Errorf("등록 실패: %w", err)
@@ -128,6 +166,9 @@ func (a *Agent) cycle(allowPrepare bool) error {
 
 	// 공개 인증서를 먼저 확인해 현재 MOK 등록 상태로 목표를 다시 받습니다.
 	// 등록 예약을 처리한 주기에는 재부팅 승인 실행 경로로 들어가지 않습니다.
+	if blocked {
+		return nil
+	}
 	importRequested := resp.MOKImport != nil
 	if a.reconcileSigning(resp) {
 		resp, err = a.report()
@@ -146,6 +187,12 @@ func (a *Agent) cycle(allowPrepare bool) error {
 		return nil
 	}
 
+	if a.distribution != nil {
+		if changed := a.apply(resp.Desired); changed {
+			_, err = a.report()
+		}
+		return err
+	}
 	if err := a.reconcileBootChoice(resp); err != nil {
 		a.lastErr = err.Error()
 		return err
@@ -188,7 +235,11 @@ func (a *Agent) ensureRegistered() error {
 
 func (a *Agent) report() (model.ReportResponse, error) {
 	var resp model.ReportResponse
-	target, problem := a.bootTarget()
+	var target *model.BootTarget
+	var problem string
+	if a.identityError == "" && a.distribution == nil {
+		target, problem = a.bootTarget()
+	}
 	security := a.securityStatus()
 	enrolled, pending, listEmpty, certWarning := a.enrollmentStatus(security)
 	var moduleSHA string
@@ -202,8 +253,14 @@ func (a *Agent) report() (model.ReportResponse, error) {
 			securityWarnings = append(securityWarnings, warning)
 		}
 	}
+	reportError := a.lastErr
+	if a.identityError != "" {
+		reportError = a.identityError
+	}
 	err := a.c.Do("POST", "/api/agent/report", model.ReportRequest{
 		Status: model.HostStatus{
+			Distribution:      a.distribution,
+			IdentityError:     a.identityError,
 			ModuleSHA256:      moduleSHA,
 			Kernel:            a.kernelRelease(),
 			Firmware:          security.firmware,
@@ -220,7 +277,7 @@ func (a *Agent) report() (model.ReportResponse, error) {
 			Version:           a.st.Version,
 			Loaded:            a.loadedPatches(),
 			Tainted:           a.tainted(),
-			Error:             a.lastErr,
+			Error:             reportError,
 			BootID:            a.bootID(), BootTarget: target, BootProblem: problem, LocalVMCount: a.localVMCount(),
 			KernelPrepare:   a.st.KernelPrepare,
 			BootConfirmedID: a.st.BootConfirmedID,
@@ -235,7 +292,7 @@ func (a *Agent) report() (model.ReportResponse, error) {
 // apply 는 컨트롤러가 원하는 버전에 맞춥니다. 무언가 바꿨으면 true.
 func (a *Agent) apply(d model.DesiredPatch) bool {
 	// 제외는 보호 유지 요청입니다. v0 롤백처럼 기존 모듈을 내리지 않습니다.
-	if d.Blocked {
+	if a.identityError != "" || a.distribution.BuildBlock() != "" || d.Blocked || (a.distribution != nil && (d.Track != a.distribution.Track() || (d.Version != 0 && d.ModuleName != model.NativeModuleName(d.Track, d.Version)))) || (a.distribution == nil && strings.HasPrefix(d.Track, "native__")) {
 		return false
 	}
 	// 이미 맞으면 할 일 없음 (기록만 보지 않고 커널에 실제로 올라가 있는지까지 확인)
@@ -336,7 +393,12 @@ func (a *Agent) loadVersion(d model.DesiredPatch) error {
 		os.Remove(part)
 		return fmt.Errorf("모듈 해시 불일치: 받은 %s, 기대 %s", sum[:12], shortHash(d.SHA256))
 	}
-	if err := klpcheck.CheckFile(part); err != nil {
+	if a.distribution != nil {
+		err = klpcheck.CheckTarget(part, a.distribution.ABI, d.ModuleName)
+	} else {
+		err = klpcheck.CheckFile(part)
+	}
+	if err != nil {
 		return fmt.Errorf("라이브패치 모듈 ELF 검사 실패: %w", err)
 	}
 	if err := os.Rename(part, path); err != nil {
@@ -362,7 +424,9 @@ func (a *Agent) activateVersion(d model.DesiredPatch, path string, timeout time.
 	}
 
 	// 실패한 후보를 다음 부팅 때 자동으로 올리지 않도록, 검증이 끝난 뒤 설치합니다.
-	if err := a.installVersion(d, path); err != nil {
+	if a.distribution != nil {
+		a.st.Installed = appendUnique(a.st.Installed, d.ModuleName)
+	} else if err := a.installVersion(d, path); err != nil {
 		return err
 	}
 
@@ -394,6 +458,9 @@ func (a *Agent) installVersion(d model.DesiredPatch, path string) error {
 }
 
 func (a *Agent) installedModulePath(name string) string {
+	if a.distribution != nil {
+		return filepath.Join(a.cfg.StateDir, "modules", name+".ko")
+	}
 	return filepath.Join(a.cfg.KpatchInstallDir, a.kernelRelease(), name+".ko")
 }
 
@@ -424,7 +491,11 @@ func (a *Agent) removeOurModules(keep string) error {
 		// uninstall 직후 상태 저장 전에 중단됐어도 이미 지운 파일은 다시 지우지 않습니다.
 		_, err := os.Stat(a.installedModulePath(name))
 		if err == nil {
-			err = a.kpatch("uninstall", name)
+			if a.distribution != nil {
+				err = os.Remove(a.installedModulePath(name))
+			} else {
+				err = a.kpatch("uninstall", name)
+			}
 		}
 		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())

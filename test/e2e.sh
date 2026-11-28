@@ -30,6 +30,16 @@ pass() { echo "  ✔ $*"; }
 die()  { echo "  ✘ $*"; echo "--- 컨트롤러 로그 ---"; tail -30 "$W/controller.log"; exit 1; }
 check() { local msg="$1"; shift; if "$@"; then pass "$msg"; else die "$msg"; fi; }
 
+check_eventually() {
+  local msg=$1 deadline=$((SECONDS + 20))
+  shift
+  while ! "$@"; do
+    if (( SECONDS >= deadline )); then die "$msg"; fi
+    sleep 0.25
+  done
+  pass "$msg"
+}
+
 export KPCTL_URL="http://127.0.0.1:$PORT" KPCTL_TOKEN="$ADMIN"
 export KPCTL_ENV="$W/no-env" KPCTL_CA="" KPCTL_SSH_FROM=""
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=t@t
@@ -131,6 +141,7 @@ make_host() {
     echo '[none] integrity confidentiality' > "$R/sys/kernel/security/lockdown"
     echo N > "$R/sys/module/module/parameters/sig_enforce"
   fi
+  echo ID=ubuntu > "$R/proc/distro-release"
   echo "$kernel" > "$R/proc/osrelease"; echo "$sig" > "$R/proc/version_signature"; echo 32768 > "$R/proc/tainted"
   printf '#!/bin/sh\ntouch %s/rebooted\n' "$R" > "$R/reboot-hook.sh"
   python3 "$FAKE/prepare-boot.py" "$R" "$kernel"
@@ -140,7 +151,7 @@ make_host() {
   "state_dir": "$R/state", "kpatch_bin": "$FAKE/kpatch", "kpatch_install_dir": "$R/installed", "reboot_hook": "$R/reboot-hook.sh",
   "livepatch_sysfs": "$R/sys/livepatch", "module_sysfs": "$R/sys/module",
   "sysfs_root": "$R/sys", "mokutil_bin": "$FAKE/mokutil",
-  "tainted_path": "$R/proc/tainted", "osrelease_path": "$R/proc/osrelease",
+  "distro_release_path": "$R/proc/distro-release", "tainted_path": "$R/proc/tainted", "osrelease_path": "$R/proc/osrelease",
   "signature_path": "$R/proc/version_signature", "boot_id_path": "$R/proc/boot_id", "proc_dir": "$R/proc",
   "boot_dir": "$R/boot", "grub_config": "$R/boot/grub.cfg", "grub_env": "$R/grubenv",
   "grub_reboot_bin": "$R/grub-reboot", "grub_editenv_bin": "$R/grub-editenv", "kernel_prepare_lock": "$R/prepare.lock", "package_locks": [],
@@ -349,14 +360,12 @@ kpctl auto clear $KERNEL >/dev/null
 sleep 2
 check "일시 중지 중에는 재개해도 승인하지 않음" bash -c "kpctl jobs | grep -qE '^$AUTOJOB .*승인대기' && kpctl auto | grep -q '일시 중지'"
 kpctl auto resume >/dev/null
-sleep 2
-check "재개하면 사람 없이 승인되고 링 1 배포" bash -c "kpctl jobs | grep -E '^$AUTOJOB ' | grep -q 'auto'"
+check_eventually "재개하면 사람 없이 승인되고 링 1 배포" bash -c "kpctl jobs | grep -E '^$AUTOJOB ' | grep -q 'auto'"
 check "자동 승인도 서명 명령을 거침" bash -c "grep -l auto_fix '$W/ctl-data/artifacts/$KERNEL/'*.ko | xargs grep -aq '~Module signature appended~'"
 AUTOVER=$(kpctl jobs | awk -v j=$AUTOJOB '$1 == j {print $3}')
 check "카나리 적용 전에는 링 2 로 넘어가지 않음" bash -c "! kpctl status | grep -qE '^$KERNEL +$AUTOVER +$AUTOVER'"
 agent gpu-01
-sleep 2
-check "카나리 적용 뒤 링 2 로 자동 승급" bash -c "kpctl status | grep -qE '^$KERNEL +$AUTOVER +$AUTOVER'"
+check_eventually "카나리 적용 뒤 링 2 로 자동 승급" bash -c "kpctl status | grep -qE '^$KERNEL +$AUTOVER +$AUTOVER'"
 check "감사 로그에 auto 로 남음" grep -qP '\tauto\t승인 job '"$AUTOJOB" "$W/ctl-data/audit.log"
 kpctl submit -kernel $KERNEL -title "자동 승인 금지 확인" "$W/manual.patch" >/dev/null
 MANUALJOB=$(kpctl jobs | awk 'NR==2 {print $1}')

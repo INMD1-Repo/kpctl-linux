@@ -77,7 +77,7 @@ func (s *Server) testVMRequirements(kernel string) (modes []string, signatureReq
 func (s *Server) testVMRequirementsLocked(st *State, kernel string) (modes []string, signatureRequired bool) {
 	var fleet []model.HostStatus
 	for _, h := range st.Hosts {
-		if h.Status.Kernel != kernel {
+		if h.Status.TrackKey() != kernel {
 			continue
 		}
 		fleet = append(fleet, h.Status)

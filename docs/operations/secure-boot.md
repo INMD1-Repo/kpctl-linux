@@ -1,5 +1,7 @@
 # Secure Boot·서명·MOK 운영
 
+Debian과 Rocky Linux의 서명 강제 대상은 해당 배포 키의 실제 MOK 등록이 확인된 뒤에만 사본을 받습니다. 패키지 트랙 확인과 전용 VM 시험 절차를 따르세요. [배포판별 Secure Boot canary](distribution-kernels.md#실제-대상-설치-및-secure-boot-canary)
+
 <a id="secure-boot"></a>
 
 서명 필요 여부는 Secure Boot 스위치 하나로 결정하지 않습니다. 에이전트는 펌웨어, EFI SecureBoot 변수, 커널 lockdown, `module.sig_enforce`를 보고하고 컨트롤러도 같은 정책으로 판단합니다. 수집 실패는 에이전트 보고 주기를 중단시키지 않으며 `unknown`과 경고로 표시합니다.

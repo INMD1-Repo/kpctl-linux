@@ -38,11 +38,12 @@ fi
 echo "■ 파일 삭제"
 rm -fv /usr/local/bin/kpctl-agent \
        /etc/systemd/system/kpctl-agent.service \
-       /etc/kpctl/agent.json /etc/kpctl/ca.crt /etc/kpctl/mirrors.list \
-       /usr/local/sbin/kpctl-prepare-kernel \
-       /etc/apt/apt.conf.d/99kpctl-no-reboot \
-       /etc/needrestart/conf.d/99kpctl.conf
-rm -rf /var/lib/kpctl-agent /var/cache/kpctl-apt-mirror
+       /etc/kpctl/agent.json /etc/kpctl/ca.crt
+rm -rf /var/lib/kpctl-agent
+if (. /etc/os-release && [ "$ID" = ubuntu ]); then
+  rm -fv /etc/kpctl/mirrors.list /usr/local/sbin/kpctl-prepare-kernel /etc/apt/apt.conf.d/99kpctl-no-reboot /etc/needrestart/conf.d/99kpctl.conf
+  rm -rf /var/cache/kpctl-apt-mirror
+fi
 systemctl daemon-reload 2>/dev/null || true
 # kpctl install 이 컨트롤러 이름을 못 찾을 때 넣은 줄 ("IP 이름 # kpctl"). cloud-init 템플릿에 넣은 줄도 지웁니다
 for f in /etc/hosts /etc/cloud/templates/hosts.*.tmpl; do
@@ -54,6 +55,8 @@ for f in /etc/hosts /etc/cloud/templates/hosts.*.tmpl; do
 done
 
 echo "완료."
+if (. /etc/os-release && [ "$ID" = ubuntu ]); then
 echo "그대로 둔 것: kpatch 패키지, /etc/kpctl/reboot-hook.sh, 커널 고정:"
 apt-mark showhold 2>/dev/null | sed 's/^/  hold: /' || true
 echo "커널 고정을 풀려면: apt-mark unhold <패키지>"
+fi

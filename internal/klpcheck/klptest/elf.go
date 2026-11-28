@@ -9,6 +9,7 @@ import (
 )
 
 type Options struct {
+	Modinfo       string
 	Object        string // relocation object; default rxrpc
 	ListedObject  string // declared patch object; default rxrpc
 	Kpatch        bool
@@ -41,6 +42,9 @@ func Module(opts Options) []byte {
 	add := func(name string, typ elf.SectionType, flags elf.SectionFlag, data []byte) uint16 {
 		sections = append(sections, section{name, elf.Section64{Type: uint32(typ), Flags: uint64(flags), Addralign: 8}, data})
 		return uint16(len(sections) - 1)
+	}
+	if opts.Modinfo != "" {
+		add(".modinfo", elf.SHT_PROGBITS, elf.SHF_ALLOC, []byte(opts.Modinfo))
 	}
 	strtab := add(".strtab", elf.SHT_STRTAB, 0, []byte("\x00.klp.sym.rxrpc.original,0\x00"))
 	symtab := add(".symtab", elf.SHT_SYMTAB, 0, nil)

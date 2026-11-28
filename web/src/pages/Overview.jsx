@@ -3,7 +3,7 @@ import Builders from "../Builders.jsx";
 import CollectionProblem from "../CollectionProblem.jsx";
 import { ReviewDialog, PromoteDialog, RollbackDialog } from "../dialogs.jsx";
 import { useApp } from "../store.jsx";
-import { ago, cmpVer, hostState, isHWE, ver, trackTarget } from "../selectors.js";
+import { ago, cmpVer, hostState, hostTrack, isHWE, ver, trackTarget } from "../selectors.js";
 import {
   Badge,
   Button,
@@ -77,7 +77,7 @@ function AutoBanner({ navigate }) {
 function KernelCards() {
   const { status } = useApp();
   const used = new Set(
-    status.hosts.filter((h) => !isHWE(h)).map((h) => h.status.kernel),
+    status.hosts.filter((h) => !isHWE(h)).map(hostTrack),
   );
   const sorted = [...status.tracks].sort((a, b) => cmpVer(b.kernel, a.kernel));
   const current = sorted.filter((t) => used.has(t.kernel));
@@ -106,7 +106,7 @@ function KernelCard({ track }) {
   const { status } = useApp();
   const { open } = useDialog();
   const hosts = status.hosts.filter(
-    (h) => h.status.kernel === track.kernel && !isHWE(h),
+    (h) => hostTrack(h) === track.kernel && !isHWE(h),
   );
   const notes = status.auto?.notes?.[track.kernel] || [];
   const adminExcluded = status.upstream?.[track.kernel]?.problem_resolution === "admin_exclusion";
