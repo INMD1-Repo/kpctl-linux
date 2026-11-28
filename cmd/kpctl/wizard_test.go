@@ -239,6 +239,14 @@ func TestBuilderWizardDistributionKernels(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(w.kernels, []string{"6.12.0-264.21.1.el10_3.x86_64"}) {
 		t.Fatalf("커널 칸: %v %v\n%s", w, err, out)
 	}
+	// Rocky 커널만 고르면 메모리·이미지·ccache 질문 없이 업그레이드 질문으로 (y, 멈춤 예, 설정 새로)
+	p, out = scripted("build-rocky10", "", "", "6.12.0-264.21.1.el10_3.x86_64", "y", "", "y")
+	if w, err := askBuilderPlan(p); err != nil || len(w.setup) != 0 || shellJoin(w.args(false)) != "-stop-running -reset-config build-rocky10 6.12.0-264.21.1.el10_3.x86_64" {
+		t.Fatalf("네이티브 질문: %+v %v\n%s", w, err, out)
+	}
+	if strings.Contains(out.String(), "빌드 메모리 한도") || !strings.Contains(out.String(), "Ubuntu 빌더 전용이라 건너뜁니다") {
+		t.Errorf("Ubuntu 전용 질문을 건너뛰지 않았습니다:\n%s", out)
+	}
 	p, out = scripted("build-trixie", "", "", "6.12.118+deb13-amd64", "", "", "", "", "")
 	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "IBT") {
 		t.Fatalf("Debian 13: %v\n%s", err, out)
