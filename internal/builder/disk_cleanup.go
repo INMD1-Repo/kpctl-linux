@@ -295,7 +295,11 @@ func (b *Builder) kernelDataInventory() ([]string, error) {
 	if headers == "" {
 		headers = "/usr/src"
 	}
-	for _, p := range []struct{ dir, prefix string }{{b.cfg.DebugDir, "vmlinux-"}, {filepath.Join(b.cfg.WorkDir, "src"), ""}, {headers, "linux-headers-"}, {"/lib/modules", ""}} {
+	modules := b.modulesRoot
+	if modules == "" {
+		modules = "/lib/modules"
+	}
+	for _, p := range []struct{ dir, prefix string }{{b.cfg.DebugDir, "vmlinux-"}, {filepath.Join(b.cfg.WorkDir, "src"), ""}, {headers, "linux-headers-"}, {modules, ""}} {
 		if p.dir == "" {
 			continue
 		}

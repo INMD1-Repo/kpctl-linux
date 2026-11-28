@@ -38,7 +38,8 @@ func (b *Builder) buildEnvironment(ctx context.Context, k KernelConfig, src stri
 		vars = append(vars, "RUSTC="+rustc, "HOSTRUSTC="+rustc, "BINDGEN="+bindgen)
 	}
 	flags := strings.TrimSpace(os.Getenv("MAKEFLAGS") + " " + strings.Join(vars, " "))
-	env := append(os.Environ(), "MAKEFLAGS="+flags, "PATH=/usr/lib/ccache:"+os.Getenv("PATH"))
+	// 빌드 로그의 git apply·patch 오류 문구("patch does not apply" 등)로 실패를 분류하므로 로캘을 고정합니다.
+	env := append(os.Environ(), "MAKEFLAGS="+flags, "PATH=/usr/lib/ccache:"+os.Getenv("PATH"), "LC_ALL=C", "LANGUAGE=C")
 	if rust && src != "" {
 		cmd := exec.CommandContext(ctx, "make", "-s", "-C", src, "rustavailable")
 		cmd.Env = env

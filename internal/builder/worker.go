@@ -42,6 +42,7 @@ type Builder struct {
 	progress          *liveProgress
 	output            io.Writer // offline worker output; never contains controller credentials
 	headersRoot       string    // empty uses /usr/src
+	modulesRoot       string    // empty uses /lib/modules
 	activeKernels     []string
 	profileFailed     map[string]debugFailure
 	archiveJobRetryAt map[int]time.Time // only the work loop reads or writes this map

@@ -98,6 +98,7 @@ func newDiskFixture(t *testing.T, kernels ...string) *diskFixture {
 		}
 	}
 	f.b.headersRoot = filepath.Join(root, "headers")
+	f.b.modulesRoot = filepath.Join(root, "modules") // 개발 호스트의 실제 커널 목록과 격리
 	old := diskFreeBytes
 	t.Cleanup(func() { diskFreeBytes = old })
 	diskFreeBytes = func(string) (uint64, error) { return f.free, nil }
@@ -406,6 +407,7 @@ func TestDiskPreventiveCleanupDoesNotBlockBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted.headersRoot = f.b.headersRoot
+	restarted.modulesRoot = f.b.modulesRoot
 	restarted.activeKernels = f.b.activeKernels
 	restarted.BuildNext()
 	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
