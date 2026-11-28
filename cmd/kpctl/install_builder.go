@@ -21,16 +21,20 @@ import (
 	"kpctl/internal/remote"
 )
 
-const installBuilderUsage = `사용법: kpctl install-builder [옵션] <호스트...> [대상 커널...] [-- setup-builder.sh 옵션]
+const installBuilderUsage = `사용법: kpctl install-builder [옵션] <호스트...> [대상 커널...] [-- 설치 스크립트 옵션]
         kpctl install-builder                         (터미널에서 인자 없이: 질문형 설치)
 
-  SSH 로 빌드 서버를 한 번에 설치합니다: 점검 → 묶음 복사 → builder.json 작성(컨트롤러 주소·빌더 토큰·CA)
-  → setup-builder.sh 실행 → 컨트롤러에 빌더가 보고하는지 확인. 옵션은 호스트 이름보다 앞에 써야 합니다.
+  SSH 로 호스트를 점검하고 묶음과 설정을 복사한 뒤 설치와 컨트롤러 보고를 확인합니다. 옵션은 호스트 이름보다 앞에 써야 합니다.
 
-  대상 커널(예: 6.8.0-136-generic)을 생략하면, 컨트롤러에 등록된 호스트 중 빌드 서버와 같은
+  Ubuntu 빌더에서 대상 커널(예: 6.8.0-136-generic)을 생략하면, 컨트롤러에 등록된 호스트 중 빌드 서버와 같은
   Ubuntu 시리즈의 GA 커널을 자동으로 고릅니다. 커널 인자는 호스트별로 같은 시리즈인 것만 넘깁니다.
   "--" 뒤의 값은 setup-builder.sh 에 그대로 넘깁니다 (--memory-mib, --jobs, --cache-gib, --no-cache,
   --host-mode, --no-start 등; sudo ./setup-builder.sh --help 참고).
+
+  Debian 12·Rocky 9·10 AMD64 는 대상과 같은 릴리스의 전용 VM 에 설치합니다.
+  커널을 생략하면 같은 릴리스의 식별된 등록 호스트 커널을 준비합니다. 등록된 track 은 빌드 ID 까지 대조합니다.
+  setup-native-builder.sh 에는 -- 뒤에 --jobs N, --no-start 를 줄 수 있습니다.
+  기존 /etc/kpctl/native-builder/worker.json 과 토큰은 -reset-config 를 줄 때 갱신합니다.
 
   빌드 서비스 실행 계정은 -build-user 로 고릅니다 (기본 kpbuild, 재설치 때는 기존 계정 유지).
   SSH 로 접속할 계정은 -ssh-user (또는 user@호스트) 입니다.
@@ -41,6 +45,7 @@ const installBuilderUsage = `사용법: kpctl install-builder [옵션] <호스�
   예) kpctl install-builder -check build-noble                       점검만
       kpctl install-builder build-noble                               등록 호스트 기준 커널 자동 선택
       kpctl install-builder build-jammy 5.15.0-160-generic -- --memory-mib 16384
+      kpctl install-builder build-rocky10 6.12.0-264.21.1.el10_3.x86_64 -- --jobs 4
       kpctl install-builder -stop-running build-noble                 실행 중인 빌더 업그레이드
       kpctl install-builder -ssh-user ubuntu -build-user builder build-noble   접속·실행 계정 지정
 
@@ -138,13 +143,20 @@ func nativeWorkerConfig(ctrlURL, caFile, builder string) ([]byte, error) {
 }
 
 // nativeProofHint 는 설치 후 운영자가 할 일입니다. 승인 핀은 빌더와 독립된 환경에서 만들어 넣어야 합니다.
-//
-// TODO(codex): targets 의 track 을 나열하고, docs/operations/distribution-kernels.md 의 "후보 검토와 작업 실행" 절차대로
-// (1) 독립 신뢰 환경에서 같은 계획(빌더의 /var/lib/kpctl-native/tracks/<track>/base.json)으로 prepare 를 다시 실행해
-// track 과 대상 kpctl-agent -identify 출력을 대조하고 컨트롤러 data_dir/distribution-proofs/<track>.json 에 설치,
-// (2) 수정 후보는 빌더에서 collect 로 사람이 검토해 제출한다는 안내를 한국어 여러 줄로 돌려줍니다. 실행 가능한 경로를 씁니다.
 func nativeProofHint(targets []remote.NativeTarget) string {
-	return ""
+	var hint strings.Builder
+	for _, t := range targets {
+		if t.Track == "" {
+			fmt.Fprintf(&hint, "\n  %s: 빌더의 /var/lib/kpctl-native/tracks/ 아래 base-proof.json 에서 track 을 확인하세요.", t.ABI)
+		} else {
+			fmt.Fprintf(&hint, "\n  %s", t.Track)
+		}
+	}
+	hint.WriteString("\n  독립된 신뢰 환경에 같은 공식 Git 과 키를 준비하고, 빌더의 /var/lib/kpctl-native/tracks/<track>/base.json 과 같은 계획으로 다시 검증하세요.")
+	hint.WriteString("\n  mkdir -p cache work && python3 /opt/kpctl/native-builder/kpctl-native-builder.py prepare --plan base.json --cache cache --work-dir work --fetch > base-proof.json")
+	hint.WriteString("\n  영수증의 track 과 대상 kpctl-agent -identify 출력을 대조한 뒤 영수증을 컨트롤러 data_dir/distribution-proofs/<track>.json 에 설치하세요.")
+	hint.WriteString("\n  수정 후보는 사람이 변경 경로와 제목을 검토하고 빌더의 /opt/kpctl/native-builder/kpctl-native-builder.py collect 로 제출하세요 (docs/operations/distribution-kernels.md 의 ‘후보 검토와 작업 실행’).")
+	return hint.String()
 }
 
 // isKernelArg 는 위치 인자가 호스트가 아니라 커널 이름(uname -r)인지 봅니다. Debian/Rocky 모양도 커널로 봅니다.
@@ -154,6 +166,7 @@ func isKernelArg(a string) bool {
 
 // setup-builder.sh 옵션 중 kpctl install-builder 가 직접 정하는 것
 var managedSetupArgs = map[string]string{
+	"--target": "대상 커널 위치 인자", "--worker": "-reset-config", "--token-file": "-builder-token-file",
 	"--config": "-reset-config / 기존 builder.json", "--ca-file": "-ca", "--plan": "-check", "--user": "-build-user", "--help": "", "-h": "",
 }
 
@@ -394,7 +407,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			if !anyNative {
 				return nil, fmt.Errorf("대상 커널을 고르려고 컨트롤러 상태를 읽지 못했습니다 (커널을 직접 지정하세요): %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "경고: 컨트롤러 상태를 읽지 못해 등록 호스트 track 대조 없이 진행합니다: %v\n", err)
+			return nil, fmt.Errorf("등록 호스트의 track 을 대조하려고 컨트롤러 상태를 읽지 못했습니다: %w", err)
 		} else {
 			registered = registeredKernels(&st)
 			registeredNative = registeredNativeKernels(&st)
@@ -485,7 +498,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 
 		// 3) 컨트롤러에 빌더가 보고하는지 확인
 		progress(target, "컨트롤러에 빌더 보고 확인")
-		b, err := waitBuilder(c, res.hostname, 2*time.Minute)
+		b, err := waitBuilder(c, res.hostname, "kpctl-builder", 2*time.Minute)
 		if err != nil {
 			res.result, res.note = "보고 미확인", err.Error()
 			return res
@@ -499,7 +512,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 
 // waitBuilder 는 빌드 서버가 컨트롤러에 최근 작업 확인(보고)을 했는지 기다립니다.
 // 빌더 이름은 builder.json 의 name, 비우면 hostname 입니다.
-func waitBuilder(c *client.Client, name string, timeout time.Duration) (*model.BuilderInfo, error) {
+func waitBuilder(c *client.Client, name, service string, timeout time.Duration) (*model.BuilderInfo, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
@@ -509,7 +522,7 @@ func waitBuilder(c *client.Client, name string, timeout time.Duration) (*model.B
 		} else if b := st.Builders[name]; b != nil && st.Now.Sub(b.LastSeen) < 2*time.Minute {
 			return b, nil
 		} else {
-			lastErr = fmt.Errorf("컨트롤러에 빌더 %s 의 최근 보고가 없습니다 (빌드 서버에서 journalctl -u kpctl-builder 확인. builder.json 에 name 을 따로 줬다면 웹의 빌드 서버 목록 확인)", name)
+			lastErr = fmt.Errorf("컨트롤러에 빌더 %s 의 최근 보고가 없습니다 (빌드 서버에서 journalctl -u %s 확인. 빌더 이름을 따로 줬다면 웹의 빌드 서버 목록 확인)", name, service)
 		}
 		if time.Now().After(deadline) {
 			return nil, lastErr
@@ -604,20 +617,22 @@ func installNativeOnHost(c *client.Client, s *remote.Session, n nativeRun, res h
 		res.result, res.note = "설치 실패", err.Error()
 		return res
 	}
-	hint := nativeProofHint(targets)
+	hint := "컨트롤러 승인 핀과 수정 후보 준비" + nativeProofHint(targets)
+	progress(n.target, hint)
+	fmt.Fprintln(&s.Log, hint)
 	if n.noStart {
 		res.ok, res.result = true, "설치 완료"
-		res.note = "서비스 시작 안 함 (--no-start): systemctl enable --now kpctl-native-builder.timer" + hint
+		res.note = "서비스 시작 안 함 (--no-start): systemctl enable --now kpctl-native-builder.timer"
 		return res
 	}
 	progress(n.target, "컨트롤러에 빌더 보고 확인")
-	b, err := waitBuilder(c, res.hostname, 3*time.Minute)
+	b, err := waitBuilder(c, res.hostname, "kpctl-native-builder", 3*time.Minute)
 	if err != nil {
 		res.result, res.note = "보고 미확인", err.Error()
 		return res
 	}
 	res.ok, res.result = true, "설치 완료"
-	res.note = fmt.Sprintf("%s, %s 네이티브 빌더, 커널 %s", b.Name, s.Facts.OSLabel(), strings.Join(labels, " ")) + hint
+	res.note = fmt.Sprintf("%s, %s 네이티브 빌더, 커널 %s", b.Name, s.Facts.OSLabel(), strings.Join(labels, " "))
 	return res
 }
 

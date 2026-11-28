@@ -12,9 +12,13 @@
 package remote
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"kpctl/internal/model"
 )
@@ -123,16 +127,92 @@ type NativeBuilderInstallOptions struct {
 
 // InstallNativeBuilder 는 묶음을 복사하고 setup-native-builder.sh 를 실행합니다. Preflight(ForBuilder) 를 먼저 불러야 합니다.
 // 설치 스크립트의 "■" 단계 줄은 OnStep 으로 바로 보여 줍니다 (서명 패키지 내려받기·prepare 로 오래 걸리므로).
-//
-// TODO(codex): InstallBuilder(builder.go) 와 같은 방식으로 구현합니다.
-//  1. mktemp -d /tmp/kpctl-native-builder.XXXXXX (이름 검증), defer 로 성공·실패 모두 sudo rm -rf. 삭제 실패는 errors.Join.
-//  2. 묶음 전체 CopyTree, CA 는 하위 ca/ 디렉터리로 Copy.
-//  3. Worker 가 있으면 worker.json 과 token 을 각각 "umask 077; cat > FILE" 표준 입력으로 씀. Token 이 비면 오류.
-//     Worker 가 있는데 Token 이 16자 미만이면 오류. 로그(s.Log)에 토큰이 남지 않아야 함 (run 은 stdin 을 기록하지 않음).
-//  4. HostsEntry 가 있으면 hostsEntryScript 실행 (InstallBuilder 와 같음).
-//  5. StopRunning && Facts.NativeBuilderActive == "yes" 이면 systemctl stop kpctl-native-builder.timer kpctl-native-builder.service.
-//  6. sudo bash setup-native-builder.sh [--worker F --token-file F] [--ca-file F] [SetupArgs...] --target <t.Arg()>...
-//     RunStream 으로 "■", "!!", "경고" 줄을 OnStep 에 넘김. 실패 시 lastLines(out, 15) 포함.
-func (s *Session) InstallNativeBuilder(b *Bundle, o NativeBuilderInstallOptions) error {
-	return fmt.Errorf("InstallNativeBuilder: 아직 구현되지 않았습니다")
+func (s *Session) InstallNativeBuilder(b *Bundle, o NativeBuilderInstallOptions) (err error) {
+	if len(o.Worker) > 0 && utf8.RuneCountInString(strings.TrimSpace(o.Token)) < 16 {
+		return fmt.Errorf("빌더 설정을 보내려면 16자 이상의 토큰이 필요합니다")
+	}
+	s.step("임시 디렉터리 만들기")
+	out, err := s.run("mktemp -d /tmp/kpctl-native-builder.XXXXXX", "")
+	if err != nil {
+		return err
+	}
+	dir := strings.TrimSpace(out)
+	if !nativeTempDir.MatchString(dir) {
+		return fmt.Errorf("임시 디렉터리 이름이 이상합니다: %q", dir)
+	}
+	defer func() {
+		if _, cleanup := s.run(s.sudo()+"rm -rf -- "+shq(dir), ""); cleanup != nil {
+			err = errors.Join(err, fmt.Errorf("임시 디렉터리 %s 삭제 실패 (토큰 파일이 남아 있을 수 있음): %w", dir, cleanup))
+		}
+	}()
+
+	s.step("네이티브 빌더 묶음 복사")
+	entries, err := os.ReadDir(b.Dir)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for _, entry := range entries {
+		paths = append(paths, b.Path(entry.Name()))
+	}
+	if err := s.SSH.CopyTree(s.Target, paths, dir); err != nil {
+		return err
+	}
+	cmd := s.sudo() + "bash " + shq(dir+"/setup-native-builder.sh")
+	if len(o.Worker) > 0 {
+		s.step("빌더 설정과 토큰 전달")
+		private := dir + "/credentials"
+		if _, err := s.run("mkdir -m 0700 "+shq(private), ""); err != nil {
+			return err
+		}
+		worker, token := shq(private+"/worker.json"), shq(private+"/token")
+		if _, err := s.run("umask 077; cat > "+worker, string(o.Worker)); err != nil {
+			return err
+		}
+		if _, err := s.run("umask 077; cat > "+token, o.Token); err != nil {
+			return err
+		}
+		cmd += " --worker " + worker + " --token-file " + token
+	}
+	if o.CAFile != "" {
+		if _, err := s.run("mkdir -m 0700 "+shq(dir+"/ca"), ""); err != nil {
+			return err
+		}
+		if err := s.SSH.Copy(s.Target, []string{o.CAFile}, dir+"/ca"); err != nil {
+			return err
+		}
+		cmd += " --ca-file " + shq(dir+"/ca/"+baseName(o.CAFile))
+	}
+	if entry := s.Facts.HostsEntry(o.ControllerURL); entry != "" {
+		s.step("컨트롤러 이름 등록 (/etc/hosts: " + entry + ")")
+		if _, err := s.run(s.sudo()+"bash -s -- "+shq(entry), hostsEntryScript); err != nil {
+			return err
+		}
+	}
+	if o.StopRunning && s.Facts.NativeBuilderActive == "yes" {
+		s.step("실행 중인 네이티브 빌더 중지")
+		if _, err := s.run(s.sudo()+"systemctl stop kpctl-native-builder.timer kpctl-native-builder.service", ""); err != nil {
+			return err
+		}
+	}
+	for _, arg := range o.SetupArgs {
+		cmd += " " + shq(arg)
+	}
+	for _, target := range o.Targets {
+		cmd += " --target " + shq(target.Arg())
+	}
+	s.step("setup-native-builder.sh 실행")
+	fmt.Fprintf(&s.Log, "$ %s\n", cmd)
+	out, err = s.SSH.RunStream(s.Target, cmd, "", func(line string) {
+		if s.OnStep != nil && (strings.HasPrefix(line, "■") || strings.HasPrefix(line, "!!") || strings.HasPrefix(line, "경고")) {
+			s.OnStep(s.Target, "  "+line)
+		}
+	})
+	s.Log.WriteString(out)
+	if err != nil {
+		return fmt.Errorf("%w\n%s", err, lastLines(out, 15))
+	}
+	return nil
 }
+
+var nativeTempDir = regexp.MustCompile(`^/tmp/kpctl-native-builder\.[a-zA-Z0-9]{6}$`)

@@ -16,7 +16,7 @@ vet:
 	gofmt -l . | (! grep .) && go vet ./...
 
 lint-scripts:
-	shellcheck -x deploy/testvm/qemu/*.sh
+	shellcheck -x deploy/testvm/qemu/*.sh deploy/setup-native-builder.sh deploy/kpctl-native-work.sh
 
 test: vet docs-check
 	go test $(GO_TEST_FLAGS) ./...

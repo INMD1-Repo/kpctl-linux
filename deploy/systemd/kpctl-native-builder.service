@@ -9,12 +9,24 @@ Type=oneshot
 # setup-native-builder.sh 가 --user 값으로 바꿉니다
 User=kpbuild
 Group=kpbuild
-ExecStart=/opt/kpctl/native-builder/kpctl-native-work.sh
+ExecStart=/bin/bash /opt/kpctl/native-builder/kpctl-native-work.sh
 TimeoutStartSec=6h
 Nice=10
-# TODO(codex): 샌드박스. 빌드 계정이 쓸 수 있는 곳은 /var/lib/kpctl-native 뿐이어야 합니다.
-#   NoNewPrivileges=yes, PrivateTmp=yes, ProtectSystem=strict, ReadWritePaths=/var/lib/kpctl-native, ProtectHome=yes,
-#   ProtectKernelTunables/Modules/Logs=yes, ProtectControlGroups=yes, RestrictSUIDSGID=yes, LockPersonality=yes,
-#   RestrictNamespaces=yes, CapabilityBoundingSet=, RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX, UMask=0077,
-#   MemoryMax 등. kpatch-build 가 실제로 필요한 것(예: /tmp 대신 작업 디렉터리, ~/.kpatch 위치)을 확인해 HOME 을
-#   /var/lib/kpctl-native 아래로 두고, systemd-analyze verify 와 systemd-analyze security 로 확인하세요.
+Environment=HOME=/var/lib/kpctl-native TMPDIR=/var/lib/kpctl-native/work
+WorkingDirectory=/var/lib/kpctl-native
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kpctl-native
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+MemoryMax=90%
