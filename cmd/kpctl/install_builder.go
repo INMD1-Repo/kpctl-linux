@@ -50,6 +50,26 @@ var buildUserName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 var kernelArg = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[A-Za-z0-9_-]+$`)
 
+// nativeBuilderHint 는 Debian/Rocky 커널·빌드 서버를 받았을 때의 안내입니다 (setup-builder.sh 도 Ubuntu 가 아니면 거부).
+const nativeBuilderHint = "install-builder 는 Ubuntu 빌드 서버 전용입니다. Debian/Rocky 커널은 대상과 같은 배포판의 별도 격리 빌더에서 " +
+	"kpctl-native-builder.py 로 빌드합니다 (docs/operations/distribution-kernels.md 의 \"빌더 준비와 입력 고정\")"
+
+// nativeKernelProblem 은 Ubuntu 빌더 대상이 아닌 배포판 커널이면 이유를 돌려줍니다. Ubuntu 모양이면 "".
+func nativeKernelProblem(k string) string {
+	if !model.IsDistributionKernelName(k) {
+		return ""
+	}
+	if d, r := model.DistributionForABI(k); d != "" {
+		return fmt.Sprintf("%s 는 %s %s 배포판 커널입니다", k, model.DistroLabel(d), r)
+	}
+	return fmt.Sprintf("%s 는 Ubuntu 가 아닌 배포판 커널입니다 (Debian 12·13, Rocky 9·10 AMD64 지원 프로필에도 없음)", k)
+}
+
+// isKernelArg 는 위치 인자가 호스트가 아니라 커널 이름(uname -r)인지 봅니다. Debian/Rocky 모양도 커널로 봅니다.
+func isKernelArg(a string) bool {
+	return kernelArg.MatchString(a) || model.IsDistributionKernelName(a)
+}
+
 // setup-builder.sh 옵션 중 kpctl install-builder 가 직접 정하는 것
 var managedSetupArgs = map[string]string{
 	"--config": "-reset-config / 기존 builder.json", "--ca-file": "-ca", "--plan": "-check", "--user": "-build-user", "--help": "", "-h": "",
@@ -70,13 +90,17 @@ func defaultBuilderBundleDir() string {
 }
 
 // splitBuilderArgs 는 위치 인자를 호스트, 대상 커널, "--" 뒤 setup-builder.sh 옵션으로 나눕니다.
+// Debian/Rocky 커널은 호스트로 오인해 SSH 로 접속하지 않고, 접속 전에 네이티브 빌더 안내와 함께 거부합니다.
 func splitBuilderArgs(args []string) (hosts, kernels, setup []string, err error) {
+	var native []string
 	for i, a := range args {
 		if a == "--" {
 			setup = append(setup, args[i+1:]...)
 			break
 		}
 		switch {
+		case nativeKernelProblem(a) != "":
+			native = append(native, nativeKernelProblem(a))
 		case kernelArg.MatchString(a):
 			kernels = append(kernels, a)
 		case strings.HasPrefix(a, "-"):
@@ -84,6 +108,9 @@ func splitBuilderArgs(args []string) (hosts, kernels, setup []string, err error)
 		default:
 			hosts = append(hosts, a)
 		}
+	}
+	if len(native) > 0 {
+		return nil, nil, nil, fmt.Errorf("%s.\n%s", strings.Join(unique(native), ".\n"), nativeBuilderHint)
 	}
 	for _, a := range setup {
 		if hint, ok := managedSetupArgs[a]; ok {
@@ -105,15 +132,38 @@ func hasArg(args []string, name string) bool {
 	return false
 }
 
-// kernelsForSeries 는 커널 목록에서 codename 시리즈의 것만 고릅니다. GA generic 이 아닌 커널(시리즈 판정 불가)은 그대로 둡니다.
+// kernelsForSeries 는 커널 목록에서 codename 시리즈의 것만 고릅니다. GA generic 이 아닌 Ubuntu 커널(시리즈 판정 불가)은
+// 그대로 두고, Debian/Rocky 커널은 Ubuntu 빌더 대상이 아니므로 뺍니다.
 func kernelsForSeries(kernels []string, codename string) []string {
 	var out []string
 	for _, k := range kernels {
+		if model.IsDistributionKernelName(k) {
+			continue
+		}
 		if lts := model.LTSForKernel(k); lts == nil || lts.Codename == codename {
 			out = append(out, k)
 		}
 	}
 	return out
+}
+
+// kernelShape 는 안내문에 쓸 그 시리즈 GA generic 커널 이름 모양입니다. 예: jammy → "5.15.0-번호-generic".
+func kernelShape(codename string) string {
+	if lts := model.LTSByCodename(codename); lts != nil {
+		return lts.Kernel + "-번호-generic"
+	}
+	return "X.Y.Z-번호-generic"
+}
+
+// exampleKernels 는 셸에 그대로 붙여 넣을 수 있는 시리즈별 커널 예입니다 (사용법의 예와 같은 값).
+var exampleKernels = map[string]string{"jammy": "5.15.0-160-generic", "noble": "6.8.0-136-generic"}
+
+// exampleKernel 은 안내문에 쓸 그 시리즈의 커널 이름 예입니다. 예가 없는 시리즈면 noble 예.
+func exampleKernel(codename string) string {
+	if k, ok := exampleKernels[codename]; ok {
+		return k
+	}
+	return exampleKernels["noble"]
 }
 
 // registeredKernels 는 컨트롤러에 등록된 호스트들이 실행 중인 커널 목록입니다 (정렬, 중복 제거).
@@ -285,11 +335,12 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		if len(kernels) == 0 {
 			hostKernels = kernelsForSeries(registered, s.Facts.Codename)
 		}
-		if !hostMode && len(hostKernels) == 0 {
+		// Ubuntu 가 아닌 빌드 서버는 Preflight 가 이미 문제로 보고하므로 (빈 시리즈로) 커널 문제를 덧붙이지 않습니다.
+		if !hostMode && len(hostKernels) == 0 && s.Facts.Distro == "ubuntu" {
 			if len(kernels) > 0 {
 				problems = append(problems, fmt.Sprintf("지정한 커널 중 %s 시리즈 커널이 없습니다", s.Facts.Codename))
 			} else {
-				problems = append(problems, fmt.Sprintf("컨트롤러에 %s 커널을 쓰는 등록 호스트가 없어 대상 커널을 고르지 못했습니다. 커널을 직접 지정하세요 (예: kpctl install-builder %s 6.8.0-136-generic)", s.Facts.Codename, target))
+				problems = append(problems, fmt.Sprintf("컨트롤러에 %s 커널을 쓰는 등록 호스트가 없어 대상 커널을 고르지 못했습니다. 대상 호스트의 uname -r 값(%s 모양)을 직접 지정하세요 (예: kpctl install-builder %s %s)", s.Facts.Codename, kernelShape(s.Facts.Codename), target, exampleKernel(s.Facts.Codename)))
 			}
 		}
 		keepConfig := s.Facts.BuilderConfig == "yes" && !*resetConfig
@@ -299,7 +350,9 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		for _, w := range warnings {
 			progress(target, "경고: "+w)
 		}
-		if len(problems) > 0 && (*checkOnly || !*force) {
+		// Ubuntu 가 아닌 빌드 서버는 -force 로도 진행하지 않습니다. setup-builder.sh 가 어차피 거부하며,
+		// 그 전에 빌더 토큰이 담긴 builder.json 을 보내거나 (-stop-running 이면) 기존 서비스를 멈추게 됩니다.
+		if len(problems) > 0 && (*checkOnly || !*force || s.Facts.Distro != "ubuntu") {
 			res.result, res.note = "점검 실패", strings.Join(problems, "\n")
 			return res
 		}

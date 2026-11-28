@@ -226,3 +226,21 @@ func TestRunWizardWithoutCheckedHosts(t *testing.T) {
 		}
 	}
 }
+
+// 질문형 설치: Rocky 커널은 호스트 칸·커널 칸 어디에 넣어도 CLI 와 같이 네이티브 빌더 안내 후 중단합니다.
+func TestBuilderWizardRejectsDistributionKernels(t *testing.T) {
+	p, _ := scripted("10.0.0.175 6.12.0-264.21.1.el10_3.x86_64")
+	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "호스트 주소가 아닙니다") ||
+		!strings.Contains(err.Error(), "Rocky 10 배포판 커널") || !strings.Contains(err.Error(), "kpctl-native-builder.py") {
+		t.Fatalf("호스트 칸: %v", err)
+	}
+	p, out := scripted("build-noble", "", "", "6.12.0-264.21.1.el10_3.x86_64", "", "", "", "", "")
+	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "Rocky 10 배포판 커널입니다") || !strings.Contains(err.Error(), "kpctl-native-builder.py") {
+		t.Fatalf("커널 칸: %v\n%s", err, out)
+	}
+	// 호스트 이름이 -amd64 로 끝나도 커널로 오인하지 않음
+	p, _ = scripted("10.0.0-build-amd64", "", "", "", "", "", "", "")
+	if w, err := askBuilderPlan(p); err != nil || !reflect.DeepEqual(w.hosts, []string{"10.0.0-build-amd64"}) {
+		t.Fatalf("호스트 이름: %v %v", w, err)
+	}
+}

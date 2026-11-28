@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"kpctl/internal/model"
 )
 
 // Session 은 호스트 한 대에 대한 작업입니다. 실행한 명령과 출력이 Log 에 쌓입니다.
@@ -62,6 +64,19 @@ type Facts struct {
 	NameResolves string // yes | no | ip(URL 이 IP 라 확인 불필요)
 	ControllerIP string
 	ViaIP        string
+}
+
+// OSLabel 은 안내문용 OS 표시입니다. 예: "Ubuntu 24.04 (noble)", "Rocky 10.1", "Debian 12 (bookworm)".
+// Rocky 처럼 VERSION_CODENAME 이 없는 배포판도 빈 따옴표 대신 릴리스로 보입니다.
+func (f Facts) OSLabel() string {
+	label := model.DistroLabel(f.Distro)
+	if f.Release != "" {
+		label += " " + f.Release
+	}
+	if f.Codename != "" {
+		label += " (" + f.Codename + ")"
+	}
+	return label
 }
 
 // HostsEntry 는 설치할 때 호스트의 /etc/hosts 에 넣을 "IP 이름" 입니다. 필요 없으면 빈 문자열.
@@ -275,8 +290,17 @@ func (s *Session) Preflight(o PreflightOptions) (problems, warnings []string, er
 		for _, c := range o.Series {
 			supported = supported || c == f.Codename && f.Distro == "ubuntu"
 		}
-		if !supported {
-			problems = append(problems, fmt.Sprintf("지원하지 않는 Ubuntu 시리즈 %q (지원: %s). 빌더는 대상 LTS 와 같은 Ubuntu 에 설치합니다", f.Codename, strings.Join(o.Series, ", ")))
+		switch {
+		case supported:
+		case f.Distro == "debian" || f.Distro == "rocky":
+			// setup-builder.sh 도 Ubuntu 가 아니면 거부합니다. 접속 전에 이유와 대안을 알려 줍니다.
+			problems = append(problems, fmt.Sprintf("%s 호스트입니다. install-builder 는 Ubuntu(%s) 빌드 서버 전용입니다. "+
+				"Debian/Rocky 커널은 대상과 같은 배포판의 별도 격리 빌더에서 kpctl-native-builder.py 로 빌드합니다 (docs/operations/distribution-kernels.md)",
+				f.OSLabel(), strings.Join(o.Series, ", ")))
+		case f.Distro == "ubuntu":
+			problems = append(problems, fmt.Sprintf("지원하지 않는 Ubuntu 시리즈 %s (지원: %s). 빌더는 대상 LTS 와 같은 Ubuntu 에 설치합니다", f.OSLabel(), strings.Join(o.Series, ", ")))
+		default:
+			problems = append(problems, fmt.Sprintf("지원하지 않는 OS %s 입니다. 빌더는 대상 LTS 와 같은 Ubuntu(%s) 에 설치합니다", f.OSLabel(), strings.Join(o.Series, ", ")))
 		}
 		if f.BuilderActive == "yes" {
 			if o.StopBuilder {

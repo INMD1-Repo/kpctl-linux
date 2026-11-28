@@ -255,8 +255,11 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 		return nil, err
 	}
 	for _, h := range strings.Fields(v) {
-		if kernelArg.MatchString(h) || strings.HasPrefix(h, "-") {
-			return nil, fmt.Errorf("%q 는 호스트 주소가 아닙니다", h)
+		if why := nativeKernelProblem(h); why != "" {
+			return nil, fmt.Errorf("%q 는 호스트 주소가 아닙니다. %s.\n%s", h, why, nativeBuilderHint)
+		}
+		if isKernelArg(h) || strings.HasPrefix(h, "-") {
+			return nil, fmt.Errorf("%q 는 호스트 주소가 아닙니다 (커널 이름은 다음 질문에서 받습니다)", h)
 		}
 	}
 	w.hosts = strings.Fields(v)
@@ -295,6 +298,10 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 		}
 		bad := ""
 		for _, f := range strings.Fields(k) {
+			// Debian/Rocky 커널은 다시 묻지 않고 CLI 와 같이 안내 후 중단합니다 (엔터로 Ubuntu 자동 선택에 빠지지 않도록)
+			if why := nativeKernelProblem(f); why != "" {
+				return nil, fmt.Errorf("%s.\n%s", why, nativeBuilderHint)
+			}
 			if !kernelArg.MatchString(f) {
 				bad = f
 			}
