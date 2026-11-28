@@ -2,6 +2,7 @@
 package controller
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,12 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"kpctl/internal/buildlog"
+	"kpctl/internal/klpcheck"
 	"kpctl/internal/model"
 )
 
@@ -26,6 +29,11 @@ func (s *Server) handleBuilderNext(w http.ResponseWriter, r *http.Request) {
 	var req model.NextJobRequest
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, err)
+		return
+	}
+
+	if reason := model.KernelBuildBlock(req.NativeTrack); reason != "" {
+		writeErr(w, fail(http.StatusConflict, "%s", reason))
 		return
 	}
 
@@ -79,6 +87,11 @@ func (s *Server) handleBuilderNext(w http.ResponseWriter, r *http.Request) {
 			content, err := os.ReadFile(s.patchFile(pid))
 			if err != nil {
 				return fmt.Errorf("패치 파일 %s 읽기 실패: %w", pid, err)
+			}
+			if _, native := model.DistributionTrack(j.Kernel); native {
+				if _, err := verifiedCandidatePaths(st.patch(pid), content); err != nil {
+					return fail(409, "%v", err)
+				}
 			}
 			patch := model.NewTaskPatch(pid, content)
 			if err := patch.Validate(); err != nil {
@@ -184,12 +197,21 @@ func (s *Server) handleBuilderResult(w http.ResponseWriter, r *http.Request) {
 		}
 
 		j.FinishedAt = time.Now()
+		if reason := model.KernelBuildBlock(kernel); res.Success && reason != "" {
+			res.Success = false
+			res.Error = reason
+		}
+		if res.Success && strings.HasPrefix(kernel, "native__") && (!res.DistributionProof.Valid(kernel) || res.ModuleName != model.NativeModuleName(kernel, j.Version)) {
+			res.Success = false
+			res.Error = "공식 배포판 서명 패키지·Git revision·대상 모듈 일치 증거 필요"
+		}
 		if res.Success {
 			checksum, moduleErr := s.saveArtifact(kernel, res.ModuleName, res.ModuleBase64)
 			if moduleErr == nil {
 				j.Status = model.JobBuilt
 				j.ModuleName = res.ModuleName
 				j.UnsignedSHA256 = checksum
+				j.DistributionProof = res.DistributionProof
 				return nil
 			}
 			res.Success = false
@@ -249,6 +271,11 @@ func (s *Server) saveArtifact(kernel, module, b64 string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("서명 전 모듈 SHA256 확인 실패: %w", err)
 	}
+	if k, ok := model.DistributionTrack(kernel); ok {
+		if err := klpcheck.CheckTarget(tmp, k.ABI, module); err != nil {
+			return "", err
+		}
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		return "", fmt.Errorf("모듈 저장 실패: %w", err)
 	}
@@ -283,7 +310,7 @@ func (s *Server) handleKnownCommits(w http.ResponseWriter, r *http.Request) {
 				readErr = fmt.Errorf("선행 패치 %s 읽기 실패: %w", p.ID, err)
 				return
 			}
-			resp.ActivePatches = append(resp.ActivePatches, model.DiscoveredPatch{Commit: p.Commit, CVEs: p.CVEs, Title: p.Title, Content: string(content)})
+			resp.ActivePatches = append(resp.ActivePatches, model.DiscoveredPatch{CandidateID: p.CandidateID, ParentCandidate: p.ParentCandidate, FixedRelease: p.FixedRelease, Commit: p.Commit, CVEs: p.CVEs, Title: p.Title, Content: string(content)})
 		}
 		body = mustJSON(resp)
 	})
@@ -297,6 +324,10 @@ func (s *Server) handleKnownCommits(w http.ResponseWriter, r *http.Request) {
 // POST /api/builder/kernels/{kernel}/upstream — 빌드 서버가 확인한 Ubuntu 최신 태그와 수집 기준 태그
 func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	kernel := r.PathValue("kernel")
+	if _, native := model.DistributionTrack(kernel); native {
+		writeErr(w, fail(http.StatusBadRequest, "배포판 패키징 변경에는 공식 서명 패키지의 fixed_release 증거가 필요합니다"))
+		return
+	}
 	if !validKernel(kernel) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))
 		return
@@ -406,6 +437,10 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))
 		return
 	}
+	if reason := model.KernelBuildBlock(kernel); reason != "" {
+		writeErr(w, fail(http.StatusConflict, "%s", reason))
+		return
+	}
 	var req model.DiscoveredRequest
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, err)
@@ -414,7 +449,12 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 
 	var resp model.DiscoveredResponse
 	var ignoredReview int
-	err := s.store.Update(func(st *State) error {
+	update := s.store.Update
+	_, native := model.DistributionTrack(kernel)
+	if native {
+		update = s.store.UpdateAtomic
+	}
+	err := update(func(st *State) error {
 		known := map[string]bool{}
 		commits := st.knownCommits(kernel)
 		if req.Prerelease {
@@ -425,9 +465,61 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 		}
 		now := time.Now()
 
+		latest := map[string]string{}
+		var activeIDs []string
+		if native {
+			if len(req.Patches) != 1 || len(req.Unpatchable) != 0 {
+				return fail(400, "submit one reviewed native candidate")
+			}
+			for _, p := range st.activePatches(kernel) {
+				activeIDs = append(activeIDs, p.CandidateID)
+				body, err := os.ReadFile(s.patchFile(p.ID))
+				if err != nil {
+					return err
+				}
+				paths, err := verifiedCandidatePaths(p, body)
+				if err != nil {
+					return fail(409, "%v", err)
+				}
+				for _, path := range paths {
+					latest[path] = p.CandidateID
+				}
+			}
+		}
 		for _, dp := range req.Patches {
-			if dp.Commit == "" || known[dp.Commit] || !looksLikePatch(dp.Content) {
+			if dp.Commit == "" || !looksLikePatch(dp.Content) {
+				if native {
+					return fail(400, "invalid native candidate")
+				}
 				continue
+			}
+			source := "ubuntu"
+			identity := dp.Commit
+			candidateID := ""
+			if k, ok := model.DistributionTrack(kernel); ok {
+				if req.Prerelease || !dp.FixedRelease.ValidFor(k, dp.Commit) {
+					return fail(http.StatusBadRequest, "공식 수정 릴리스의 버전·Git·서명 증거가 필요합니다")
+				}
+				source = k.Distro
+				candidateID = fmt.Sprintf("%s/%x", dp.Commit, sha256.Sum256([]byte(dp.Content)))
+				identity = candidateID
+			}
+			var paths []string
+			if known[identity] || known[dp.Commit] {
+				continue
+			}
+			if native {
+				if req.ExpectedActive == nil || !slices.Equal(req.ExpectedActive, activeIDs) {
+					return fail(409, "active candidates changed; repeat collect")
+				}
+				var err error
+				paths, err = candidatePaths([]byte(dp.Content))
+				if err != nil {
+					return fail(400, "%v", err)
+				}
+				if err = checkParent(latest, paths, dp.ParentCandidate); err != nil {
+					return fail(409, "%v", err)
+				}
 			}
 			id := "p" + leftPad(st.NextPatchID+1)
 			if err := os.WriteFile(s.patchFile(id), []byte(dp.Content), 0o640); err != nil {
@@ -435,12 +527,12 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 			}
 			st.NextPatchID++
 			st.Patches = append(st.Patches, &model.Patch{
-				ID: id, Kernel: kernel, Source: "ubuntu", Commit: dp.Commit,
+				ID: id, Paths: paths, ParentCandidate: dp.ParentCandidate, Kernel: kernel, Source: source, Commit: dp.Commit, CandidateID: candidateID, FixedRelease: dp.FixedRelease,
 				Prerelease: req.Prerelease,
 				CVEs:       normalizeCVEs(dp.CVEs), Title: dp.Title, State: model.PatchActive,
 				AddedBy: "builder", AddedAt: now,
 			})
-			known[dp.Commit] = true
+			known[identity] = true
 			resp.AddedPatches++
 		}
 
@@ -460,7 +552,7 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 			u.ProblemFailure, u.ProblemResolution = nil, ""
 			upstreamHold(st.track(kernel), u)
 		}
-		if !req.Prerelease && ignoredReview == 0 && req.LatestTag != "" && validTag(req.LatestTag) {
+		if !strings.HasPrefix(kernel, "native__") && !req.Prerelease && ignoredReview == 0 && req.LatestTag != "" && validTag(req.LatestTag) {
 			st.upstream(kernel).CollectedTag = req.LatestTag
 		}
 		if resp.AddedPatches > 0 {
@@ -477,10 +569,10 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ignoredReview > 0 {
-		s.audit("builder", "Ubuntu 수집 kernel=%s: 원인 검토가 필요한 시험 빌드 %d건은 '불가'로 기록하지 않음", kernel, ignoredReview)
+		s.audit("builder", "패키징 Git 수집 kernel=%s: 원인 검토가 필요한 시험 빌드 %d건은 '불가'로 기록하지 않음", kernel, ignoredReview)
 	}
 	if resp.AddedPatches > 0 {
-		s.audit("builder", "Ubuntu 수집 kernel=%s: 패치 %d건 추가, 라이브패치 불가 %d건, job %d",
+		s.audit("builder", "패키징 Git 수집 kernel=%s: 패치 %d건 추가, 라이브패치 불가 %d건, job %d",
 			kernel, resp.AddedPatches, 0, resp.JobID)
 	}
 	writeJSON(w, http.StatusOK, resp)

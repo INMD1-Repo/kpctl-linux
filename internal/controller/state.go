@@ -128,7 +128,11 @@ func (st *State) knownCommits(kernel string) []string {
 	var out []string
 	for _, p := range st.Patches {
 		if p.Kernel == kernel && !p.Prerelease && p.Commit != "" {
-			out = append(out, p.Commit)
+			if p.CandidateID != "" {
+				out = append(out, p.CandidateID)
+			} else {
+				out = append(out, p.Commit)
+			}
 		}
 	}
 	for _, u := range st.Unpatchable {
@@ -157,7 +161,7 @@ func (st *State) hostKernels() []model.HostKernel {
 	}
 	byKernel := map[key]*model.HostKernel{}
 	for _, h := range st.Hosts {
-		k := h.Status.Kernel
+		k := h.Status.TrackKey()
 		if k == "" {
 			continue
 		}

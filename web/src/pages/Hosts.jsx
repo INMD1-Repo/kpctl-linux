@@ -9,6 +9,7 @@ import {
   coveredTag,
   forcedVersion,
   hostState,
+  hostTrack,
   hostSecurity,
   hostTarget,
   isHWE,
@@ -57,6 +58,7 @@ function HostSecurity({ host }) {
 
 function BuildButton({ host, children, kind }) {
   const { open } = useDialog();
+  if (host.status.distribution) return <span className="muted small-note">해당 배포판 빌더에서 후보를 검토하고 collect를 실행하세요.</span>;
   return (
     <Button
       kind={kind}
@@ -66,7 +68,7 @@ function BuildButton({ host, children, kind }) {
             title="최신 수정 빌드"
             label="빌드 요청"
             onConfirm={(api) =>
-              api("POST", kernelPath(host.status.kernel) + "/refresh")
+              api("POST", kernelPath(hostTrack(host)) + "/refresh")
             }
           >
             {host.status.kernel} 호스트에 적용할 CVE 수정을 수집합니다. 자동
@@ -84,7 +86,7 @@ function BuildButton({ host, children, kind }) {
 }
 function PurgeAction({ host, upstream }) {
   const { open } = useDialog();
-  const path = kernelPath(host.status.kernel) + "/purge";
+  const path = kernelPath(hostTrack(host)) + "/purge";
   if (isSet(upstream.purge_requested_at))
     return (
       <>
@@ -121,13 +123,14 @@ function PurgeAction({ host, upstream }) {
 function KernelUpdate({ host }) {
   const { status } = useApp();
   const { open } = useDialog();
+  if (host.rollout_eligibility?.status === "blocked_unsupported") return <span className="warning small-note">{host.rollout_eligibility.reason}</span>;
   if (isHWE(host)) return <span className="muted">-</span>;
   const mine = pkgVersion(host),
-    upstream = status.upstream?.[host.status.kernel];
+    upstream = status.upstream?.[hostTrack(host)];
   const latest = tagVersion(upstream?.latest_tag),
     covered = tagVersion(coveredTag(status, host));
   const excluded = status.unpatchable.filter(
-    (u) => u.kernel === host.status.kernel,
+    (u) => u.kernel === hostTrack(host),
   ).length;
   const effective =
     covered && (!mine || cmpVer(covered, mine) > 0) ? covered : mine;
@@ -135,7 +138,7 @@ function KernelUpdate({ host }) {
   const release = latestFor(status, host),
     target = hostTarget(status, host),
     ring = ringTarget(status, host);
-  const job = openJob(status, host.status.kernel);
+  const job = openJob(status, hostTrack(host));
   let action;
   if (target < 0) action = <span className="warning small-note">출시 전 배포 중 — 변경은 링 배포·롤백에서 진행하세요.</span>;
   else if (job?.status === "built" && job.version > Math.max(release, target, host.status.version))
@@ -153,7 +156,7 @@ function KernelUpdate({ host }) {
             <Confirm
               title="최신 누적본으로 바로 업데이트"
               label={`v${release} 적용`}
-              onConfirm={(api) => api("POST", hostPath(host) + "/update-now", { kernel: host.status.kernel, version: release })}
+              onConfirm={(api) => api("POST", hostPath(host) + "/update-now", { kernel: hostTrack(host), version: release })}
             >
               <strong>{host.hostname}: v{host.status.version} → 최신 누적 v{release}</strong>
               <p>중간 버전을 설치하지 않고, 빌드·승인된 누적 모듈 하나로 바로 적용합니다.</p>
@@ -258,7 +261,7 @@ function KernelUpdate({ host }) {
           업데이트 필요
         </span>
       )}
-      <CollectionProblem kernel={host.status.kernel} upstream={upstream} />
+      <CollectionProblem kernel={hostTrack(host)} upstream={upstream} />
       {upstream?.outside && (
         <span className="muted small-note">빌드 서버: {upstream.outside}</span>
       )}
@@ -267,9 +270,9 @@ function KernelUpdate({ host }) {
           빌드 서버 자료 삭제 {ago(upstream.purged_at, status.now)}: {upstream.purge_result}
         </span>
       )}
-      {!latest && !upstream?.problem && !upstream?.outside && (
+      {!host.status.distribution && !latest && !upstream?.problem && !upstream?.outside && (
         <span className="error small-note">
-          {builderNote(status, host.status.kernel)}
+          {builderNote(status, hostTrack(host))}
         </span>
       )}
       {action}
@@ -300,6 +303,7 @@ function gaKernelFromTag(tag) {
 function KernelPrepare({ host }) {
   const { status } = useApp();
   const { open } = useDialog();
+  if (host.status.distribution || host.status.identity_error) return null;
   const kernel = host.status.kernel || "";
   const current = /^(?:5\.15\.0|6\.8\.0|7\.0\.0)-(\d+)-generic$/.exec(kernel);
   const latest = gaKernelFromTag(status.upstream?.[kernel]?.latest_tag);

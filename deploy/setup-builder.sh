@@ -129,6 +129,7 @@ print(json.dumps({'mode': 'host' if host else 'sandbox', 'host_packages': sys.ar
 PLANPY
   exit 0
 fi
+(. /etc/os-release && [ "$ID" = ubuntu ]) || { echo "Debian/Rocky 빌더는 kpctl-native-builder.py 및 distribution-kernels.md를 사용하세요" >&2; exit 2; }
 KPATCH_REF="${KPATCH_REF:-e0a8f7c681964e9128449446a34f7f3e631a8621}"
 GIT_ROOT="${GIT_ROOT:-/srv}"
 SUPPORTED_LTS="jammy noble resolute"  # internal/model/lts.go 의 SupportedLTS 와 같게 유지

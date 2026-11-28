@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { kernelPath } from "../api.js";
 import { useApp, useResource } from "../store.jsx";
-import { knownKernels, PATCH_STATE, localTime } from "../selectors.js";
+import { hostTrack, knownKernels, PATCH_STATE, localTime } from "../selectors.js";
 import {
   Badge,
   Button,
@@ -14,6 +14,8 @@ import {
   useDialog,
   VMTestEvidence,
 } from "../ui.jsx";
+
+const sourceNames = { ubuntu: "Ubuntu", debian: "Debian", rocky: "Rocky Linux" };
 
 function PatchVMTest({ patch, jobs }) {
   const tested = jobs.find((job) => job.vm_test && job.patch_ids?.includes(patch.id));
@@ -30,6 +32,8 @@ export default function Patches() {
     kernel ? kernelPath(kernel) + "/patches" : null,
     revision,
   );
+  const inventoryOnly = status.hosts.find(h => hostTrack(h) === kernel &&
+    h.status.distribution?.distro === "debian" && h.status.distribution.release === "13");
   const unpatchable = status.unpatchable.filter((p) => p.kernel === kernel);
   if (!kernels.length) return <Empty>아직 패치가 없습니다.</Empty>;
   return (
@@ -47,7 +51,7 @@ export default function Patches() {
             ))}
           </select>
           <div className="actions">
-            <Button
+            {inventoryOnly ? <span className="warning">{inventoryOnly.rollout_eligibility?.reason}</span> : <Button
               onClick={() =>
                 open(
                   <Confirm
@@ -67,7 +71,7 @@ export default function Patches() {
               }
             >
               활성 패치로 다시 빌드
-            </Button>
+            </Button>}
           </div>
         </div>
         <Resource resource={resource}>
@@ -92,11 +96,13 @@ export default function Patches() {
                       <Badge value={PATCH_STATE[p.state] || [p.state, ""]} />
                     </td>
                     <td>
-                      {p.source === "ubuntu" ? "Ubuntu " : "수동 "}
+                      {sourceNames[p.source] || "수동"} {p.fixed_release?.version}{" "}
                       {p.prerelease && <Badge value={["출시 전", "warn"]} />}
-                      <span className="mono muted">
-                        {p.commit?.slice(0, 12)}
-                      </span>
+                      <div className="mono muted" style={{ overflowWrap: "anywhere" }}>{p.candidate_id || p.commit?.slice(0, 12)}</div>
+                      {p.candidate_id && <small>
+                        {p.paths?.join(", ")} · 서명 키 {p.fixed_release?.signer}
+                        {p.parent_candidate && <div>선행 후보 {p.parent_candidate}</div>}
+                      </small>}
                     </td>
                     <td className="mono">{(p.cves || []).join(", ")}</td>
                     <td className="title">{p.title}</td>

@@ -1,11 +1,11 @@
 # kpctl-linux
 
-Ubuntu GA 커널의 선택한 CVE 수정을 누적 라이브패치 모듈로 만들어 관리자가 승인한 호스트에 적용합니다. 실행 커널을 교체해야 하는 작업은 디스크 커널 준비와 별도의 재부팅 승인 절차로 처리합니다.
+Ubuntu GA와 Debian 12·Rocky Linux 9/10의 공식 기본 AMD64 커널을 대상으로, 검토한 수정을 누적 라이브패치 모듈로 만들어 승인한 호스트에 적용합니다. Debian 13 기본 커널은 식별과 공식 소스 조사를 지원합니다. 실행 커널을 교체해야 하는 작업은 디스크 커널 준비와 별도의 재부팅 승인 절차로 처리합니다.
 
 | 구성 요소 | 역할 |
 |---|---|
 | `kpctl-controller` | 패치·버전·호스트 상태 저장, 서명, VM 시험, 링 배포와 승인 |
-| `kpctl-builder` | Ubuntu 소스 수집, 의존 패치 확인, 누적 모듈 빌드·ABI 검사 |
+| `kpctl-builder` · `kpctl-native-builder.py` | Ubuntu Git 또는 Debian·Rocky의 공식 Git·서명 패키지에서 후보 수집, 누적 모듈 빌드와 대상 검증 |
 | `kpctl-agent` | 호스트 상태 보고, 받은 파일의 해시 확인, 모듈 적용·부팅용 설치 |
 | `kpctl` | 운영자가 사용하는 관리자 CLI |
 
@@ -22,7 +22,7 @@ Go 서버는 표준 라이브러리와 JSON 상태 파일을 사용합니다. �
 
 ## 기본 커널 식별표
 
-현재 코드의 지원 표는 다음과 같습니다. HWE는 `version_signature`로 구별해 같은 이름의 GA 모듈을 배포하지 않습니다.
+Ubuntu GA 식별에는 다음 표를 사용합니다. HWE는 `version_signature`로 구별해 같은 이름의 GA 모듈을 배포하지 않습니다.
 
 | Ubuntu 시리즈 | GA generic 계열 |
 |---|---|
@@ -32,13 +32,15 @@ Go 서버는 표준 라이브러리와 JSON 상태 파일을 사용합니다. �
 
 식별 근거는 [지원 모델](internal/model/lts.go)입니다. 직접 커널을 지정하는 빌더 설정은 기본 지원 범위를 확대하는 보증이 아닙니다.
 
+Debian 12 및 Rocky Linux 9/10 AMD64 공식 기본 커널에는 배포판별 입력 검증과 별도 빌더를 사용합니다. Debian 13 stock AMD64는 식별·공식 소스 조사만 지원합니다. IBT를 유지하는 라이브패치 빌더가 없어 정식 보안 커널 업데이트와 계획된 재부팅이 필요합니다. 릴리스별 실제 컴파일 결과, 차단 사유, 설치 및 Secure Boot canary 절차는 [배포판 커널 운영 기록](docs/operations/distribution-kernels.md)에 있습니다.
+
 ## 설치와 운영
 
 [설치 순서](docs/install/README.md)는 컨트롤러, 해당 LTS의 빌더, 대상 에이전트 순입니다. 운영 전에 [Secure Boot와 키 교체](docs/operations/secure-boot.md), [기능별 명세](docs/features/README.md), [제약](docs/reference/limitations.md)을 확인하세요.
 
 추가 기능은 설정으로 선택합니다.
 
-- 여러 서명 키와 호스트별 인증서 등록 상태, 재부팅 없는 MOK 등록 예약.
+- Secure Boot 대상은 컨트롤러 서비스 계정으로 `kpctl signing init-key`를 실행해 공통 모듈 서명 키를 준비할 수 있습니다. 각 호스트에는 공개 인증서를 예약하고 계획된 재부팅 때 콘솔에서 승인합니다. [키 생성·컨트롤러 설정](docs/install/controller.md#module-signing-key) · [첫 패치 적용 확인](docs/operations/secure-boot.md#verify-signed-module)
 - 고정 VM 또는 일회용 VM에서 부팅·미서명 거부·교체·롤백·로그·smoke 검사.
 - 자동 배포와 분리한 출시 전 수집. 관리자의 명시 승인과 VM 시험이 필요합니다.
 - 커널 CNA 저장소의 upstream 수정 커밋 대조. 공식 OSV 재고와의 비교는 별도 기능입니다.

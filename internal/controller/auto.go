@@ -113,7 +113,7 @@ func (s *Server) planAuto(st *State) autoPlan {
 func (s *Server) hostFailure(st *State, kernel string, t *model.Track) autoHoldCause {
 	var ids []string
 	for id, h := range st.Hosts {
-		if h.Status.Kernel == kernel && !model.HWEWithGAName(h.Status) && h.Status.Error != "" && t.RingVersions[h.Ring] > 0 && s.rolloutEligibility(h, st.releasedJob(kernel, t.RingVersions[h.Ring])).Status == "eligible" {
+		if h.Status.TrackKey() == kernel && !model.HWEWithGAName(h.Status) && h.Status.Error != "" && t.RingVersions[h.Ring] > 0 && s.rolloutEligibility(h, st.releasedJob(kernel, t.RingVersions[h.Ring])).Status == "eligible" {
 			ids = append(ids, id)
 		}
 	}
@@ -161,7 +161,11 @@ func autoIneligible(st *State, j *model.Job) string {
 		return "새 패치가 없는 재빌드"
 	}
 	for _, id := range j.NewPatchIDs {
-		if p := st.patch(id); p == nil || p.Source != "ubuntu" {
+		p := st.patch(id)
+		if p != nil && (p.Source == "debian" || p.Source == "rocky") {
+			return "배포판 Git 릴리스 간 변경 범위와 서명 출처 확인 필요"
+		}
+		if p == nil || p.Source != "ubuntu" {
 			return "수동 제출 패치 포함 (" + id + ")"
 		}
 	}
@@ -414,7 +418,7 @@ func (s *Server) holdResolved(st *State, kernel string, t *model.Track) (bool, s
 		}
 	case holdHost:
 		h := st.Hosts[t.AutoHoldRef]
-		if h != nil && h.Status.Kernel == kernel && !model.HWEWithGAName(h.Status) && h.Status.Error == "" &&
+		if h != nil && h.Status.TrackKey() == kernel && !model.HWEWithGAName(h.Status) && h.Status.Error == "" &&
 			!t.AutoHoldAt.IsZero() && h.LastSeen.After(t.AutoHoldAt) &&
 			time.Since(h.LastSeen) < time.Duration(s.settings().HostStaleMinutes)*time.Minute && s.hostFailure(st, kernel, t).reason == "" {
 			return true, "호스트 오류 해결"

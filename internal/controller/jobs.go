@@ -3,6 +3,7 @@ package controller
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"kpctl/internal/model"
@@ -26,6 +27,9 @@ func (s *Server) createPrereleaseJob(st *State, kernel, requestedBy string, urge
 }
 
 func (s *Server) createJobChannel(st *State, kernel, requestedBy string, urgent, prerelease bool) (*model.Job, error) {
+	if reason := model.KernelBuildBlock(kernel); reason != "" {
+		return nil, fail(http.StatusConflict, "%s", reason)
+	}
 	active := st.activePatches(kernel)
 	if prerelease {
 		active = st.activePrereleasePatches(kernel)
@@ -148,6 +152,13 @@ func explicitBuilderKernel(req model.NextJobRequest, kernel string) bool {
 // kpatch-build 는 커널을 빌드한 gcc 와 같은 gcc 가 있어야 하므로, LTS 시리즈마다 그 시리즈의
 // Ubuntu 를 쓰는 빌드 서버가 따로 있습니다. 시리즈를 알리지 않은 빌드 서버는 예전처럼 다 받습니다.
 func builderCanBuild(req model.NextJobRequest, kernel string) bool {
+	if model.KernelBuildBlock(kernel) != "" {
+		return false
+	}
+	if strings.HasPrefix(kernel, "native__") || req.NativeTrack != "" {
+		_, ok := model.DistributionTrack(kernel)
+		return ok && req.NativeTrack == kernel
+	}
 	if req.Series == "" {
 		return true
 	}

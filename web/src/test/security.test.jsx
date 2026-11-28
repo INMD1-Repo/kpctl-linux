@@ -27,6 +27,21 @@ async function showPage(name) {
 }
 
 describe('보안·서명과 VM 증거 화면', () => {
+  it('트랙과 작업이 없는 Debian 13을 조사 전용으로 표시한다', async () => {
+    const status = statusFixture();
+    status.tracks = []; status.jobs = [];
+    const host = status.hosts[0];
+    host.status.distribution = { distro: 'debian', release: '13' };
+    host.status.kernel = '6.12.118+deb13-amd64';
+    host.status.version = 0;
+    host.rollout_eligibility = { status: 'blocked_unsupported', reason: 'IBT · trixie-security 업데이트 후 계획된 재부팅' };
+    mountSecurity({ status });
+    await showPage('호스트');
+    const row = (await screen.findByText(host.hostname)).closest('tr');
+    expect(row.textContent).toContain('배포 제외');
+    expect(row.textContent).toContain('trixie-security');
+  });
+
   it('키별 등록 상태·MOK 대기·제외 사유와 보안 경고를 호스트별로 표시한다', async () => {
     const status = statusFixture();
     const old = structuredClone(status.hosts[0]);

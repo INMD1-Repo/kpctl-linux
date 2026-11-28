@@ -42,6 +42,13 @@ fi
 # JSON 에 그대로 넣으므로 안전한 문자만 허용 (openssl rand -hex 로 만든 토큰이면 통과)
 [[ "$TOKEN" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "등록 토큰에 영문/숫자/._- 외의 문자가 있습니다"; exit 1; }
 
+. /etc/os-release
+if [[ "$ID" = debian && "$VERSION_ID" = 13 ]]; then echo "Debian 13 stock: 식별·공식 소스 조사 전용 (IBT, CONFIG_KLP_BUILD 없음). trixie-security 정식 linux-image-amd64 업데이트 후 계획된 재부팅이 필요합니다." >&2; fi
+case "$ID" in
+  ubuntu) ;;
+  debian|rocky) "$HERE/kpctl-agent" -identify ;;
+  *) echo "!! 지원하지 않는 배포판: $ID"; exit 1 ;;
+esac
 echo "■ 커널 확인"
 K=$(uname -r)
 [ -d /sys/kernel/livepatch ] || grep -qs '^CONFIG_LIVEPATCH=y' "/boot/config-$K" || { echo "!! $K 커널에 CONFIG_LIVEPATCH 가 없습니다"; exit 1; }
@@ -53,6 +60,7 @@ echo "  $K: CONFIG_LIVEPATCH=y"
 echo "  Secure Boot: $(mokutil --sb-state 2>/dev/null || echo '확인 불가')"
 
 echo "■ 1. kpatch 런타임"
+if [ "$ID" = ubuntu ]; then
 APT=(-y -q -o DPkg::Lock::Timeout=300)
 # 이전 apt 가 도중에 끊겨 dpkg 가 멈춰 있으면 어떤 설치도 실패하므로 먼저 복구
 if [ -n "$(dpkg --audit 2>/dev/null)" ]; then
@@ -130,12 +138,26 @@ if [ -d /etc/needrestart/conf.d ]; then
   printf '%s\n' '$nrconf{kernelhints} = 0;' '$nrconf{restart} = "l";' > /etc/needrestart/conf.d/99kpctl.conf
 fi
 
+else
+  # Native targets reconcile after each boot against the full running build ID.
+  # No uname-only kpatch boot copy or system-wide kernel upgrade policy.
+  if compgen -G "/var/lib/kpatch/*/kpctl_*.ko" >/dev/null; then
+    echo "!! $K 에 ABI만으로 자동 로드되는 기존 kpctl 모듈이 있습니다. 관리자 확인 필요"; exit 1
+  fi
+  case "$ID" in
+    debian) apt-get install -y --no-install-recommends binutils kmod mokutil xz-utils gzip ;;
+    rocky) dnf -y --disablerepo='*' --enablerepo=baseos,appstream --setopt=gpgcheck=1 install binutils kmod mokutil ;;
+  esac
+  if ! command -v kpatch >/dev/null; then install -m 0755 "$HERE/kpatch" /usr/local/sbin/kpatch; fi
+fi
 echo "■ 4. 에이전트"
 systemctl stop kpctl-agent 2>/dev/null || true          # 재설치: 실행 중인 에이전트 먼저 멈춤
 install -m 0755 "$HERE/kpctl-agent" "/usr/local/bin/kpctl-agent.new.$$"
 mv -f "/usr/local/bin/kpctl-agent.new.$$" /usr/local/bin/kpctl-agent   # 실행 중인 파일을 안전하게 교체
 install -d -m 0755 /etc/kpctl
 CA_LINE=""
+REBOOT_LINE=""
+if [ "$ID" = ubuntu ]; then REBOOT_LINE='"reboot_hook": "/etc/kpctl/reboot-hook.sh",'; fi
 if [ -n "$CA" ]; then install -m 0644 "$CA" /etc/kpctl/ca.crt; CA_LINE='"ca_file": "/etc/kpctl/ca.crt",'; fi
 ( umask 077
   cat > /etc/kpctl/agent.json <<EOF
@@ -144,18 +166,20 @@ if [ -n "$CA" ]; then install -m 0644 "$CA" /etc/kpctl/ca.crt; CA_LINE='"ca_file
   "enroll_token": "$TOKEN",
   $CA_LINE
   $MOK_LINE
-  "interval_seconds": 60,
-  "reboot_hook": "/etc/kpctl/reboot-hook.sh"
+  $REBOOT_LINE
+  "interval_seconds": 60
 }
 EOF
 )
-[ -f /etc/kpctl/reboot-hook.sh ] || install -m 0700 "$HERE/reboot-hook.example.sh" /etc/kpctl/reboot-hook.sh
-# 커널 준비 도우미가 읽는 미러 순서 (공식 → 한국 미러)
-if [ -f "$HERE/mirrors.list" ]; then install -m 0644 "$HERE/mirrors.list" /etc/kpctl/mirrors.list; fi
-if [ -f "$HERE/kpctl-prepare-kernel.py" ]; then
-  install -m 0755 "$HERE/kpctl-prepare-kernel.py" /usr/local/sbin/kpctl-prepare-kernel
-else
-  echo "!! 경고: kpctl-prepare-kernel.py 가 묶음에 없어 자동 커널 준비(커널 점프 1단계)가 실패합니다" >&2
+# Ubuntu GA 커널 준비, 점프 및 재부팅 훅.
+if [ "$ID" = ubuntu ]; then
+  [ -f /etc/kpctl/reboot-hook.sh ] || install -m 0700 "$HERE/reboot-hook.example.sh" /etc/kpctl/reboot-hook.sh
+  if [ -f "$HERE/mirrors.list" ]; then install -m 0644 "$HERE/mirrors.list" /etc/kpctl/mirrors.list; fi
+  if [ -f "$HERE/kpctl-prepare-kernel.py" ]; then
+    install -m 0755 "$HERE/kpctl-prepare-kernel.py" /usr/local/sbin/kpctl-prepare-kernel
+  else
+    echo "!! 경고: kpctl-prepare-kernel.py 가 묶음에 없어 자동 커널 준비(커널 점프 1단계)가 실패합니다" >&2
+  fi
 fi
 install -m 0644 "$HERE/kpctl-agent.service" /etc/systemd/system/kpctl-agent.service
 systemctl daemon-reload

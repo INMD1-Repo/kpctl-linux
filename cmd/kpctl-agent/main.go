@@ -7,9 +7,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"kpctl/internal/agent"
@@ -18,7 +20,32 @@ import (
 func main() {
 	configPath := flag.String("config", "/etc/kpctl/agent.json", "설정 파일 경로")
 	once := flag.Bool("once", false, "한 주기만 실행하고 종료")
+	identify := flag.Bool("identify", false, "print running kernel track and exit")
 	flag.Parse()
+	if *identify {
+		b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+		if err != nil {
+			log.Fatal(err)
+		}
+		abi := strings.TrimSpace(string(b))
+		k, err := agent.IdentifyKernel(abi, "/sys/kernel/notes", "/etc/os-release", "/proc/sys/kernel/version")
+		if reason := k.BuildBlock(); reason != "" {
+			fmt.Fprintln(os.Stderr, reason)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		if k == nil {
+			fmt.Println(abi)
+		} else {
+			var check agent.KernelImageCheck
+			if err := check.Verify(k, "/boot", "/lib/modules"); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(k.Track())
+		}
+		return
+	}
 
 	cfg, err := agent.LoadConfig(*configPath)
 	if err != nil {

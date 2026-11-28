@@ -8,9 +8,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"kpctl/internal/builder"
@@ -22,7 +24,23 @@ func main() {
 	discoverOnly := flag.Bool("discover-only", false, "자동 수집만 1회 하고 종료")
 	buildRequest := flag.String("build-request", "", "격리 컨테이너 내부의 로컬 빌드 요청")
 	checkConfig := flag.Bool("check-config", false, "설정·CA 읽기 검사 후 종료 (컨트롤러에 접속하지 않음)")
+	verify := flag.Bool("verify-distribution-module", false, "검증 전용: TRACK VERSION MODULE CONFIG SYMVERS REFERENCE_MODULE")
 	flag.Parse()
+	if *verify {
+		if flag.NArg() != 6 {
+			log.Fatal("expected TRACK VERSION MODULE CONFIG SYMVERS REFERENCE_MODULE")
+		}
+		version, err := strconv.Atoi(flag.Arg(1))
+		if err != nil {
+			log.Fatal(err)
+		}
+		msg, err := builder.VerifyDistributionModule(flag.Arg(0), version, flag.Arg(2), flag.Arg(3), flag.Arg(4), flag.Arg(5))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Print(msg)
+		return
+	}
 	if *buildRequest != "" {
 		if err := builder.RunBuildRequest(*buildRequest); err != nil {
 			log.Fatal(err)

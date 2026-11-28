@@ -54,7 +54,15 @@ kpctl host cordon node-01
 kpctl host reboot node-01 -kernel 6.8.0-86-generic
 kpctl host cancel-reboot node-01
 kpctl host uncordon node-01
-kpctl signing rollout-cert prod-2026
+```
+
+MOK 첫 시험은 `-host`로 canary 한 대를 지정합니다. 옵션을 생략하면 해당 컨트롤러의 전체 등록 호스트 중 미등록·미확인 대상을 예약합니다. 기존 예약을 발견한 `pending_existing`은 최초 예약자에게 비밀번호를 확인하세요. [MOK 등록·콘솔 승인](secure-boot.md#mok-enrollment)
+
+```sh
+kpctl hosts
+kpctl signing rollout-cert -host node-01 prod-2026
+kpctl hosts mok-status node-01
+# 에이전트 보고가 pending이면 비공개 터미널에서 조회합니다.
 kpctl hosts mok-password node-01
 ```
 

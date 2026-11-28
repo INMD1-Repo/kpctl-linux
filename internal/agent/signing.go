@@ -30,21 +30,24 @@ func (a *Agent) mokutil(args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-// mokutil 공식 src/mokutil.c의 test_key()/print_skip_message()를 기준으로 합니다.
-// https://github.com/lcp/mokutil/blob/master/src/mokutil.c
-// pending·blocked도 종료 0이므로 종료 코드만으로 enrolled라 판단하지 않습니다.
-func mokTestResult(out []byte, err error) (state string, pending bool) {
-	text := strings.TrimSpace(string(out))
-	if err == nil && (strings.HasSuffix(text, " is already enrolled") || strings.HasSuffix(text, " is already in db") || strings.HasSuffix(text, " is already in the built-in trusted keyring")) {
+// mokutil 0.5/0.6 and newer tools use opposite 0/1 exit conventions.
+// --ignore-keyring tests the EFI lists and excludes older tools that gave
+// the same "already enrolled" answer for pending or blocked certificates.
+func (a *Agent) mokTestResult(path string) (state string, pending bool) {
+	out, err := a.mokutil("--test-key", path, "--ignore-keyring")
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+			return "unknown", false
+		}
+	}
+	switch strings.TrimSpace(string(out)) {
+	case path + " is already enrolled":
 		return "enrolled", false
-	}
-	if err == nil && strings.HasSuffix(text, " is already in the enrollment request") {
+	case path + " is already in db":
+		return "in_db", false
+	case path + " is already in the enrollment request":
 		return "not_enrolled", true
-	}
-	if err == nil && (strings.HasSuffix(text, " is blocked in dbx") || strings.HasSuffix(text, " is blocked in MokListX")) {
-		return "not_enrolled", false
-	}
-	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 && strings.HasSuffix(text, " is not enrolled") {
+	case path + " is not enrolled", path + " is blocked in dbx", path + " is blocked in MokListX", path + " is blocked in MokListXRT":
 		return "not_enrolled", false
 	}
 	return "unknown", false
@@ -95,7 +98,7 @@ func (a *Agent) certFile(cert model.SigningCert) (string, error) {
 	return path, os.Rename(file.Name(), path)
 }
 
-func (a *Agent) enrollmentStatus(security hostSecurity) (map[string]string, bool, string) {
+func (a *Agent) enrollmentStatus(security hostSecurity) (map[string]string, bool, bool, string) {
 	var statuses map[string]string
 	if len(a.st.SigningCerts) > 0 {
 		statuses = make(map[string]string, len(a.st.SigningCerts))
@@ -104,7 +107,7 @@ func (a *Agent) enrollmentStatus(security hostSecurity) (map[string]string, bool
 		statuses[cert.ID] = "unknown"
 	}
 	if security.firmware != "uefi" {
-		return statuses, false, ""
+		return statuses, false, false, ""
 	}
 	pendingOut, pendingErr := a.mokutil("--list-new")
 	pending, pendingKnown := mokListPending(pendingOut)
@@ -119,15 +122,17 @@ func (a *Agent) enrollmentStatus(security hostSecurity) (map[string]string, bool
 			warnings = append(warnings, cert.ID+": 공개 인증서 무결성 확인 실패")
 			continue
 		}
-		out, err := a.mokutil("--test-key", path)
-		state, certPending := mokTestResult(out, err)
+		state, certPending := a.mokTestResult(path)
 		statuses[cert.ID] = state
 		pending = pending || certPending
 		if state == "unknown" {
 			warnings = append(warnings, cert.ID+": MOK 등록 상태를 읽지 못했습니다")
 		}
+		if state == "in_db" {
+			warnings = append(warnings, cert.ID+": UEFI db 일치, MOK 등록·커널 모듈 신뢰 미확인")
+		}
 	}
-	return statuses, pending, strings.Join(warnings, "; ")
+	return statuses, pending, pendingKnown && pendingErr == nil && !pending, strings.Join(warnings, "; ")
 }
 
 // reconcileSigning은 인증서·최종 결과만 저장하며 비밀번호 원문·해시는 저장하지 않습니다.
@@ -169,9 +174,10 @@ func (a *Agent) importMOK(request model.MOKImportRequest) model.MOKImportResult 
 	}
 	// 현 호스트 mokutil --help와 공식 man/mokutil.1의 --hash-file 계약을 확인했습니다.
 	// https://github.com/lcp/mokutil/blob/master/man/mokutil.1
-	help, err := a.mokutil("--help")
-	if err != nil || !strings.Contains(string(help), "--hash-file") {
-		result.Detail = "mokutil --hash-file 미지원 또는 도구 실행 불가. " + manual
+	// Some releases print their full help and return 255.
+	help, _ := a.mokutil("--help")
+	if !strings.Contains(string(help), "--hash-file") || !strings.Contains(string(help), "--ignore-keyring") {
+		result.Detail = "mokutil --hash-file·--ignore-keyring 미지원 또는 도구 실행 불가. " + manual
 		return result
 	}
 	var cert *model.SigningCert
@@ -190,14 +196,22 @@ func (a *Agent) importMOK(request model.MOKImportRequest) model.MOKImportResult 
 		result.Status, result.Detail = "failed", "공개 인증서 무결성 확인 실패. "+manual
 		return result
 	}
-	out, err := a.mokutil("--test-key", path)
-	state, pending := mokTestResult(out, err)
+	state, pending := a.mokTestResult(path)
 	if state == "enrolled" {
 		result.Status, result.Detail = "enrolled", "이미 등록된 인증서"
 		return result
 	}
 	if pending {
-		result.Status, result.Detail = "pending", "다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요"
+		result.Status, result.Detail = "pending_existing", "기존 MOK 예약 감지: 최초 예약자가 지정한 비밀번호로 콘솔 승인 필요"
+		return result
+	}
+	if state != "not_enrolled" {
+		result.Detail = "MOK 미등록 여부를 확인할 수 없습니다 (" + state + "). EFI 상태와 대상 커널의 모듈 신뢰를 확인하세요"
+		return result
+	}
+	list, listErr := a.mokutil("--list-new")
+	if anyPending, known := mokListPending(list); listErr != nil || !known || anyPending {
+		result.Status, result.Detail = "failed", "기존 MOK 예약을 보존합니다. 대기 목록 확인 및 기존 콘솔 승인 후 다시 예약하세요"
 		return result
 	}
 	if !strings.HasPrefix(request.PasswordHash, "$6$") || strings.ContainsAny(request.PasswordHash, "\r\n\x00") || len(request.PasswordHash) > 256 {
@@ -216,19 +230,46 @@ func (a *Agent) importMOK(request model.MOKImportRequest) model.MOKImportResult 
 		result.Status, result.Detail = "failed", "MOK 비밀번호 해시 임시 파일 기록 실패. "+manual
 		return result
 	}
-	if _, err := a.mokutil("--import", path, "--hash-file", hash.Name()); err != nil {
+	importOut, err := a.mokutil("--import", path, "--hash-file", hash.Name())
+	if err != nil {
 		result.Status, result.Detail = "failed", "MOK 등록 예약 명령 실패. "+manual
 		return result
 	}
 	// 종료 0이어도 차단된 키를 건너뛸 수 있으므로 실제 pending 상태를 재확인합니다.
-	out, err = a.mokutil("--test-key", path)
-	state, pending = mokTestResult(out, err)
+	state, pending = a.mokTestResult(path)
 	if state == "enrolled" {
 		result.Status, result.Detail = "enrolled", "이미 등록된 인증서"
 	} else if pending {
-		result.Status, result.Detail = "pending", "다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요"
+		result.Status, result.Detail, result.PasswordSet = mokImportOutcome(path, string(importOut))
 	} else {
 		result.Status, result.Detail = "failed", "MOK 등록 예약을 확인하지 못했습니다. "+manual
 	}
 	return result
+}
+
+// Classify only after the exact DER is reported in MokNew. Do not disclose
+// raw tool output, which may contain local paths or credential material.
+func mokImportOutcome(path, output string) (string, string, bool) {
+	ambiguous := false
+	warned := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		msg := strings.TrimPrefix(line, "SKIP: ")
+		if msg == path+" is already in the enrollment request" {
+			return "pending_existing", "기존 MOK 예약 감지: 최초 예약자의 콘솔 비밀번호 필요", false
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "warning:") && !strings.Contains(lower, "skip") && !strings.Contains(lower, "already") {
+			warned = true
+		} else if line != "" {
+			ambiguous = true
+		}
+	}
+	if ambiguous {
+		return "pending_uncertain", "MokNew에서 인증서를 확인했습니다. 도구의 추가 출력만으로 비밀번호 출처를 확인할 수 없어 이 요청의 후보 비밀번호를 제공합니다. 최초 예약자와 대조하세요.", false
+	}
+	if warned {
+		return "pending", "등록 명령이 경고와 함께 완료됐고 해당 인증서의 예약을 확인했습니다. 콘솔 비밀번호는 이 요청에 저장된 후보와 대조하세요", false
+	}
+	return "pending", "다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요", true
 }

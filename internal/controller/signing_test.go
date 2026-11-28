@@ -237,12 +237,15 @@ func TestSigningLegacyHostReportGetsActiveArtifactAndWarning(t *testing.T) {
 func TestSigningCopiesPreserveUnsignedOriginalAndExpandKernel(t *testing.T) {
 	s := newAutoServer(t, AutoRollout{})
 	root := t.TempDir()
-	signer := vmScript(t, root, "sign.sh", `printf '%s' ":$2:$3" >> "$1"`)
-	s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{
-		{ID: "new", Active: true, SignCommand: []string{signer, "{module}", "{kernel}", "new"}},
-		{ID: "old", SignCommand: []string{signer, "{module}", "{kernel}", "old"}},
-		{ID: "unused", SignCommand: []string{signer, "{module}", "{kernel}", "unused"}},
-	}}
+	wrapper := vmScript(t, root, "kernel.sh", `[ "$1" = "`+testKernel+`" ] || exit 1
+shift
+exec "$@"`)
+	s.cfg.Signing = &SigningConfig{Mode: "always"}
+	for _, id := range []string{"new", "old", "unused"} {
+		key := testSigningKey(t, id, id == "new")
+		key.SignCommand = append([]string{wrapper, "{kernel}"}, key.SignCommand...)
+		s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, key)
+	}
 	addHost(t, s, "old-only", 1)
 	if err := s.store.Update(func(st *State) error {
 		st.Hosts["old-only"].Status = signingHost(map[string]string{"new": "not_enrolled", "old": "enrolled", "unused": "not_enrolled"}).Status
@@ -264,7 +267,7 @@ func TestSigningCopiesPreserveUnsignedOriginalAndExpandKernel(t *testing.T) {
 		for _, key := range []string{"new", "old"} {
 			path := s.signingArtifactFile(testKernel, module, key)
 			data, err := os.ReadFile(path)
-			if err != nil || string(data) != "module:"+testKernel+":"+key {
+			if err != nil || string(data) != expectedPayload(t, s, "module", key) {
 				t.Fatalf("시도 %d 키 %s의 서명/치환/원본 재사용 실패: %q (%v)", attempt, key, data, err)
 			}
 			sum, err := fileSHA256(path)
@@ -300,6 +303,9 @@ func TestSigningRemovedKeyCannotBeSelectedFromHistoricalJob(t *testing.T) {
 
 // 검토 항목 2.3: 서명 도구가 되돌려 준 개인키 경로가 API 오류·감사 로그에 노출되면 안 됩니다.
 func TestSigningFailureOutputRedactsCommandArguments(t *testing.T) {
+	if got := redactSigningOutput("-----BEGIN RSA PRIVATE KEY-----\ntest output", nil); got != "<redacted>" {
+		t.Fatal("서명 도구의 개인키 출력을 숨겨야 함")
+	}
 	if got := redactSigningOutput("sign-file: /etc/kpctl/keys/k.priv: No such file (sha512)", []string{"/usr/bin/sign-file", "sha512", "/etc/kpctl/keys/k.priv", "{module}"}); got != "sign-file: <redacted>: No such file (<redacted>)" {
 		t.Fatalf("예상과 다른 가림 결과: %q", got)
 	}
@@ -321,5 +327,22 @@ func TestSigningFailureOutputRedactsCommandArguments(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "<redacted>") || !strings.Contains(err.Error(), "No such file") {
 		t.Fatalf("도구 출력은 경로만 가린 채 남아야 함: %v", err)
+	}
+}
+
+func TestSignModuleRejectsNoOpAndDiagnosesMissingTargetHeaders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.ko")
+	if err := os.WriteFile(path, []byte("module"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ command, want string }{
+		{vmScript(t, dir, "noop", "exit 0"), "trailer"},
+		{filepath.Join(dir, "headers-{kernel}", "scripts", "sign-file"), "linux-headers-" + testKernel},
+	} {
+		_, err := signModule(SigningKey{ID: "test", SignCommand: []string{tc.command, "{module}"}}, testKernel, path, signingBytesSHA256([]byte("module")), []byte("test"))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("error = %v, want %q", err, tc.want)
+		}
 	}
 }

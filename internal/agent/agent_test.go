@@ -217,20 +217,23 @@ func newTestAgent(t *testing.T) (*Agent, string) {
 	}
 	t.Setenv("FAKE_ROOT", root)
 	cfg := &Config{
-		ControllerURL:    "http://127.0.0.1:1",
-		StateDir:         filepath.Join(root, "state"),
-		KpatchBin:        fake,
-		KpatchInstallDir: filepath.Join(root, "installed"),
-		ModulePrefix:     "kpctl_",
-		LivepatchSysfs:   filepath.Join(root, "sys/livepatch"),
-		ModuleSysfs:      filepath.Join(root, "sys/module"),
-		OSReleasePath:    filepath.Join(root, "proc/osrelease"),
+		ControllerURL:     "http://127.0.0.1:1",
+		StateDir:          filepath.Join(root, "state"),
+		KpatchBin:         fake,
+		KpatchInstallDir:  filepath.Join(root, "installed"),
+		ModulePrefix:      "kpctl_",
+		LivepatchSysfs:    filepath.Join(root, "sys/livepatch"),
+		ModuleSysfs:       filepath.Join(root, "sys/module"),
+		SysfsRoot:         filepath.Join(root, "sys"),
+		DistroReleasePath: filepath.Join(root, "etc/os-release"),
+		OSReleasePath:     filepath.Join(root, "proc/osrelease"),
 	}
 	for _, dir := range []string{cfg.StateDir, cfg.LivepatchSysfs, cfg.ModuleSysfs} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
+	writeTestFile(t, cfg.DistroReleasePath, "ID=ubuntu\n")
 	writeTestFile(t, cfg.OSReleasePath, testKernel)
 	a, err := New(cfg)
 	if err != nil {

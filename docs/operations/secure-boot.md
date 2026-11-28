@@ -1,5 +1,7 @@
 # Secure Boot·서명·MOK 운영
 
+Debian과 Rocky Linux의 서명 강제 대상은 해당 배포 키의 실제 MOK 등록이 확인된 뒤에만 사본을 받습니다. 패키지 트랙 확인과 전용 VM 시험 절차를 따르세요. [배포판별 Secure Boot canary](distribution-kernels.md#실제-대상-설치-및-secure-boot-canary)
+
 <a id="secure-boot"></a>
 
 서명 필요 여부는 Secure Boot 스위치 하나로 결정하지 않습니다. 에이전트는 펌웨어, EFI SecureBoot 변수, 커널 lockdown, `module.sig_enforce`를 보고하고 컨트롤러도 같은 정책으로 판단합니다. 수집 실패는 에이전트 보고 주기를 중단시키지 않으며 `unknown`과 경고로 표시합니다.
@@ -45,13 +47,17 @@
 | 상태 | 결과 |
 | --- | --- |
 | `mode=never` | `blocked_signing_disabled`; 기존 모듈 유지 |
+| 보안·서명 상태를 보고한 호스트에 서명이 필요하고 서명 키·명령이 없음 | `blocked_signing_disabled`. 컨트롤러의 키를 설정하고 새 누적본 승인 |
+| 위 호스트에서 이전 작업의 서명 사본 메타데이터가 없음 | `blocked_artifact`. 원래 승인 작업의 기본 URL로 대체하지 않음 |
 | 같은 버전이고 설치 SHA와 일치하는 허용된 signed 사본이 있음 | 그 사본 유지; active 변경은 새 누적 버전부터 반영 |
 | 등록된 키의 signed 사본이 있음 | 새 버전은 active 등록 키 우선, 그다음 등록된 다른 설정 키 선택 |
 | 등록된 키의 사본이 없거나 명시적으로 unsigned임 | `blocked_artifact`; 재승인 또는 새 누적본 필요 |
 | 모든 설정 키가 명시적으로 `not_enrolled`임 | `blocked_mok_missing`: “MOK 등록 필요” |
 | 위 상태에서 MOK 예약도 확인됨 | 같은 제외 상태, “다음 계획된 재부팅 때 콘솔에서 MOK 승인 필요” |
-| 설치 SHA·등록 보고가 모두 없는 이전 에이전트 | 처음 적용할 때부터 작업 기본 사본을 일관되게 제공하고 경고; 명시적 unsigned·누락 사본은 차단 |
+| 보안·서명 필드가 전혀 없는 이전 에이전트 | 작업 기본 사본과 미확인 경고. 서명 미설정의 익명 사본과 이전 형식의 기본 URL 호환 유지 |
 | 새 에이전트가 등록 상태를 unknown으로 보고함 | active 사본과 경고 전달; 명시적 unsigned·누락 사본은 차단 |
+
+`mokutil --test-key <DER> --ignore-keyring`에서 MokListRT 등록을 확인한 경우에만 에이전트가 `enrolled`로 보고합니다. UEFI db에서 일치하면 `in_db`로 보고하며 확인된 등록 수에 포함하지 않습니다. 이는 shim/MOK 목록에 대한 관찰입니다. 대상 Ubuntu GA 커널이 어느 키링에서 모듈 서명을 신뢰하는지는 해당 부팅에서 확인해야 합니다. db 일치만 관찰하면 등록 미확인 정책에 따라 경고와 함께 서명 사본을 제공할 수 있습니다.
 
 보안 신호와 등록 상태의 unknown은 서로 다른 정보입니다. 이전 에이전트는 필드가 없으므로 서명 필요로 판단하면서 등록 미확인 경고를 붙입니다. 이전 형식의 메타데이터에는 기존 기본 URL 호환 경로가 남아 있으므로, unknown 경고가 실제 키 신뢰 검증의 완료를 뜻하지 않습니다.
 
@@ -65,19 +71,44 @@
 
 MOK 자동화는 **UEFI와 shim/MokManager를 사용하는 부팅 환경**을 전제로 합니다. BIOS에서 강제 서명이 켜졌다면 MOK 자동 등록은 `unsupported`입니다. 해당 커널이 실제로 신뢰하는 키링과 운영자가 승인한 키 배포 방법을 먼저 확인해야 합니다. BIOS에 `mokutil --import`를 실행하면 해결된다고 가정하지 않습니다.
 
-1. 컨트롤러에 공개 DER 인증서와 서명 명령을 설정하고, 키 ID와 인증서 내용을 확인합니다. 같은 ID의 DER은 처음 확인한 SHA에 고정됩니다. 인증서 교체에는 새 ID를 씁니다.
-2. 시험 VM의 신뢰 키는 운영자가 별도로 등록합니다. 다음 CLI는 컨트롤러에 등록된 대상 호스트에 인증서 예약을 전달하며, 고정·일회 시험 VM 이미지를 자동 변경하지 않습니다.
+1. [컨트롤러 설치·공통 키 준비](../install/controller.md#module-signing-key)에서 `sudo -u kpctl -- kpctl signing init-key prod-2026`를 실행하고, 서명 명령·공개 DER를 설정한 뒤 서비스를 재시작합니다. 대상은 UEFI/shim, Secure Boot on, 지원 Ubuntu GA 커널과 재부팅 중 접근 가능한 콘솔을 갖춰야 합니다. 대상에서 `mokutil --sb-state`, `uname -r`, `cat /proc/version_signature`를 확인합니다. `mokutil`이 없으면 대상에서 `sudo apt-get install mokutil`로 준비하세요.
+2. **첫 시험은 `-host node-01`로 canary 한 대를 지정하세요.** 정확한 호스트 이름 또는 ID를 사용하며, 중복된 이름은 ID로 다시 지정합니다. `-host`를 생략한 기존 명령은 이 컨트롤러에 등록된 모든 호스트 중 인증서 미등록·미확인 대상에 예약합니다. 고정·일회 시험 VM 이미지의 신뢰 키는 운영자가 별도로 등록합니다.
 
    ```sh
+   sudo kpctl install -check -group canary node-01
+   sudo kpctl install -group canary node-01
    sudo kpctl signing list
-   sudo kpctl signing rollout-cert prod-2026
-   sudo kpctl hosts mok-password node-01
+   sudo kpctl hosts mok-status node-01
+   # 이 호스트 한 대에만 예약합니다.
+   sudo kpctl signing rollout-cert -host node-01 prod-2026
+   sudo kpctl hosts mok-status node-01
    ```
 
-3. 호스트의 `mok_import` 결과와 `mok_pending`을 확인합니다. 예약은 재부팅을 실행하지 않습니다. 다음 계획된 재부팅 때 콘솔에서 해당 인증서와 호스트별 비밀번호를 확인하고 MOK 등록을 승인합니다.
-4. 부팅 후 새 보고의 `enrolled_certs[키ID]=enrolled`를 확인합니다. pending이나 명령 성공만으로 등록 완료 처리하지 않습니다.
+3. 에이전트의 다음 보고 뒤 `mok-status`에서 해당 키의 예약 결과를 확인합니다. `pending`이면 콘솔 조작자가 비공개 터미널에서 `sudo kpctl hosts mok-password node-01`로 조회합니다. `awaiting_agent`는 다음 보고를 기다립니다. `pending_existing`이면 기존 예약과 비밀번호가 유지되므로 최초 예약자에게 콘솔 비밀번호를 확인합니다. 도구가 일반 경고를 출력한 뒤 인증서 대기가 확인되면 `pending`과 경고를 함께 보고합니다. 해석할 수 없는 출력을 반환하면 `pending_uncertain`에서 해당 요청의 후보 비밀번호를 조회할 수 있습니다. 경고가 있으면 최초 예약자와 값을 대조하세요. 구 에이전트의 `pending`은 출처가 불분명해 조회된 값이 콘솔 비밀번호와 다를 수 있습니다. 다음 계획된 재부팅 때 VM 콘솔의 MokManager에서 **Enroll MOK → View key**로 키 ID·지문을 대조한 뒤 Continue → Yes, 호스트별 비밀번호를 입력하고 부팅합니다. 지문이 SHA1 형식이면 컨트롤러에서 같은 DER에 `openssl x509 -inform DER -in 파일.der -noout -fingerprint -sha1`을 실행해 같은 형식으로 대조합니다.
+4. 부팅 후 `mokutil --sb-state`가 enabled인지 다시 확인합니다. 컨트롤러에서 `sudo kpctl hosts mok-status node-01`의 보고 시각이 재부팅 후이고 `prod-2026: enrolled`인지 확인합니다. 마지막 예약 기록은 여전히 pending일 수 있습니다. 대상에서 직접 확인하려면 에이전트 기본 경로 `/var/lib/kpctl-agent/certs/<DER의 SHA256>.der`를 사용해 `sudo mokutil --test-key /해당/공개.der --ignore-keyring`을 실행합니다. mokutil 버전에 따라 정상 질의의 0·1 종료 규약이 다릅니다. 에이전트는 인증서 경로와 결과 문구를 함께 검사합니다. `unknown`이면 해당 DER, 지원 옵션, EFI 변수 접근과 부팅 경로를 확인합니다. [mokutil 0.6.0 소스](https://github.com/lcp/mokutil/blob/0.6.0/src/mokutil.c) · [현재 mokutil 소스](https://github.com/lcp/mokutil/blob/master/src/mokutil.c)
 
-`rollout-cert`는 이미 등록된 호스트를 건너뛰고 나머지에 요청합니다. 비 UEFI·미확인 펌웨어에는 경고를 표시합니다. 실패·unsupported 요청은 원인을 해결한 뒤 명시적으로 다시 예약할 수 있습니다. 같은 키·인증서의 진행 중 요청을 반복 실행해 비밀번호를 계속 바꾸지 않습니다.
+`rollout-cert`는 이미 등록된 호스트를 건너뛰고 나머지에 요청합니다. 비 UEFI·미확인 펌웨어에는 경고를 표시합니다. 실패·unsupported 요청은 원인을 해결한 뒤 같은 키로 명시적으로 다시 예약할 수 있습니다. 이때 컨트롤러가 저장한 콘솔 비밀번호는 그대로 두고 에이전트 작업 ID만 갱신합니다. 같은 키·인증서의 진행 중 요청을 반복 실행해 비밀번호를 계속 바꾸지 않습니다.
+
+다른 키의 요청이 있으면 수동·자동 예약 모두 기존 처리 결과와 대기 보고를 확인합니다. 미지원(`unsupported`)은 import 실행 전 결과입니다. 이전 키가 등록됐거나 미지원으로 끝나고 대기 보고가 없으면 새 키를 예약할 수 있습니다. 실패(`failed`) 직후 호스트가 MOK 대기를 보고하면 관리자 조회에서 해당 요청의 후보 비밀번호를 확인할 수 있습니다. 대기가 해당 DER인지와 최초 예약자를 대조하세요. 실패는 펌웨어 쓰기 후에도 발생할 수 있어 동일 요청 결과와 최근의 **빈 MokNew** 보고가 있어야 다른 키로 넘어갑니다. 같은 키를 자동으로 반복 재시도하지 않습니다. 실제 import 직전에도 에이전트는 해당 공개 DER와 호스트 전체 대기 목록을 다시 확인합니다.
+
+**같은 키를 다시 요청했는데 예약 수가 0일 때**에는 경고에 표시된 호스트·요청 ID와 `sudo kpctl hosts mok-status node-01`의 마지막 보고를 확인하세요. 전체 예약 응답의 `scheduled_hosts`는 요청 ID를 새로 발급한 호스트 수입니다. 기존 요청을 보존한 호스트는 경고에 표시하며, 단일 호스트의 같은 요청은 HTTP 409로 이유를 반환합니다. 실제 대기가 있으면 최초 예약자의 콘솔 승인을 진행하세요. 최근 보고에서 키가 `not_enrolled`이고 MokNew가 비었는데 이전 처리 결과가 남았다면 경고에 표시된 `-host`와 정확한 `-replace-request` 명령으로 같은 키를 재예약할 수 있습니다. 이때 기존 비밀번호와 해시를 유지하고 요청 ID를 갱신합니다.
+
+**퇴역 키 또는 같은 키의 이전 요청이 계속 표시될 때**에는 대상 콘솔에서 `sudo mokutil --list-new`를 확인하세요. 대기 중이면 최초 예약자와 기존 콘솔 승인을 먼저 처리합니다. 운영자가 콘솔 처리를 마쳤거나 별도 절차로 대기를 정리했는데 컨트롤러에 `pending`·`pending_existing`·`pending_uncertain`만 남은 경우 아래 명령으로 **컨트롤러 요청**을 교체할 수 있습니다. 콘솔에서 다른 도구로 예약하는 작업과 시간을 겹치지 않게 하세요.
+
+```sh
+sudo kpctl hosts mok-status node-01
+# 최근 보고에서 'MokNew 빈 목록 확인: true'와 처리된 컨트롤러 요청 ID를 읽습니다.
+read -r -p '교체할 기존 MOK 요청 ID: ' REQ
+# 같은 키 재시도는 기존 키 ID, 퇴역 키 교체는 새 키 ID를 지정합니다.
+sudo kpctl signing rollout-cert -host node-01 -replace-request "$REQ" prod-2026
+sudo kpctl hosts mok-status node-01
+```
+
+복구는 요청 ID가 일치하고 처리 결과가 저장되어 있으며 마지막 보고가 최신이고 MokNew가 비었다는 명시적 증거가 있는 경우에만 실행됩니다. `mok_pending: false`만 보고한 구 에이전트는 갱신 후 새 보고를 기다리세요. 대기와 빈 목록 모두 확인되지 않으면 CLI는 `미보고/확인 불가`를 표시합니다. 대상의 UEFI·mokutil과 에이전트 버전을 확인하세요. 키 제거만으로 미완료 요청을 취소하지 않습니다. 조회 중 도착한 다른 요청, 처리 중인 요청, 실제 대기는 기존 비밀번호와 함께 보존합니다. 복구 성공은 관리자·대상·키·이전 요청 ID와 함께 감사됩니다. 이 명령에는 펌웨어 요청 취소나 재부팅 단계가 없습니다.
+
+**`awaiting_agent`가 지속될 때**에는 `mok-status`의 마지막 보고 시각과 호스트의 `systemctl status kpctl-agent`, `journalctl -u kpctl-agent -b`로 에이전트 실행·컨트롤러 연결을 확인하세요. MOK 요청을 처리하지 않는 구 에이전트는 같은 배포본으로 갱신해 기존 요청부터 처리하게 합니다. 퇴역 키의 인증서가 없어 `failed`를 보고한 경우에는 최신 빈 MokNew 보고 뒤 새 키 예약을 다시 시도하세요. 에이전트를 복구할 수 없으면 해당 호스트의 교체를 보류합니다. 호스트를 실제로 폐기·재구축해 재등록하는 경우 새 호스트 ID로 시작하므로 기존 MOK 대기의 최초 예약자와 콘솔 접근 가능 여부를 먼저 확인하고 호스트 링·정책을 다시 점검하세요. 컨트롤러 등록을 삭제해도 펌웨어 대기는 취소되지 않습니다.
+
+관리자 API는 전체 예약에 `POST /api/signing/{key}/rollout-cert`, 한 대 예약에 `POST /api/signing/{key}/hosts/{host}/rollout-cert`를 사용합니다. 두 요청의 본문은 비우거나 빈 JSON 객체 `{}`를 보냅니다. 단일 호스트 경로에만 `?replace_request=<기존 요청 ID>`를 지정할 수 있습니다. 구 컨트롤러가 단일 호스트 경로를 지원하지 않으면 CLI가 오류를 반환합니다. 전체 예약으로 재시도하지 않습니다.
 
 설치 묶음의 `install-agent.sh`에는 선택적인 `--enroll-mok`가 있습니다. 기본값은 꺼짐이며, 켜면 에이전트가 서명 필요·active 인증서 미등록 조건에서 예약을 요청합니다. 이미 설치한 에이전트는 `mok_auto_import` 설정으로 같은 동작을 선택할 수 있습니다. 일반 `kpctl install` 명령에 이 플래그가 있다고 가정하지 말고 직접 설치 스크립트 또는 설정 파일을 사용합니다.
 
@@ -87,9 +118,45 @@ MOK 자동화는 **UEFI와 shim/MokManager를 사용하는 부팅 환경**을 �
 
 MOK import를 처리하는 주기에는 패치 적용·재부팅 경로로 진행하지 않습니다. 결과가 컨트롤러에 보고된 뒤의 후속 주기는 별도로 승인된 재부팅을 처리할 수 있습니다. kpctl의 재부팅 승인은 [정확한 새 GA 대상·드레인·5분 일회 승인](reboot-approval.md#reboot-approval) 조건을 그대로 적용합니다. MOK 등록을 위해 이 조건을 우회하지 않습니다.
 
+<a id="verify-signed-module"></a>
+
+## 첫 서명 패치 적용 확인
+
+해당 Ubuntu 시리즈의 [빌더](../install/builder.md)가 준비되어 있고 대상 GA ABI의 검토 가능한 활성 패치가 있어야 합니다. 첫 시험에서는 자동 승인을 끄고 canary의 재부팅 후 등록 보고를 기다립니다. 별도 `test_vm` 검사를 사용하는 경우 동일 ABI로 부팅하는 시험 VM에도 같은 **공개 DER**를 미리 등록하세요. `sb_on` 시험은 그 VM에서 미서명 원본 거부와 실제 배포 사본의 로드·교체·롤백을 검사합니다.
+
+```sh
+# 컨트롤러에서 K에 canary의 uname -r 값을 넣습니다.
+K=6.8.0-85-generic
+sudo kpctl patches -kernel "$K"
+sudo kpctl build -kernel "$K"
+sudo kpctl jobs
+# 생성된 작업이 승인대기이고 diff와 빌드 로그를 검토한 뒤 실행합니다.
+read -r -p '승인할 작업 번호: ' JOB
+sudo kpctl log "$JOB"
+sudo kpctl approve "$JOB"
+sudo kpctl hosts
+```
+
+canary의 적용/목표 버전이 같고 오류·전환 대기가 사라지면, 대상 콘솔에서 아래 값을 확인합니다. `MOD`에는 해당 승인 작업의 실제 모듈 이름을 넣습니다. 단일 키 설치에서는 컨트롤러에서 `sudo sha256sum "/var/lib/kpctl/artifacts/$K/signed-prod-2026/$MOD.ko"`로 배포 사본의 SHA256을 읽어 설치 사본과 대조합니다. VM 시험을 사용했다면 관리자 웹의 작업 상세에 기록된 키별 SHA256도 확인합니다.
+
+```sh
+sudo kpatch list
+read -r -p '승인된 모듈 이름 (.ko 제외): ' MOD
+KO="/var/lib/kpatch/$(uname -r)/$MOD.ko"
+sudo sha256sum "$KO"
+sudo modinfo -F signer "$KO"
+cat "/sys/kernel/livepatch/$MOD/enabled"       # 1
+cat "/sys/kernel/livepatch/$MOD/transition"    # 0
+sudo journalctl -k -b --no-pager | tail -100
+```
+
+컨트롤러는 Linux trailer·서명 길이, 원본 SHA256, CMS 서명자 한 명 및 분리 서명을 검사합니다. OpenSSL CMS는 실제 배포하는 DER로 원본 바이트의 서명을 확인합니다. 검증 실패 때는 서비스 계정의 OpenSSL CMS 실행 여부, 래퍼 출력 형식, 설정 DER와 서명자 지문을 대조하세요. 부팅 후 Secure Boot 상태, 해당 키의 등록 보고, 승인 SHA와 실제 로드·활성 상태까지 일치해야 대상 검증이 끝납니다. 서명 도구가 없으면 컨트롤러의 대상 헤더·실행 권한을 확인합니다. `Key was rejected by service` 또는 `Required key not available`이면 대상의 DER 지문·shim 부팅·등록 보고와 커널 로그를 확인합니다. `invalid module format`이면 `uname -r`과 `modinfo -F vermagic "$KO"`를 비교합니다. 로드가 실패해 설치 파일이 없으면 같은 진단에 에이전트가 다운로드한 `/var/lib/kpctl-agent/modules/$MOD.ko`를 사용합니다.
+
 <a id="key-rotation"></a>
 
 ## 키 교체
+
+새 ID용 키는 예를 들어 컨트롤러에서 `sudo -u kpctl -- kpctl signing init-key prod-next`로 준비합니다. 기존 키 디렉터리와 DER pin, 배포 상태 및 산출물을 일관되게 백업하고 수명·지문을 기록합니다. VM이나 빌더에서 개인키를 회수하거나 이들에게 개인키 백업을 복사하지 않습니다.
 
 새 키를 이전 키 ID에 덮어쓰지 않습니다. 먼저 현재 키가 유효한 동안, 현재 컨트롤러로 업로드·승인한 pin 보유 누적본과 정상 VM 시험을 확보합니다. 인증서 만료 임박 전에 다음 순서로 진행합니다.
 

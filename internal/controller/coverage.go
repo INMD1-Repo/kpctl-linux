@@ -260,7 +260,7 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request, who stri
 			cp := *h
 			cp.TokenHash = ""
 			host = &cp
-			if j := st.releasedJob(h.Status.Kernel, h.Status.Version); j != nil && len(h.Status.Loaded) == 1 {
+			if j := st.releasedJob(h.Status.TrackKey(), h.Status.Version); j != nil && len(h.Status.Loaded) == 1 {
 				lp := h.Status.Loaded[0]
 				age := time.Since(h.LastSeen)
 				if lp.Name == j.ModuleName && lp.Enabled && !lp.Transition && h.Status.Error == "" && age >= -30*time.Second && age <= time.Duration(s.settings().HostStaleMinutes)*time.Minute {
@@ -270,13 +270,13 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request, who stri
 				}
 			}
 			for _, p := range st.Patches {
-				if p.Kernel == h.Status.Kernel {
+				if p.Kernel == h.Status.TrackKey() {
 					cp := *p
 					patches = append(patches, cp)
 				}
 			}
 			for _, u := range st.Unpatchable {
-				if u.Kernel == h.Status.Kernel {
+				if u.Kernel == h.Status.TrackKey() {
 					for _, cve := range u.CVEs {
 						detail := u.Title + ": " + u.Reason
 						if u.Decision != nil {
@@ -291,6 +291,10 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request, who stri
 	})
 	if host == nil {
 		writeErr(w, fail(http.StatusNotFound, "호스트를 찾을 수 없습니다"))
+		return
+	}
+	if host.Status.Distribution != nil {
+		writeErr(w, fail(http.StatusBadRequest, "이 배포판의 전체 CVE 인벤토리는 제공하지 않습니다. 공식 릴리스에서 수집한 수정은 kpctl patches -kernel %s 에서 확인하세요", host.Status.TrackKey()))
 		return
 	}
 	lts := model.LTSForKernel(host.Status.Kernel)

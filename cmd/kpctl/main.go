@@ -39,8 +39,8 @@ var commands = map[string]command{
 	"patch":    {"patch enable|disable <패치ID>             패치 켜기/끄기 (이후 build 필요)", cmdPatch},
 	"promote":  {"promote -kernel K -ring N [-force] [--prerelease]   이전 링 버전을 링 N 에 배포", cmdPromote},
 	"rollback": {"rollback -kernel K -version N [--prerelease]       모든 링을 버전 N 으로 (0 = 패치 전부 내림)", cmdRollback},
-	"hosts":    {"hosts [mok-password <호스트>]              호스트 목록·MOK 콘솔 승인 비밀번호", cmdHosts},
-	"signing":  {"signing list | rollout-cert <키ID>         서명 키 현황·MOK 등록 예약 (재부팅 없음)", cmdSigning},
+	"hosts":    {"hosts [mok-status|mok-password <호스트>]   호스트 목록·MOK 상태·콘솔 승인 비밀번호", cmdHosts},
+	"signing":  {"signing init-key | list | rollout-cert      공통 모듈 서명 키 준비·상태·MOK 등록 예약", cmdSigning},
 	"auto":     {"auto [pause|resume|hold K|clear K]       자동 배포 현황·일시 중지·재개", cmdAuto},
 	"host":     {"host set|cordon|uncordon|reboot|delete <호스트> [...]   호스트 관리 (kpctl host 로 도움말)", cmdHost},
 
@@ -69,6 +69,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	var c *client.Client
+	local := os.Args[1] == "signing" && len(os.Args) > 2 && os.Args[2] == "init-key"
+	if !local {
+		c = adminClient()
+	}
+	if err := cmd.run(c, os.Args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		fmt.Fprintln(os.Stderr, "오류:", err)
+		os.Exit(1)
+	}
+}
+
+func adminClient() *client.Client {
 	envErr := loadEnvFile()
 	url, token := os.Getenv("KPCTL_URL"), os.Getenv("KPCTL_TOKEN")
 	if url == "" || token == "" {
@@ -83,13 +98,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "오류:", err)
 		os.Exit(1)
 	}
-	if err := cmd.run(c, os.Args[2:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) { // -h 로 도움말만 본 경우
-			return
-		}
-		fmt.Fprintln(os.Stderr, "오류:", err)
-		os.Exit(1)
-	}
+	return c
 }
 
 // loadEnvFile 은 KEY=VALUE 형식 파일을 읽어, 아직 설정되지 않은 환경 변수만 채웁니다.

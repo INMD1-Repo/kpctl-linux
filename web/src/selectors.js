@@ -19,10 +19,11 @@ export function ago(time, now) {
   return Math.round(seconds / 86400) + '일 전';
 }
 export const trackTarget = (track, ring) => track?.prerelease_ring_versions?.[ring] || track?.ring_versions?.[ring] || 0;
-export const ringTarget = (status, host) => trackTarget(status.tracks.find(t => t.kernel === host.status.kernel), host.ring);
-export const forcedVersion = host => host.update_now_kernel === host.status.kernel ? host.update_now_version || 0 : 0;
+export const hostTrack = host => host.status.identity_error ? '' : host.track_key || (host.status.distribution ? '' : host.status.kernel);
+export const ringTarget = (status, host) => trackTarget(status.tracks.find(t => t.kernel === hostTrack(host)), host.ring);
+export const forcedVersion = host => host.update_now_kernel === hostTrack(host) ? host.update_now_version || 0 : 0;
 export const hostTarget = (status, host) => { const target = ringTarget(status, host); return target < 0 ? target : Math.max(target, forcedVersion(host)); };
-export const latestFor = (status, host) => status.latest_released?.[host.status.kernel] || 0;
+export const latestFor = (status, host) => status.latest_released?.[hostTrack(host)] || 0;
 export function isHWE(host) {
   const pkg = (host.status.kernel_signature || '').split(/\s+/)[1] || '';
   return pkg.includes('~') && /^(5\.15\.0|6\.8\.0|7\.0\.0)-.*-generic$/.test(host.status.kernel);
@@ -49,6 +50,7 @@ export function hostSecurity(host) {
   return { required, warning: status.security_warning || (missing.length ? missing.join(', ') + ' 상태 미확인: 서명이 필요한 것으로 표시합니다.' : '') };
 }
 export function pkgVersion(host) {
+  if (host.status.distribution) return host.status.distribution.version;
   const fields = (host.status.kernel_signature || '').split(/\s+/);
   return fields[0] === 'Ubuntu' && fields[1]?.includes('-') ? fields[1].slice(0, fields[1].lastIndexOf('-')) : '';
 }
@@ -61,9 +63,9 @@ export function cmpVer(a, b) {
   return 0;
 }
 export const openJob = (status, kernel) => status.jobs.find(j => j.kernel === kernel && !j.prerelease && ['queued', 'running', 'built'].includes(j.status));
-export const coveredTag = (status, host) => status.released_tags?.[host.status.kernel]?.[host.status.version] || '';
+export const coveredTag = (status, host) => status.released_tags?.[hostTrack(host)]?.[host.status.version] || '';
 export function knownKernels(status) {
-  return [...new Set([...status.tracks.map(t => t.kernel), ...status.hosts.map(h => h.status.kernel), ...status.unpatchable.map(u => u.kernel)].filter(Boolean))].sort();
+  return [...new Set([...status.tracks.map(t => t.kernel), ...status.hosts.map(hostTrack), ...status.unpatchable.map(u => u.kernel)].filter(Boolean))].sort();
 }
 export function builderNote(status, kernel) {
   const series = [['5.15.0-', 'jammy'], ['6.8.0-', 'noble'], ['7.0.0-', 'resolute']].find(([prefix]) => kernel.startsWith(prefix) && kernel.endsWith('-generic'))?.[1] || '';

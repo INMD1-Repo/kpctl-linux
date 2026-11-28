@@ -25,10 +25,16 @@
 
   "test_vm": { "enabled": false },
 
-  "sign_command": [
-    "/usr/src/linux-headers-6.8.0-85-generic/scripts/sign-file",
-    "sha256", "/etc/kpctl/keys/mok.priv", "/etc/kpctl/keys/mok.der", "{module}"
-  ],
+  "signing": {
+    "mode": "always",
+    "keys": [{
+      "id": "prod-2026",
+      "active": true,
+      "cert": "/etc/kpctl/signing/prod-2026/module.der",
+      "sign_command": ["/usr/src/linux-headers-{kernel}/scripts/sign-file", "sha256",
+        "/etc/kpctl/signing/prod-2026/module.priv", "/etc/kpctl/signing/prod-2026/module.der", "{module}"]
+    }]
+  },
 
   "scheduler": {},
   "drain_check_seconds": 300
