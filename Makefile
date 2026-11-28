@@ -59,13 +59,22 @@ dist: web
 	   deploy/systemd/kpctl-dnsmasq.service deploy/systemd/kpctl-autoenroll.service deploy/systemd/kpctl-autoenroll.timer \
 	   configs/controller.example.json configs/host-mgmt-netplan.example.yaml dist/controller/
 	cp -R deploy/testvm dist/controller/
-	cp bin/kpctl-builder deploy/setup-builder.sh deploy/kpctl-kernel-debug.sh deploy/systemd/kpctl-builder.service configs/builder.example.json dist/builder/
-	cp deploy/kpctl-kernel-inputs.py deploy/kpctl-native-builder.py deploy/native_inputs.py dist/builder/
-	cp deploy/setup-native-builder.sh deploy/kpctl-native-work.sh deploy/systemd/kpctl-native-builder.service deploy/systemd/kpctl-native-builder.timer dist/builder/
-	cp deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py dist/builder/
-	cp -R deploy/kpatch-fixes dist/builder/
-	cp deploy/setup-build-environment.sh deploy/kpctl-build-environment.py dist/builder/
-	cp -R deploy/build-environment dist/builder/
+	# 빌더는 배포판별 전용 묶음으로 나눕니다: Ubuntu(setup-builder.sh)와 Debian·Rocky(setup-native-builder.sh).
+	# kpctl install-builder 는 호스트 배포판·대상 커널 이름에 맞는 묶음 하나만 보냅니다 (internal/remote/builder.go).
+	# 맨 위 kpctl-builder 는 컨트롤러가 빌드 서버 자동 업데이트에 쓰는 사본입니다 (builder_binary 기본값).
+	mkdir -p dist/builder/ubuntu dist/builder/debian dist/builder/rocky
+	cp bin/kpctl-builder dist/builder/
+	cp bin/kpctl-builder deploy/setup-builder.sh deploy/kpctl-kernel-debug.sh deploy/systemd/kpctl-builder.service configs/builder.example.json \
+	   deploy/kpctl-kernel-inputs.py deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py \
+	   deploy/setup-build-environment.sh deploy/kpctl-build-environment.py dist/builder/ubuntu/
+	cp -R deploy/kpatch-fixes deploy/build-environment dist/builder/ubuntu/
+	for d in debian rocky; do \
+	  cp bin/kpctl-builder deploy/setup-native-builder.sh deploy/kpctl-native-builder.py deploy/native_inputs.py deploy/kpctl-native-work.sh \
+	     deploy/systemd/kpctl-native-builder.service deploy/systemd/kpctl-native-builder.timer \
+	     deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py dist/builder/$$d/ && \
+	  cp -R deploy/kpatch-fixes dist/builder/$$d/ || exit 1; \
+	done
+	for d in ubuntu debian rocky; do echo $$d > dist/builder/$$d/builder-flavor; done
 	cp -R dist/builder/. dist/controller/builder/  # kpctl install-builder 가 SSH 로 보낼 묶음 + 빌드 서버 자동 업데이트용 kpctl-builder
 
 clean:

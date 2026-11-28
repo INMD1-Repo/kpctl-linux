@@ -6,7 +6,7 @@
 
 1. 개발 환경에서 `make test`와 `make dist`를 실행해 설치 묶음을 만듭니다. 웹 재빌드에는 [web/package.json](../../web/package.json)에 맞는 Node.js/npm이 필요합니다.
 2. `dist/controller/`를 [컨트롤러 서버](controller.md)에 설치하고 관리자·빌더·등록 토큰과 TLS 신뢰를 준비합니다.
-3. 대상 LTS와 같은 Ubuntu 시리즈의 서버에 [빌더](builder.md)를 준비합니다. 컨트롤러에서 `sudo kpctl install-builder <빌드 서버>` 한 번으로 묶음 복사·설정·설치까지 끝나며, 직접 `dist/builder/`를 전달해 설치할 수도 있습니다. 기본 설치는 대상 GCC별 rootless sandbox입니다.
+3. 대상 LTS와 같은 Ubuntu 시리즈의 서버에 [빌더](builder.md)를 준비합니다. 컨트롤러에서 `sudo kpctl install-builder <빌드 서버>` 한 번으로 묶음 복사·설정·설치까지 끝나며, 직접 `dist/builder/ubuntu/`를 전달해 설치할 수도 있습니다. 기본 설치는 대상 GCC별 rootless sandbox입니다.
 4. GA generic 커널을 실행하는 호스트에 `dist/agent/` 또는 관리자 CLI로 [에이전트](agent.md)를 설치합니다.
 5. [서명과 MOK 상태](../operations/secure-boot.md), [승인 전 VM 검사](../features/test-vm.md#f22)를 구성한 뒤 카나리부터 승인합니다.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Debian 12·Rocky 9·10 AMD64 네이티브 빌더 설치. dist/builder 에서 root 로 실행합니다 (보통 kpctl install-builder 가 SSH 로 실행).
+# Debian 12·Rocky 9·10 AMD64 네이티브 빌더 설치. dist/builder/debian 또는 dist/builder/rocky 에서 root 로 실행합니다 (보통 kpctl install-builder 가 SSH 로 실행).
 #
 # 빌더 호스트는 대상과 같은 배포판·릴리스의 전용 VM 입니다. 이 스크립트는 그 VM 에
 #   배포판 공식 빌드 도구 → (Debian 12·Rocky 9) 고정 kpatch → 전용 계정·디렉터리 → 공식 패키징 Git
@@ -132,6 +132,11 @@ check_host() {
       [[ ${RELEASE_TYPE:-stable} == stable && $desc != *beta* && $desc != *candidate* && $desc != *" rc"* ]] || fail "Rocky 정식 릴리스가 필요합니다" ;;
     *) fail "지원하지 않는 릴리스: $DISTRO $VERSION_ID (Debian 12·Rocky 9·10 지원)" ;;
   esac
+  # make dist 의 배포판별 묶음에는 builder-flavor(debian | rocky) 가 있습니다. 다른 배포판 묶음이면 설치하지 않습니다.
+  if [[ -f $HERE/builder-flavor ]]; then
+    local flavor; flavor=$(tr -d '[:space:]' < "$HERE/builder-flavor")
+    [[ $flavor == "$DISTRO" ]] || fail "이 묶음은 ${flavor:-?} 빌더용입니다 ($DISTRO 호스트에는 dist/builder/$DISTRO 를 쓰세요)"
+  fi
   [[ $(uname -m) == x86_64 ]] || fail "AMD64 전용 빌더입니다"
   [[ ! -x $AGENT ]] || fail "에이전트가 설치된 운영 호스트입니다"
   local virt flag target

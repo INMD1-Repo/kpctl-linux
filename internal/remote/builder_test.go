@@ -1,4 +1,4 @@
-// 이 파일: remote 패키지의 TestInstallBuilderCopiesBundleAndRunsSetup 회귀 시험 (가짜 ssh/scp 로 로컬 실행).
+// 이 파일: remote 패키지의 InstallBuilder·배포판별 빌더 묶음(OpenBuilderBundle) 회귀 시험 (가짜 ssh/scp 로 로컬 실행).
 package remote
 
 import (
@@ -53,7 +53,7 @@ func TestInstallBuilderCopiesBundleAndRunsSetup(t *testing.T) {
 		t.Skip("bash 없음")
 	}
 	bundle := t.TempDir()
-	for _, f := range builderBundleFiles {
+	for _, f := range ubuntuBuilderFiles {
 		p := filepath.Join(bundle, f)
 		if f == "kpatch-fixes" || f == "build-environment" {
 			if err := os.MkdirAll(p, 0o755); err != nil {
@@ -133,7 +133,7 @@ func TestInstallNativeBuilderCopiesBundleAndRunsSetup(t *testing.T) {
 		t.Skip("bash 없음")
 	}
 	bundle := t.TempDir()
-	for _, f := range builderBundleFiles {
+	for _, f := range nativeBuilderFiles {
 		p := filepath.Join(bundle, f)
 		if f == "kpatch-fixes" || f == "build-environment" {
 			if err := os.MkdirAll(p, 0o755); err != nil {
@@ -209,6 +209,117 @@ echo "기타 출력"
 		s := &Session{SSH: &SSH{SSHBin: "/nonexistent-ssh"}, Target: "x", Facts: Facts{UID: "0"}}
 		if err := s.InstallNativeBuilder(&Bundle{Dir: bundle}, NativeBuilderInstallOptions{Worker: []byte("{}"), Token: tok}); err == nil || strings.Contains(s.Log.String(), "mktemp") {
 			t.Errorf("토큰 %q: err=%v log=%s", tok, err, s.Log.String())
+		}
+	}
+}
+
+// writeFlavorBundle 은 root/<flavor>/ 에 그 종류 전용 묶음을 만듭니다. kpctl-builder 는 ELF 아키텍처만 읽으므로 시험 바이너리로 대신합니다.
+func writeFlavorBundle(t *testing.T, root, flavor, marker string) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	elfData, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, flavor)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range BuilderBundleFiles(flavor) {
+		p, body := filepath.Join(dir, f), []byte("x")
+		switch f {
+		case "kpatch-fixes", "build-environment":
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		case "kpctl-builder":
+			body = elfData
+		case builderFlavorMarker:
+			body = []byte(marker + "\n")
+		}
+		if err := os.WriteFile(p, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func TestOpenBuilderBundleFlavors(t *testing.T) {
+	root := t.TempDir()
+	ub := writeFlavorBundle(t, root, FlavorUbuntu, FlavorUbuntu)
+	rk := writeFlavorBundle(t, root, FlavorRocky, FlavorRocky)
+	bs, err := OpenBuilderBundle(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(bs.Flavors(), ","); got != "ubuntu,rocky" || bs.Arch == "" {
+		t.Fatalf("Flavors=%s Arch=%q", got, bs.Arch)
+	}
+	if b, err := bs.Flavor(FlavorUbuntu); err != nil || b.Dir != ub {
+		t.Errorf("ubuntu: %v %v", b, err)
+	}
+	if b, err := bs.Flavor(FlavorRocky); err != nil || b.Dir != rk {
+		t.Errorf("rocky: %v %v", b, err)
+	}
+	if _, err := bs.Flavor(FlavorDebian); err == nil || !strings.Contains(err.Error(), "Debian 전용 묶음(debian/)") {
+		t.Errorf("debian 묶음이 없는데 err=%v", err)
+	}
+
+	// Ubuntu 묶음에는 네이티브 빌더 파일이, 네이티브 묶음에는 Ubuntu 전용 파일이 없어야 합니다 (서로 영향 없음)
+	for _, f := range ubuntuBuilderFiles {
+		if f == "setup-builder.sh" || f == "build-environment" || f == "builder.example.json" {
+			for _, nf := range nativeBuilderFiles {
+				if nf == f {
+					t.Errorf("네이티브 묶음에 Ubuntu 전용 %s", f)
+				}
+			}
+		}
+	}
+	for _, f := range []string{"setup-native-builder.sh", "kpctl-native-builder.py", "kpctl-native-builder.timer"} {
+		if _, err := os.Stat(filepath.Join(ub, f)); err == nil {
+			t.Errorf("Ubuntu 묶음에 %s", f)
+		}
+	}
+}
+
+func TestOpenBuilderBundleRejects(t *testing.T) {
+	// 표식이 다른 종류
+	root := t.TempDir()
+	writeFlavorBundle(t, root, FlavorDebian, FlavorRocky)
+	if _, err := OpenBuilderBundle(root); err == nil || !strings.Contains(err.Error(), `"rocky" 입니다 ("debian" 여야 함)`) {
+		t.Errorf("표식 불일치: %v", err)
+	}
+	// 파일 빠짐
+	root = t.TempDir()
+	dir := writeFlavorBundle(t, root, FlavorUbuntu, FlavorUbuntu)
+	if err := os.Remove(filepath.Join(dir, "setup-builder.sh")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenBuilderBundle(root); err == nil || !strings.Contains(err.Error(), "setup-builder.sh 가 없습니다") {
+		t.Errorf("파일 누락: %v", err)
+	}
+	// 나뉘기 전 통합 묶음
+	root = t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "setup-builder.sh"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenBuilderBundle(root); err == nil || !strings.Contains(err.Error(), "통합 묶음") {
+		t.Errorf("통합 묶음: %v", err)
+	}
+	// 빈 디렉터리
+	if _, err := OpenBuilderBundle(t.TempDir()); err == nil || !strings.Contains(err.Error(), "묶음이 없습니다") {
+		t.Errorf("빈 디렉터리: %v", err)
+	}
+}
+
+func TestFactsBuilderFlavor(t *testing.T) {
+	for distro, want := range map[string]string{"ubuntu": FlavorUbuntu, "debian": FlavorDebian, "rocky": FlavorRocky, "almalinux": "", "": ""} {
+		if got := (Facts{Distro: distro}).BuilderFlavor(); got != want {
+			t.Errorf("%q → %q, want %q", distro, got, want)
 		}
 	}
 }

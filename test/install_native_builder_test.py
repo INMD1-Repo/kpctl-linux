@@ -111,6 +111,19 @@ class NativeInstall(unittest.TestCase):
             self.assertIn(reason, p.stderr)
         self.assertFalse(self.calls.exists())
 
+    def test_bundle_flavor_marker_must_match_host(self):
+        # make dist 의 dist/builder/<종류>/builder-flavor 가 호스트 os-release ID 와 다르면 설치하지 않습니다
+        marker = self.root / "builder-flavor"
+        body = 'HERE=$FIXTURE\nmain "$@"'
+        marker.write_text("rocky\n")
+        p = self.setup_command("--plan", "--target", DEB, body=body)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("rocky 빌더용", p.stderr)
+        marker.write_text("debian\n")
+        p = self.setup_command("--plan", "--target", DEB, body=body)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(self.calls.exists())
+
     def test_packages_use_official_repos_and_signed_srpm(self):
         script = 'parse_args "$@"\ncheck_host\nTEMP=$FIXTURE\ninstall_packages'
         self.fake("apt-get", 'echo "$*" >> "$FIXTURE/calls"')

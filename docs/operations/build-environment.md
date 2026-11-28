@@ -8,7 +8,7 @@
 
 ## 설치와 준비
 
-배포 묶음 `dist/builder`에서 실제 대상 커널을 지정합니다. `--plan`은 계획을 출력하고, `--no-start`는 서비스 시작을 보류합니다.
+Ubuntu 배포 묶음 `dist/builder/ubuntu`에서 실제 대상 커널을 지정합니다. `--plan`은 계획을 출력하고, `--no-start`는 서비스 시작을 보류합니다.
 
 ```sh
 sudo ./setup-builder.sh --plan --no-cache 6.8.0-85-generic

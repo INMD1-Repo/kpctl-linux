@@ -1,7 +1,8 @@
 // 이 파일: kpctl install-builder — SSH 로 빌드 서버를 한 번에 설치
 //
-// kpctl install 의 빌더판입니다. 점검 → dist/builder 묶음 복사 → builder.json(컨트롤러 주소·빌더 토큰·CA) 작성 →
-// setup-builder.sh 실행 → 컨트롤러에 빌더가 보고하는지 확인까지 합니다.
+// kpctl install 의 빌더판입니다. 점검 → 호스트 배포판(os-release)과 대상 커널 이름으로 빌더 종류 결정 →
+// 그 종류 전용 묶음(dist/builder/ubuntu·debian·rocky)만 복사 → 설정(컨트롤러 주소·빌더 토큰·CA) 작성 →
+// setup-builder.sh(Ubuntu) 또는 setup-native-builder.sh(Debian·Rocky) 실행 → 컨트롤러에 빌더가 보고하는지 확인까지 합니다.
 // 실제 SSH 작업은 internal/remote/builder.go 가 합니다.
 package main
 
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"kpctl/internal/client"
@@ -25,6 +27,10 @@ const installBuilderUsage = `사용법: kpctl install-builder [옵션] <호스�
         kpctl install-builder                         (터미널에서 인자 없이: 질문형 설치)
 
   SSH 로 호스트를 점검하고 묶음과 설정을 복사한 뒤 설치와 컨트롤러 보고를 확인합니다. 옵션은 호스트 이름보다 앞에 써야 합니다.
+
+  빌더는 Ubuntu·Debian·Rocky 전용 묶음으로 나뉘어 있습니다 (dist/builder/ubuntu, debian, rocky).
+  대상 커널 이름(6.8.0-136-generic → Ubuntu, 6.1.0-57-amd64 → Debian, ….el9/el10.x86_64 → Rocky)과
+  호스트 OS 를 대조해 맞는 묶음 하나만 복사·설치합니다. 커널과 호스트 배포판이 다르면 설치하지 않습니다.
 
   Ubuntu 빌더에서 대상 커널(예: 6.8.0-136-generic)을 생략하면, 컨트롤러에 등록된 호스트 중 빌드 서버와 같은
   Ubuntu 시리즈의 GA 커널을 자동으로 고릅니다. 커널 인자는 호스트별로 같은 시리즈인 것만 넘깁니다.
@@ -159,6 +165,58 @@ func nativeProofHint(targets []remote.NativeTarget) string {
 	return hint.String()
 }
 
+// kernelFlavor 는 커널 이름(uname -r)으로 그 커널을 빌드할 빌더 묶음 종류를 고릅니다.
+// 6.1.0-57-amd64 처럼 Debian 모양이면 debian, ….el9_9.x86_64 처럼 RHEL 계열이면 rocky, 그 밖의 Ubuntu 모양이면 ubuntu.
+// 커널 이름이 아니면 "".
+func kernelFlavor(k string) string {
+	if d, _ := model.DistributionForABI(k); d != "" {
+		return d
+	}
+	if model.IsDistributionKernelName(k) {
+		if rhelKernel.MatchString(k) {
+			return remote.FlavorRocky
+		}
+		return remote.FlavorDebian
+	}
+	if kernelArg.MatchString(k) {
+		return remote.FlavorUbuntu
+	}
+	return ""
+}
+
+var rhelKernel = regexp.MustCompile(`\.el[0-9]+`)
+
+// kernelsByFlavor 는 대상 커널을 빌더 종류별로 나눕니다 (종류 순서는 remote.BuilderFlavors).
+func kernelsByFlavor(kernels []string) map[string][]string {
+	out := map[string][]string{}
+	for _, k := range kernels {
+		f := kernelFlavor(k)
+		out[f] = append(out[f], k)
+	}
+	return out
+}
+
+// flavorSummary 는 "Ubuntu 빌더: 6.8.0-136-generic · Rocky 빌더: 6.12.0-…" 처럼 커널 이름으로 고른 빌더 안내입니다.
+func flavorSummary(kernels []string) string {
+	by := kernelsByFlavor(kernels)
+	var parts []string
+	for _, f := range remote.BuilderFlavors {
+		if len(by[f]) > 0 {
+			parts = append(parts, fmt.Sprintf("%s 빌더 %s", model.DistroLabel(f), strings.Join(by[f], " ")))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// flavorMismatch 는 지정한 커널이 모두 이 호스트와 다른 배포판 빌더용일 때의 문제 설명입니다. 하나라도 같은 종류면 "".
+func flavorMismatch(kernels []string, flavor, osLabel string) string {
+	if len(kernels) == 0 || len(kernelsByFlavor(kernels)[flavor]) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("지정한 커널은 %s 용인데 이 호스트는 %s 입니다. 빌더는 대상 커널과 같은 배포판에 설치합니다 (커널에 맞는 빌드 서버를 지정하세요)",
+		flavorSummary(kernels), osLabel)
+}
+
 // isKernelArg 는 위치 인자가 호스트가 아니라 커널 이름(uname -r)인지 봅니다. Debian/Rocky 모양도 커널로 봅니다.
 func isKernelArg(a string) bool {
 	return kernelArg.MatchString(a) || model.IsDistributionKernelName(a)
@@ -171,14 +229,17 @@ var managedSetupArgs = map[string]string{
 }
 
 // defaultBuilderBundleDir: KPCTL_BUILDER_BUNDLE → kpctl 실행 파일 옆 builder/ → /usr/local/share/kpctl/builder
+// 묶음 디렉터리 아래에 배포판별 전용 묶음 ubuntu/, debian/, rocky/ 가 있습니다.
 func defaultBuilderBundleDir() string {
 	if d := os.Getenv("KPCTL_BUILDER_BUNDLE"); d != "" {
 		return d
 	}
 	if exe, err := os.Executable(); err == nil {
 		d := filepath.Join(filepath.Dir(exe), "builder")
-		if _, err := os.Stat(filepath.Join(d, "setup-builder.sh")); err == nil {
-			return d
+		for _, f := range remote.BuilderFlavors {
+			if _, err := os.Stat(filepath.Join(d, f, "builder-flavor")); err == nil {
+				return d
+			}
 		}
 	}
 	return "/usr/local/share/kpctl/builder"
@@ -309,7 +370,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	fs := flag.NewFlagSet("install-builder", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprintln(os.Stderr, installBuilderUsage); fs.PrintDefaults() }
 	r := addRemoteFlags(fs)
-	fs.Lookup("bundle").Usage = "빌더 설치 묶음 디렉터리 (dist/builder 전체; 기본: kpctl 옆 builder/ 또는 /usr/local/share/kpctl/builder)"
+	fs.Lookup("bundle").Usage = "빌더 설치 묶음 디렉터리 (ubuntu/·debian/·rocky/ 가 든 dist/builder 전체; 기본: kpctl 옆 builder/ 또는 /usr/local/share/kpctl/builder)"
 	fs.Lookup("bundle").DefValue = defaultBuilderBundleDir()
 	r.bundleDir = defaultBuilderBundleDir()
 	tokenDir := os.Getenv("KPCTL_TOKEN_DIR")
@@ -362,7 +423,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		return nil, err
 	}
 	r.ssh.Timeout = *timeout
-	bundle, err := remote.OpenBuilderBundle(r.bundleDir)
+	bundles, err := remote.OpenBuilderBundle(r.bundleDir)
 	if err != nil {
 		return nil, err
 	}
@@ -387,8 +448,10 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		if len(token) < 16 {
 			return nil, fmt.Errorf("빌더 토큰이 너무 짧습니다 (%s)", *tokenFile)
 		}
-		if config, err = builderConfig(bundle, *ctrlURL, token, *caFile); err != nil {
-			return nil, err
+		if ub, err := bundles.Flavor(remote.FlavorUbuntu); err == nil { // Ubuntu 묶음이 없으면 Ubuntu 호스트에서 Flavor 가 거부
+			if config, err = builderConfig(ub, *ctrlURL, token, *caFile); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -422,7 +485,20 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	if *checkOnly {
 		mode = "점검"
 	}
-	fmt.Printf("빌드 서버 %d대 %s 시작 (동시 %d대, 빌더 %s, 컨트롤러 %s)\n\n", len(hosts), mode, r.parallel, bundle.Arch, *ctrlURL)
+	fmt.Printf("빌드 서버 %d대 %s 시작 (동시 %d대, 빌더 %s, 묶음 %s, 컨트롤러 %s)\n", len(hosts), mode, r.parallel, bundles.Arch, strings.Join(bundles.Flavors(), "·"), *ctrlURL)
+	if len(kernels) > 0 {
+		fmt.Printf("대상 커널 이름으로 고른 빌더: %s\n", flavorSummary(kernels))
+	}
+	fmt.Println()
+	var assignedMu sync.Mutex
+	assigned := map[string]bool{} // 어느 호스트의 대상이 된 지정 커널
+	assign := func(ks ...string) {
+		assignedMu.Lock()
+		defer assignedMu.Unlock()
+		for _, k := range ks {
+			assigned[k] = true
+		}
+	}
 
 	results := runAll(hosts, r.parallel, func(target string) (res hostResult) {
 		s := &remote.Session{SSH: r.loginFor(target), Target: target, OnStep: progress}
@@ -430,7 +506,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 
 		// 1) 점검
 		problems, warnings, err := s.Preflight(remote.PreflightOptions{
-			ForBuilder: true, Arch: bundle.Arch, ControllerURL: *ctrlURL, Series: series,
+			ForBuilder: true, Arch: bundles.Arch, ControllerURL: *ctrlURL, Series: series,
 			StopBuilder: *stopRunning, AllowWithAgent: *force,
 		})
 		res.hostname = s.Facts.Hostname
@@ -438,11 +514,38 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			return hostResult{result: "접속 실패", note: err.Error()}
 		}
 
+		// 빌더 종류: 호스트 OS(os-release) 기준. 실행 중인 커널 이름이 다른 배포판 모양이면 알려 주고,
+		// 지정한 대상 커널이 모두 다른 배포판용이거나 그 종류 전용 묶음이 없으면 -force 로도 설치하지 않습니다
+		// (빌더는 대상과 같은 배포판에서 빌드하며, 다른 배포판 묶음을 대신 보내지 않습니다).
+		flavor := s.Facts.BuilderFlavor()
+		var bundle *remote.Bundle
+		if flavor != "" {
+			if kf := kernelFlavor(s.Facts.Kernel); kf != "" && kf != flavor {
+				warnings = append(warnings, fmt.Sprintf("호스트 OS 는 %s 인데 실행 중인 커널 %s 는 %s 커널 이름입니다. OS 기준으로 %s 빌더를 설치합니다",
+					s.Facts.OSLabel(), s.Facts.Kernel, model.DistroLabel(kf), model.DistroLabel(flavor)))
+			}
+			hard := false
+			if m := flavorMismatch(kernels, flavor, s.Facts.OSLabel()); m != "" {
+				problems, hard = append(problems, m), true
+			}
+			if bundle, err = bundles.Flavor(flavor); err != nil {
+				problems, hard = append(problems, err.Error()), true
+			}
+			if hard {
+				for _, w := range warnings {
+					progress(target, "경고: "+w)
+				}
+				res.result, res.note = "점검 실패", strings.Join(problems, "\n")
+				return res
+			}
+		}
+
 		if s.Facts.IsNativeBuilderOS() {
 			return installNativeOnHost(c, s, nativeRun{
 				target: target, problems: problems, warnings: warnings, kernels: kernels, registered: registeredNative,
 				hostMode: hostMode, noStart: noStart, checkOnly: *checkOnly, force: *force, stopRunning: *stopRunning,
 				resetConfig: *resetConfig, ctrlURL: *ctrlURL, caFile: *caFile, token: token, setupArgs: setupArgs, bundle: bundle,
+				assign: assign,
 			}, res)
 		}
 
@@ -472,9 +575,10 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			res.result, res.note = "점검 실패", strings.Join(problems, "\n")
 			return res
 		}
+		assign(hostKernels...)
 		if *checkOnly {
 			res.ok, res.result = true, "점검 통과"
-			res.note = fmt.Sprintf("%s %s, 커널 %s", s.Facts.Codename, s.Facts.Arch, strings.Join(hostKernels, " "))
+			res.note = fmt.Sprintf("%s %s, Ubuntu 빌더, 커널 %s", s.Facts.Codename, s.Facts.Arch, strings.Join(hostKernels, " "))
 			return res
 		}
 
@@ -504,9 +608,15 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			return res
 		}
 		res.ok, res.result = true, "설치 완료"
-		res.note = fmt.Sprintf("%s, 시리즈 %s, 커널 %s", b.Name, b.Series, strings.Join(b.Kernels, " "))
+		res.note = fmt.Sprintf("%s, Ubuntu 빌더, 시리즈 %s, 커널 %s", b.Name, b.Series, strings.Join(b.Kernels, " "))
 		return res
 	})
+	// 지정했지만 어느 호스트의 대상도 되지 못한 커널 (예: Rocky 커널을 Ubuntu 빌드 서버에만 지정)
+	for _, k := range kernels {
+		if !assigned[k] {
+			fmt.Printf("경고: 대상 커널 %s (%s 빌더용) 을 맡은 빌드 서버가 없습니다. 같은 배포판·릴리스의 빌드 서버를 지정하세요\n", k, model.DistroLabel(kernelFlavor(k)))
+		}
+	}
 	return results, printResults(results, r.logDir)
 }
 
@@ -544,7 +654,8 @@ type nativeRun struct {
 	ctrlURL, caFile    string
 	token              string
 	setupArgs          []string
-	bundle             *remote.Bundle
+	bundle             *remote.Bundle       // 이 호스트 배포판 전용 묶음 (dist/builder/debian 또는 rocky)
+	assign             func(abis ...string) // 대상이 된 지정 커널 기록 (nil 이면 기록 안 함)
 }
 
 // nativeSetupArgs 는 setup-native-builder.sh 가 받는 "--" 뒤 옵션입니다 (나머지는 Ubuntu setup-builder.sh 전용).
@@ -595,6 +706,9 @@ func installNativeOnHost(c *client.Client, s *remote.Session, n nativeRun, res h
 	var labels []string
 	for _, t := range targets {
 		labels = append(labels, t.ABI)
+	}
+	if n.assign != nil {
+		n.assign(labels...)
 	}
 	if n.checkOnly {
 		res.ok, res.result = true, "점검 통과"

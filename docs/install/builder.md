@@ -6,7 +6,9 @@
 
 ## 컨트롤러에서 한 번에 설치 (권장)
 
-컨트롤러에 SSH 키가 등록된 빌드 서버라면 컨트롤러에서 명령 하나로 설치합니다. `kpctl install-builder`는 사전 점검(sudo·아키텍처·지원 시리즈·컨트롤러 접속·실행 중인 빌더) → `/usr/local/share/kpctl/builder` 묶음 복사 → 컨트롤러 주소·`/etc/kpctl/tokens/builder.token`·CA로 `builder.json` 작성 → `setup-builder.sh` 실행 → 컨트롤러에 빌더 보고 확인까지 진행합니다. 토큰은 명령줄이 아닌 표준 입력으로 전달되고 임시 디렉터리는 끝나면 지웁니다.
+컨트롤러에 SSH 키가 등록된 빌드 서버라면 컨트롤러에서 명령 하나로 설치합니다. `kpctl install-builder`는 사전 점검(sudo·아키텍처·지원 시리즈·컨트롤러 접속·실행 중인 빌더) → 배포판 전용 묶음 선택·복사 → 컨트롤러 주소·`/etc/kpctl/tokens/builder.token`·CA로 `builder.json` 작성 → `setup-builder.sh` 실행 → 컨트롤러에 빌더 보고 확인까지 진행합니다. 토큰은 명령줄이 아닌 표준 입력으로 전달되고 임시 디렉터리는 끝나면 지웁니다.
+
+빌더 묶음은 배포판별로 나뉩니다. `/usr/local/share/kpctl/builder`(= `make dist`의 `dist/builder`) 아래 `ubuntu/`(setup-builder.sh), `debian/`·`rocky/`(setup-native-builder.sh)가 있고, 각 묶음의 `builder-flavor` 파일이 종류를 적습니다. `install-builder`는 호스트 os-release와 대상 커널 이름(`6.8.0-136-generic` → Ubuntu, `6.1.0-57-amd64` → Debian, `….el9`·`….el10….x86_64` → Rocky)을 대조해 맞는 묶음 하나만 보냅니다. 지정한 커널이 모두 다른 배포판용이거나 그 배포판 묶음이 없으면 `-force`로도 설치하지 않습니다. 따라서 Debian·Rocky 빌더 파일이 바뀌어도 Ubuntu 빌드 서버로 가는 묶음은 바뀌지 않습니다. 맨 위 `kpctl-builder`는 빌드 서버 자동 업데이트(`builder_binary`)용 사본입니다.
 
 헷갈리면 터미널에서 인자 없이 `sudo kpctl install-builder`만 실행합니다. 빌드 서버 주소, SSH 접속 계정(저장한 키와 계정을 보여 줌), 빌드 서비스 계정, 대상 커널, 메모리, ccache, 재설치 여부를 차례로 묻습니다. 그다음 같은 설치를 다시 할 수 있는 명령줄을 보여 주고, 점검 → 설치 확인 → 설치 순서로 진행합니다. 점검에서 접속에 실패하면 그 자리에서 `ssh-key copy`로 키를 등록하고 다시 점검할 수 있습니다. 이 질문에 `N`을 선택하면 점검을 통과한 빌드 서버만 표시됩니다. 목록을 확인하고 Enter를 누르면 해당 서버에 설치합니다.
 
@@ -59,10 +61,10 @@ sudo kpctl install-builder build-jammy 5.15.0-160-generic -- --memory-mib 16384 
 }
 ```
 
-`dist/builder/` 전체가 필요합니다. 실행 파일만 복사하면 디버그 입력·격리 환경 도우미가 빠집니다. 아래 커널 번호는 설치 명령의 형식 예시이며 최신 배포 버전을 뜻하지 않습니다.
+`dist/builder/ubuntu/` 전체가 필요합니다. 실행 파일만 복사하면 디버그 입력·격리 환경 도우미가 빠집니다. 아래 커널 번호는 설치 명령의 형식 예시이며 최신 배포 버전을 뜻하지 않습니다.
 
 ```sh
-cd dist/builder
+cd dist/builder/ubuntu
 sudo ./setup-builder.sh --config /secure/builder.json --ca-file /secure/ca.crt --no-start 6.8.0-136-generic
 sudo -u kpbuild -H /usr/local/bin/kpctl-builder -config /etc/kpctl/builder.json -check-config
 sudo systemctl enable --now kpctl-builder

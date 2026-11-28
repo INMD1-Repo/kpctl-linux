@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -201,28 +202,15 @@ func TestKernelsForSeriesDropsDistributionKernels(t *testing.T) {
 	}
 }
 
-// 에이전트가 설치된 Rocky 운영 호스트에는 -force 로도 설치 단계(임시 디렉터리·묶음 복사·토큰 설정 전송·서비스 중지)로
-// 넘어가지 않아야 합니다 (NativeBuilderHardBlock).
-func TestInstallBuilderForceRefusesNativeAgentHost(t *testing.T) {
-	dir := t.TempDir()
-	bin, bundle, calls := filepath.Join(dir, "bin"), filepath.Join(dir, "bundle"), filepath.Join(dir, "ssh-calls")
-	for _, d := range []string{bin, filepath.Join(bundle, "kpatch-fixes"), filepath.Join(bundle, "build-environment")} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, f := range []string{"setup-builder.sh", "kpctl-builder.service", "kpctl-kernel-debug.sh", "kpctl-kernel-inputs.py", "kpctl-kpatch-fixes.sh",
-		"kpctl-kpatch-cold-test.py", "setup-build-environment.sh", "kpctl-build-environment.py",
-		"setup-native-builder.sh", "kpctl-native-builder.py", "native_inputs.py", "kpctl-native-work.sh", "kpctl-native-builder.service", "kpctl-native-builder.timer"} {
-		if err := os.WriteFile(filepath.Join(bundle, f), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	exe, err := os.Executable() // ELF 아키텍처만 읽으므로 시험 바이너리로 대신합니다
+// writeBuilderBundles 는 root/<종류>/ 에 배포판별 빌더 묶음(make dist 의 dist/builder)을 만듭니다.
+// kpctl-builder 는 ELF 아키텍처만 읽으므로 시험 바이너리로 대신합니다.
+func writeBuilderBundles(t *testing.T, root string, flavors ...string) {
+	t.Helper()
+	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(exe)
+	elfData, err := os.ReadFile(exe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,40 +218,163 @@ func TestInstallBuilderForceRefusesNativeAgentHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, key := filepath.Join(dir, "builder.token"), filepath.Join(dir, "id_test")
-	for p, body := range map[string][]byte{filepath.Join(bundle, "kpctl-builder"): data, filepath.Join(bundle, "builder.example.json"): example,
-		token: []byte("builder-token-0123456789abcdef\n"), key: nil} {
-		if err := os.WriteFile(p, body, 0o600); err != nil {
+	for _, flavor := range flavors {
+		dir := filepath.Join(root, flavor)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
+		for _, f := range remote.BuilderBundleFiles(flavor) {
+			var body []byte
+			switch f {
+			case "kpatch-fixes", "build-environment":
+				if err := os.MkdirAll(filepath.Join(dir, f), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			case "kpctl-builder":
+				body = elfData
+			case "builder.example.json":
+				body = example
+			case "builder-flavor":
+				body = []byte(flavor + "\n")
+			}
+			if err := os.WriteFile(filepath.Join(dir, f), body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	arch, err := remote.OpenBuilderBundle(bundle)
-	if err != nil {
+}
+
+func TestKernelFlavor(t *testing.T) {
+	for k, want := range map[string]string{
+		"6.8.0-136-generic":             remote.FlavorUbuntu,
+		"5.15.0-140-generic":            remote.FlavorUbuntu,
+		"6.8.0-1020-aws":                remote.FlavorUbuntu,
+		"6.1.0-57-amd64":                remote.FlavorDebian,
+		"6.12.118+deb13-amd64":          remote.FlavorDebian,
+		"6.12.0-264.21.1.el10_3.x86_64": remote.FlavorRocky,
+		"5.14.0-570.12.1.el9_6.x86_64":  remote.FlavorRocky,
+		"4.18.0-553.el8_10.x86_64":      remote.FlavorRocky, // 지원 밖이어도 RHEL 계열 모양이면 rocky 빌더용
+		"build-01":                      "",
+	} {
+		if got := kernelFlavor(k); got != want {
+			t.Errorf("kernelFlavor(%s) = %q, want %q", k, got, want)
+		}
+	}
+	ks := []string{"6.12.0-264.21.1.el10_3.x86_64", "6.8.0-136-generic", "6.1.0-57-amd64"}
+	if got := flavorSummary(ks); got != "Ubuntu 빌더 6.8.0-136-generic · Debian 빌더 6.1.0-57-amd64 · Rocky 빌더 6.12.0-264.21.1.el10_3.x86_64" {
+		t.Errorf("flavorSummary = %q", got)
+	}
+	if m := flavorMismatch(ks, remote.FlavorDebian, "Debian 12"); m != "" {
+		t.Errorf("Debian 커널이 하나라도 있으면 불일치가 아님: %q", m)
+	}
+	if m := flavorMismatch(nil, remote.FlavorDebian, "Debian 12"); m != "" {
+		t.Errorf("커널 생략은 불일치가 아님: %q", m)
+	}
+	if m := flavorMismatch([]string{"6.8.0-136-generic"}, remote.FlavorRocky, "Rocky 10"); !strings.Contains(m, "Ubuntu 빌더 6.8.0-136-generic 용인데 이 호스트는 Rocky 10") {
+		t.Errorf("flavorMismatch = %q", m)
+	}
+}
+
+// fakeBuilderHost 는 사전 점검(bash -s) 명령에 주어진 사실을 돌려주고 받은 원격 명령을 calls 에 적는 가짜 ssh 를 PATH 앞에 둡니다.
+func fakeBuilderHost(t *testing.T, dir, facts string) (calls string) {
+	t.Helper()
+	bin := filepath.Join(dir, "bin")
+	calls = filepath.Join(dir, "ssh-calls")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fake := "#!/bin/bash\necho \"${@: -1}\" >> " + calls + "\ncat >/dev/null\ncat <<'FACTS'\nhostname=rocky10-host\nuid=0\narch=" + arch.Arch +
-		"\nkernel=6.12.0-264.21.1.el10_3.x86_64\nsudo=ok\ncontroller=200\nnameresolves=yes\nagent=installed\nrole=host\ndistro=rocky\nrelease=10.1\ncodename=\nrelease_type=stable\nx86v3=yes\nvirt=kvm\ncontainer=none\nsystemd=yes\nvarfree=209715200\nnativebuilderactive=yes\nnativebuilderconfig=no\nFACTS\n"
+	fake := "#!/bin/bash\necho \"${@: -1}\" >> " + calls + "\ncat >/dev/null\ncat <<'FACTS'\n" + facts + "FACTS\n"
 	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("KPCTL_SSH_KEY", key)
-	t.Setenv("KPCTL_BUILDER_BUNDLE", bundle)
+	return calls
+}
 
-	// 커널을 지정해도 등록 호스트 track 대조를 위해 컨트롤러 상태를 읽습니다
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"hosts":[],"builders":{}}`)) }))
-	defer srv.Close()
-	c, err := client.New(srv.URL, "admin-token-0123456789", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	results, err := runBuilderInstall(c, []string{"-force", "-stop-running", "-builder-token-file", token, "-log-dir", filepath.Join(dir, "logs"),
-		"-controller-url", "https://ctl:8443", "10.0.0.175", "6.12.0-264.21.1.el10_3.x86_64"})
-	if err == nil || len(results) != 1 || results[0].ok || results[0].result != "점검 실패" || !strings.Contains(results[0].note, "-force 로도 넘길 수 없음") {
-		t.Fatalf("results=%+v err=%v", results, err)
-	}
+func onlyPreflight(t *testing.T, calls string) {
+	t.Helper()
 	got, _ := os.ReadFile(calls)
 	if n := strings.Count(string(got), "\n"); n != 1 || !strings.HasPrefix(string(got), "bash -s -- ") {
 		t.Fatalf("사전 점검 외의 원격 명령이 실행됐습니다:\n%s", got)
 	}
+}
+
+func builderTestClient(t *testing.T) *client.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"hosts":[],"builders":{}}`)) }))
+	t.Cleanup(srv.Close)
+	c, err := client.New(srv.URL, "admin-token-0123456789", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+const rocky10Facts = "hostname=rocky10-host\nuid=0\narch=%s\nkernel=6.12.0-264.21.1.el10_3.x86_64\nsudo=ok\ncontroller=200\nnameresolves=yes\nagent=%s\nrole=host\ndistro=rocky\nrelease=10.1\ncodename=\nrelease_type=stable\nx86v3=yes\nvirt=kvm\ncontainer=none\nsystemd=yes\nvarfree=209715200\nnativebuilderactive=yes\nnativebuilderconfig=no\n"
+
+// 대상 커널 이름이 다른 배포판용이거나, 호스트 배포판 전용 묶음이 없으면 -force 로도 복사·설치 단계로 넘어가지 않습니다.
+func TestInstallBuilderPicksBundleByKernelName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flavors []string
+		kernel  string
+		want    string
+	}{
+		{"Ubuntu 커널을 Rocky 호스트에", []string{"ubuntu", "debian", "rocky"}, "6.8.0-136-generic", "Ubuntu 빌더 6.8.0-136-generic 용인데 이 호스트는 Rocky"},
+		{"Debian 커널을 Rocky 호스트에", []string{"ubuntu", "debian", "rocky"}, "6.1.0-57-amd64", "Debian 빌더 6.1.0-57-amd64 용인데 이 호스트는 Rocky"},
+		{"Rocky 묶음 없음", []string{"ubuntu", "debian"}, "6.12.0-264.21.1.el10_3.x86_64", "Rocky 전용 묶음(rocky/)이 없습니다"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bundle, token, key := filepath.Join(dir, "bundle"), filepath.Join(dir, "builder.token"), filepath.Join(dir, "id_test")
+			writeBuilderBundles(t, bundle, tc.flavors...)
+			for p, body := range map[string]string{token: "builder-token-0123456789abcdef\n", key: ""} {
+				if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bs, err := remote.OpenBuilderBundle(bundle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := fakeBuilderHost(t, dir, fmt.Sprintf(rocky10Facts, bs.Arch, "none"))
+			t.Setenv("KPCTL_SSH_KEY", key)
+			t.Setenv("KPCTL_BUILDER_BUNDLE", bundle)
+			results, err := runBuilderInstall(builderTestClient(t), []string{"-force", "-stop-running", "-builder-token-file", token, "-log-dir", filepath.Join(dir, "logs"),
+				"-controller-url", "https://ctl:8443", "10.0.0.175", tc.kernel})
+			if err == nil || len(results) != 1 || results[0].ok || results[0].result != "점검 실패" || !strings.Contains(results[0].note, tc.want) {
+				t.Fatalf("results=%+v err=%v", results, err)
+			}
+			onlyPreflight(t, calls)
+		})
+	}
+}
+
+// 에이전트가 설치된 Rocky 운영 호스트에는 -force 로도 설치 단계(임시 디렉터리·묶음 복사·토큰 설정 전송·서비스 중지)로
+// 넘어가지 않아야 합니다 (NativeBuilderHardBlock).
+func TestInstallBuilderForceRefusesNativeAgentHost(t *testing.T) {
+	dir := t.TempDir()
+	bundle, token, key := filepath.Join(dir, "bundle"), filepath.Join(dir, "builder.token"), filepath.Join(dir, "id_test")
+	writeBuilderBundles(t, bundle, remote.BuilderFlavors...)
+	for p, body := range map[string]string{token: "builder-token-0123456789abcdef\n", key: ""} {
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bs, err := remote.OpenBuilderBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := fakeBuilderHost(t, dir, fmt.Sprintf(rocky10Facts, bs.Arch, "installed"))
+	t.Setenv("KPCTL_SSH_KEY", key)
+	t.Setenv("KPCTL_BUILDER_BUNDLE", bundle)
+
+	// 커널을 지정해도 등록 호스트 track 대조를 위해 컨트롤러 상태를 읽습니다
+	results, err := runBuilderInstall(builderTestClient(t), []string{"-force", "-stop-running", "-builder-token-file", token, "-log-dir", filepath.Join(dir, "logs"),
+		"-controller-url", "https://ctl:8443", "10.0.0.175", "6.12.0-264.21.1.el10_3.x86_64"})
+	if err == nil || len(results) != 1 || results[0].ok || results[0].result != "점검 실패" || !strings.Contains(results[0].note, "-force 로도 넘길 수 없음") {
+		t.Fatalf("results=%+v err=%v", results, err)
+	}
+	onlyPreflight(t, calls)
 }

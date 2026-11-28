@@ -1,5 +1,5 @@
 #!/bin/bash
-# 새 Ubuntu LTS 빌더 설치. dist/builder에서 root로 실행합니다.
+# 새 Ubuntu LTS 빌더 설치. dist/builder/ubuntu 에서 root로 실행합니다.
 # 기본: 호스트 입력 + rootless 런타임 + 대상 GCC 이미지 + 설정·서비스.
 # 호스트 컴파일 도구 설치는 --host-mode에서만 수행합니다.
 set -euo pipefail
@@ -152,9 +152,13 @@ fi
 for input in "$CONFIG_INPUT" "$CA_INPUT" "$SOURCES"; do
   [ -z "$input" ] || [ -f "$input" ] || { echo "입력 파일 없음: $input" >&2; exit 2; }
 done
-[ -x "$HERE/kpctl-builder" ] || { echo 'make dist로 만든 dist/builder에서 실행하세요' >&2; exit 2; }
-[ -f "$HERE/kpctl-kernel-debug.sh" ] || { echo 'kpctl-kernel-debug.sh가 없습니다. make dist로 만든 전체 dist/builder 묶음을 사용하세요' >&2; exit 2; }
-[ -f "$HERE/kpctl-kernel-inputs.py" ] || { echo 'kpctl-kernel-inputs.py가 없습니다. 전체 dist/builder 묶음을 사용하세요' >&2; exit 2; }
+[ -x "$HERE/kpctl-builder" ] || { echo 'make dist로 만든 dist/builder/ubuntu에서 실행하세요' >&2; exit 2; }
+[ -f "$HERE/kpctl-kernel-debug.sh" ] || { echo 'kpctl-kernel-debug.sh가 없습니다. make dist로 만든 전체 dist/builder/ubuntu 묶음을 사용하세요' >&2; exit 2; }
+[ -f "$HERE/kpctl-kernel-inputs.py" ] || { echo 'kpctl-kernel-inputs.py가 없습니다. 전체 dist/builder/ubuntu 묶음을 사용하세요' >&2; exit 2; }
+# make dist 의 배포판별 묶음 표식. Debian·Rocky 묶음(setup-native-builder.sh 용)으로는 설치하지 않습니다.
+if [ -f "$HERE/builder-flavor" ] && [ "$(tr -d '[:space:]' < "$HERE/builder-flavor")" != ubuntu ]; then
+  echo "이 묶음은 $(tr -d '[:space:]' < "$HERE/builder-flavor") 빌더용입니다. Ubuntu 빌더는 dist/builder/ubuntu 를 쓰세요" >&2; exit 2
+fi
 if systemctl is-active --quiet kpctl-builder; then
   echo '실행 중인 빌더가 있습니다. 새 설치 스크립트이므로 작업 종료 뒤 중지하고 실행하세요.' >&2; exit 1
 fi
