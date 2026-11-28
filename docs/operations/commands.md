@@ -81,6 +81,7 @@ kpctl install -group server -hosts-file hosts.txt
 kpctl uninstall node-01
 kpctl install-builder -check build-noble
 kpctl install-builder build-noble
+kpctl install-builder build-rocky10 6.12.0-264.21.1.el10_3.x86_64 -- --jobs 4
 kpctl install-builder -stop-running build-noble 6.8.0-136-generic -- --memory-mib 16384
 kpctl autoenroll -dry-run
 kpctl dhcp leases
@@ -88,6 +89,10 @@ kpctl ssh-key list
 kpctl ssh-key show -cloud-init > kpctl-client.yaml
 ```
 
-기본 `uninstall`은 적용 중인 라이브패치를 보존합니다. `-remove-patches`를 붙이면 패치 제거도 요청합니다. `install`과 `install-builder`를 터미널에서 인자 없이 실행하면 필요한 값을 하나씩 묻는 질문형 설치가 됩니다. 인자를 주거나 스크립트·타이머에서 실행하면 질문하지 않습니다. `install-builder`는 빌드 서버를 SSH로 한 번에 설치합니다. 커널을 생략하면 등록 호스트 중 같은 시리즈의 GA 커널을 고르며, `--` 뒤 값은 `setup-builder.sh`에 그대로 넘깁니다. SSH 접속 계정은 `-ssh-user`, 빌드 서비스 계정은 `-build-user`로 고릅니다. 실행 중인 빌더는 `-stop-running` 없이는 바꾸지 않습니다. `install -h`, `install-builder -h`, `autoenroll -h`, `bootstrap -h`로 SSH·토큰·묶음 관련 선택지를 확인합니다. `bootstrap` 출력에는 등록 토큰이 있으므로 권한을 제한한 파일로 저장합니다. `ssh-key show -cloud-init`은 컨트롤러 공개키만 넣는 새 VM용 user-data를 출력합니다. 토큰이 없어 템플릿에 둬도 되며, 설치는 자동 등록이 SSH로 합니다.
+기본 `uninstall`은 적용 중인 라이브패치를 보존합니다. `-remove-patches`를 붙이면 패치 제거도 요청합니다. `install`과 `install-builder`를 터미널에서 인자 없이 실행하면 필요한 값을 하나씩 묻는 질문형 설치가 됩니다. 인자를 주거나 스크립트·타이머에서 실행하면 질문하지 않습니다.
+
+`install-builder`는 SSH로 빌드 서버의 OS를 확인합니다. Ubuntu에서는 같은 시리즈의 등록 GA 커널을 고르고 `setup-builder.sh`를 실행합니다. Debian 12·Rocky 9·10 AMD64 전용 VM에서는 `setup-native-builder.sh`가 같은 릴리스의 커널·빌드 ID를 대조하고 타이머를 설치합니다. 커널을 생략하면 식별된 등록 호스트에서 고릅니다. 네이티브 빌더에는 `--` 뒤에 `--jobs N`, `--no-start`를 줄 수 있습니다. 컨트롤러 승인 핀과 수정 후보 제출은 운영자가 맡습니다. [네이티브 빌더 설치 및 승인 절차](distribution-kernels.md#빌더-준비와-입력-고정)
+
+SSH 접속 계정은 `-ssh-user`, 빌드 서비스 계정은 `-build-user`로 고릅니다. 실행 중인 빌더는 `-stop-running` 없이는 바꾸지 않습니다. `install -h`, `install-builder -h`, `autoenroll -h`, `bootstrap -h`로 SSH·토큰·묶음 관련 선택지를 확인합니다. `bootstrap` 출력에는 등록 토큰이 있으므로 권한을 제한한 파일로 저장합니다. `ssh-key show -cloud-init`은 컨트롤러 공개키만 넣는 새 VM용 user-data를 출력합니다. 토큰이 없어 템플릿에 둬도 되며, 설치는 자동 등록이 SSH로 합니다.
 
 근거: [명령 등록](../../cmd/kpctl/main.go), [배포·호스트 명령](../../cmd/kpctl/commands.go), [서명 명령](../../cmd/kpctl/signing.go), [설치 명령](../../cmd/kpctl/install.go), [빌더 설치 명령](../../cmd/kpctl/install_builder.go), [질문형 설치](../../cmd/kpctl/wizard.go).

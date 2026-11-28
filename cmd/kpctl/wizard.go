@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"kpctl/internal/client"
+	"kpctl/internal/model"
 )
 
 // prompter 는 한 줄씩 묻고 답을 읽습니다 (시험에서는 in/out 을 바꿔 끼움).
@@ -247,7 +248,8 @@ func askAgentPlan(p *prompter, dhcpAvailable bool) (*wizardPlan, error) {
 func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 	w := &wizardPlan{command: "install-builder"}
 	fmt.Fprintln(p.out, "■ 빌드 서버 설치 — 질문에 답하면 점검 후 설치합니다. [ ] 안은 엔터를 쳤을 때 값입니다.")
-	fmt.Fprintln(p.out, "  빌드 서버는 패치할 호스트와 같은 Ubuntu 버전(예: 24.04)이어야 하고, 패치 대상 호스트와는 다른 서버여야 합니다.")
+	fmt.Fprintln(p.out, "  빌드 서버는 패치할 호스트와 같은 OS 버전(Ubuntu 22.04·24.04·26.04, Debian 12, Rocky 9·10)이어야 하고,")
+	fmt.Fprintln(p.out, "  패치 대상 호스트와는 다른 서버여야 합니다 (Debian/Rocky 는 같은 릴리스의 전용 VM).")
 	fmt.Fprintln(p.out)
 
 	v, err := p.need("빌드 서버 주소 (여러 대는 공백으로)")
@@ -302,7 +304,7 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 			if why := nativeKernelProblem(f); why != "" {
 				return nil, fmt.Errorf("%s.\n%s", why, nativeBuilderHint)
 			}
-			if !kernelArg.MatchString(f) {
+			if !isKernelArg(f) {
 				bad = f
 			}
 		}
@@ -313,7 +315,19 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 		fmt.Fprintf(p.out, "  %q 는 커널 이름 형식이 아닙니다 (uname -r 값, 예: 6.8.0-136-generic).\n", bad)
 	}
 
+	// 메모리·컴파일러 이미지·ccache 는 Ubuntu setup-builder.sh 전용입니다. Debian/Rocky 커널만 골랐으면 묻지 않습니다
+	// (setup-native-builder.sh 는 이 옵션을 받지 않음).
+	native := len(w.kernels) > 0
+	for _, k := range w.kernels {
+		native = native && model.IsDistributionKernelName(k)
+	}
+	if native {
+		fmt.Fprintln(p.out, "  Debian/Rocky 네이티브 빌더: 메모리·컴파일러 이미지·ccache 질문은 Ubuntu 빌더 전용이라 건너뜁니다.")
+		return askBuilderUpgrade(p, w)
+	}
+
 	fmt.Fprintln(p.out)
+	fmt.Fprintln(p.out, "  아래 세 질문은 Ubuntu 빌더 전용입니다 (Debian/Rocky 빌드 서버면 엔터로 기본값).")
 	for {
 		m, err := p.ask("빌드 메모리 한도 MiB", "12288")
 		if err != nil {
@@ -350,7 +364,11 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 	if !cache {
 		w.setup = append(w.setup, "--no-cache")
 	}
+	return askBuilderUpgrade(p, w)
+}
 
+// askBuilderUpgrade 는 재설치(업그레이드) 여부를 묻습니다. Ubuntu·Debian/Rocky 빌더 공통입니다.
+func askBuilderUpgrade(p *prompter, w *wizardPlan) (*wizardPlan, error) {
 	fmt.Fprintln(p.out)
 	upgrade, err := p.yes("이미 빌더가 설치된 서버를 다시 설치(업그레이드)하는 건가요", false)
 	if err != nil {
@@ -364,7 +382,7 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 		if stop {
 			w.flags = append(w.flags, "-stop-running")
 		}
-		reset, err := p.yes("  기존 builder.json 을 버리고 이 컨트롤러 기준으로 새로 만들까요", false)
+		reset, err := p.yes("  기존 빌더 설정(builder.json 또는 native-builder/worker.json)을 버리고 이 컨트롤러 기준으로 새로 만들까요", false)
 		if err != nil {
 			return nil, err
 		}

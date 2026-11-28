@@ -26,6 +26,13 @@ var builderBundleFiles = []string{
 	"setup-build-environment.sh",
 	"kpctl-build-environment.py",
 	"build-environment",
+	// Debian/Rocky 네이티브 빌더 (native_builder.go, setup-native-builder.sh)
+	"setup-native-builder.sh",
+	"kpctl-native-builder.py",
+	"native_inputs.py",
+	"kpctl-native-work.sh",
+	"kpctl-native-builder.service",
+	"kpctl-native-builder.timer",
 }
 
 // OpenBuilderBundle 은 빌더 설치 묶음에 필요한 파일이 다 있는지 확인하고 kpctl-builder 의 아키텍처를 읽습니다.

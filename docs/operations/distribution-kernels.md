@@ -40,9 +40,23 @@ Rocky 10 kernel-core의 config에는 로컬 빌드를 위해 지운 CONFIG_SYSTE
 
 ## 빌더 준비와 입력 고정
 
-빌더는 전용 비특권 사용자와 해당 정식 릴리스의 격리된 VM 또는 rootless 컨테이너를 사용한다. Debian은 공식 archive keyring으로 검증한 signed apt root, Rocky는 해당 배포판 키로 CHECKSUM 서명과 OCI 이미지 SHA256을 확인한 root에서 준비했다. 신뢰하는 원본 배포 환경에서 소스와 빌드 툴을 읽기 전용으로 제공하고, 매번 별도의 쓰기 가능한 작업 디렉터리를 제공한다. 패키지를 실행 호스트에 설치할 필요는 없다.
+대상과 같은 배포판·릴리스의 AMD64 전용 VM을 준비한다. Debian 12 bookworm, Rocky 9·10 정식 릴리스에서 빌드할 수 있다. VM은 systemd로 부팅하고 `/var`에 40 GiB 이상을 확보한다. 커널이 여럿이면 80 GiB 이상을 권장한다. Rocky 10에는 x86-64-v3 CPU가 필요하다. 에이전트가 설치된 패치 대상 호스트, 컨테이너, Debian 13 기본 커널은 `-force`로도 설치할 수 없다.
 
-`kpctl install-builder`와 `setup-builder.sh`는 Ubuntu 빌드 서버 전용이다. Debian·Rocky 커널 이름(예: `6.12.0-264.21.1.el10_3.x86_64`, `6.1.0-57-amd64`)을 인자로 주면 SSH 접속 전에, Debian·Rocky 호스트를 지정하면 사전 점검에서 `/etc/os-release`를 읽은 뒤 설치 파일을 보내기 전에 이 절차를 안내하고 중단한다. `-force`로도 진행하지 않는다.
+컨트롤러에서 `kpctl install-builder <전용 VM> [커널]`을 실행한다. 커널을 생략하면 같은 배포판·릴리스의 식별된 등록 호스트에서 고른다. 커널을 지정해도 같은 ABI의 등록 track이 있으면 빌드 ID를 포함해 prepare 영수증과 대조한다.
+
+```sh
+sudo kpctl install-builder -check build-rocky10
+sudo kpctl install-builder build-rocky10 6.12.0-264.21.1.el10_3.x86_64 -- --jobs 4
+sudo kpctl install-builder build-bookworm 6.1.0-57-amd64
+```
+
+설치 스크립트는 공식 저장소에서 빌드 패키지를 준비하고, 전용 계정(기본 `kpbuild`)으로 패키징 Git의 정식 릴리스를 찾아 대상별 영수증을 만든다. `/opt/kpctl/native-builder/`에는 드라이버와 작업 스크립트가, `/usr/local/bin/kpctl-builder`에는 모듈 검증기가 설치된다. 작업 루트 `/var/lib/kpctl-native/`의 `inputs/`에는 Git, `cache/`에는 서명 패키지, `work/`에는 임시 빌드 파일이 들어간다. `tracks/<track>/base.json`은 선택한 계획이고 `base-proof.json`은 빌더가 확인한 영수증이다. `/etc/kpctl/native-builder/`의 `worker.json`과 별도 `token` 파일은 root 소유이며 빌드 그룹만 읽을 수 있다. CA를 지정했다면 `/etc/kpctl/tls/ca.crt`에 설치한다.
+
+설치 직후 `kpctl-native-builder.timer`가 샌드박스 서비스에서 트랙별 작업을 조회한다. `-- --no-start`로 설치했다면 빌더에서 `sudo systemctl enable --now kpctl-native-builder.timer`로 시작한다. 재설치 전에는 진행 중인 작업을 확인하고 `-stop-running`을 사용한다. 이번에 지정하지 않은 기존 트랙은 계속 조회하므로 설치 경고를 확인한다.
+
+승인 핀은 운영자가 별도로 준비한다. 독립된 신뢰 환경에서 같은 계획과 정식 입력으로 `prepare`를 다시 실행하고 영수증의 track을 대상의 `kpctl-agent -identify` 결과와 대조한다. 독립 검증 영수증을 컨트롤러의 `data_dir/distribution-proofs/<track>.json`에 설치한다. [후보 검토와 작업 실행](#후보-검토와-작업-실행)에 따라 이후 릴리스의 승인 핀도 준비하고, 사람이 검토한 수정만 빌더에서 `collect`로 제출한다.
+
+다음은 수동으로 같은 기준 입력을 준비할 때 사용하는 패키지와 Git 경로다.
 
 - Debian 빌드 이미지에는 배포판의 git, python3, dpkg-dev, gpgv, gcc, make, binutils, kmod, libelf-dev, libssl-dev, bc, bison, flex, cpio, xz-utils, zstd, dwarves 및 필요한 커널 build dependencies를 준비한다. 예시 GCC 버전은 bookworm `gcc-12 (Debian 12.2.0-14+deb12u1) 12.2.0`, trixie `x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0`이다.
 - Rocky 격리 이미지에서 공식 BaseOS/AppStream/CRB와 배포판 키를 사용해 rpm-build, rpmdevtools, cpio, git, gnupg2, gcc, make, elfutils-libelf-devel, kmod, 패키징 매크로와 정확한 SRPM의 BuildRequires를 준비한다. `dnf builddep /path/kernel-<NVR>.src.rpm`으로 의존성을 확인한다. Rocky 10 klp-build에는 patchutils(recountdiff), xxhash-libs와 xxhash-devel 0.8 이상이 필요했다. 두 xxhash 패키지는 Rocky 10 공식 devel 저장소의 서명된 0.8.2-11.el10이었다. 고정한 실제 GCC는 Rocky 9 11.5.0-17, Rocky 10 14.4.1-5였다.
@@ -91,7 +105,7 @@ Rocky 10의 위와 같은 BaseOS 계획에는 `release=10`, 기준 버전 `6.12.
 ```sh
 umask 077
 mkdir -p /work/cache /work/tmp
-driver=/opt/kpctl/builder/kpctl-native-builder.py
+driver=/opt/kpctl/native-builder/kpctl-native-builder.py
 args=(--plan base.json --cache /work/cache --work-dir /work/tmp)
 python3 "$driver" history --plan base.json
 python3 "$driver" prepare "${args[@]}" --fetch > base-proof.json
