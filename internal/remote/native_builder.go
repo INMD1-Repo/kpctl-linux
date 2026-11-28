@@ -12,6 +12,7 @@
 package remote
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -216,3 +217,60 @@ func (s *Session) InstallNativeBuilder(b *Bundle, o NativeBuilderInstallOptions)
 }
 
 var nativeTempDir = regexp.MustCompile(`^/tmp/kpctl-native-builder\.[a-zA-Z0-9]{6}$`)
+
+const fetchNativeProofsScript = `python3 -I - <<'PY'
+import json
+from pathlib import Path
+out = []
+tracks = Path("/var/lib/kpctl-native/tracks")
+if tracks.is_dir():
+    for folder in sorted(tracks.iterdir()):
+        proof = folder / "base-proof.json"
+        if proof.is_file() and not proof.is_symlink():
+            try:
+                data = json.loads(proof.read_text())
+                if data.get("track") == folder.name:
+                    out.append(data)
+            except Exception:
+                pass
+print(json.dumps(out))
+PY`
+
+// FetchNativeBaseProofs 는 설치된 네이티브 빌더의 /var/lib/kpctl-native/tracks/*/base-proof.json 중
+// targets 에 해당하는 영수증을 읽어 유효성을 검증한 뒤 돌려줍니다.
+func (s *Session) FetchNativeBaseProofs(targets []NativeTarget) ([]model.DistributionProof, error) {
+	out, err := s.run(s.sudo()+fetchNativeProofsScript, "")
+	if err != nil {
+		return nil, fmt.Errorf("빌더 base-proof.json 읽기 실패: %w", err)
+	}
+	var all []model.DistributionProof
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &all); err != nil {
+		return nil, fmt.Errorf("빌더 base-proof.json 해석 실패: %w", err)
+	}
+	wantedTracks := map[string]bool{}
+	wantedABIs := map[string]bool{}
+	for _, t := range targets {
+		if t.Track != "" {
+			wantedTracks[t.Track] = true
+		} else {
+			wantedABIs[t.ABI] = true
+		}
+	}
+	var matched []model.DistributionProof
+	for _, p := range all {
+		if !p.Valid(p.Track) {
+			continue
+		}
+		k, ok := model.DistributionTrack(p.Track)
+		if !ok {
+			continue
+		}
+		if wantedTracks[p.Track] || wantedABIs[k.ABI] {
+			matched = append(matched, p)
+		}
+	}
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("대상에 일치하는 base-proof.json 을 빌더에서 찾지 못했습니다")
+	}
+	return matched, nil
+}

@@ -360,6 +360,7 @@ type RebootClaim struct {
 
 type NextJobRequest struct {
 	CanCollectReviewed bool   `json:"can_collect_reviewed,omitempty"`
+	CanAutoDiscover    bool   `json:"can_auto_discover,omitempty"`
 	NativeTrack        string `json:"native_track,omitempty"`
 	CanPrerelease      bool   `json:"can_prerelease,omitempty"` // 음수 버전·출시 전 모듈 이름을 처리하는 빌더만 수신
 	Builder            string `json:"builder"`
@@ -419,6 +420,7 @@ type BuildKernelInfo struct {
 
 type BuildTask struct {
 	ReviewedCandidates []ReviewedCandidate `json:"reviewed_candidates,omitempty"`
+	AutoDiscover       bool                `json:"auto_discover,omitempty"`
 	Job                Job                 `json:"job"`
 	Patches            []TaskPatch         `json:"patches"` // 이 순서대로 적용
 	KernelInfo         *BuildKernelInfo    `json:"kernel_info,omitempty"`
@@ -584,6 +586,7 @@ type DiscoveredPatch struct {
 
 type DiscoveredRequest struct {
 	ReviewedBase   *DistributionProof `json:"reviewed_base,omitempty"`
+	AutoPin        bool               `json:"auto_pin,omitempty"`
 	ExpectedActive []string           `json:"expected_active"`
 	Prerelease     bool               `json:"prerelease,omitempty"`
 	Patches        []DiscoveredPatch  `json:"patches"`

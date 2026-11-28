@@ -101,7 +101,7 @@ kpctl ssh-key show -cloud-init > kpctl-client.yaml
 
 - 기본 `uninstall`은 적용 중인 라이브패치를 보존하며, `-remove-patches`를 붙이면 패치 제거도 요청합니다.
 - `install`과 `install-builder`를 터미널에서 인자 없이 실행하면 필요한 값을 하나씩 묻는 질문형 설치가 됩니다. 인자를 주거나 스크립트·타이머에서 실행하면 질문하지 않습니다.
-- `install-builder`는 SSH로 빌드 서버의 OS를 확인합니다. Ubuntu에서는 같은 시리즈의 등록 GA 커널을 고르고 `setup-builder.sh`를 실행합니다. Debian 12·Rocky 9·10 AMD64 전용 VM에서는 `setup-native-builder.sh`가 같은 릴리스의 커널·빌드 ID를 대조하고 타이머를 설치합니다. 커널을 생략하면 식별된 등록 호스트에서 고르며, 네이티브 빌더에는 `--` 뒤에 `--jobs N`, `--no-start`를 줄 수 있습니다. [네이티브 빌더 설치 및 승인 절차](distribution-kernels.md#빌더-준비와-입력-고정)
+- `install-builder`는 SSH로 빌드 서버의 OS를 확인합니다. Ubuntu에서는 같은 시리즈의 등록 GA 커널을 고르고 `setup-builder.sh`를 실행합니다. Debian 12·Rocky 9·10 AMD64 전용 VM에서는 `setup-native-builder.sh`가 같은 릴리스의 커널·빌드 ID를 대조하고 타이머를 설치한 뒤, 기본적으로 컨트롤러에 기준 승인 핀(`base-proof.json`)을 자동 등록하고 최신 공식 릴리스 자동 수집·시험 컴파일·누적 빌드를 켭니다(수동 독립 핀 검증을 쓰려면 `-no-auto-pin`). 커널을 생략하면 식별된 등록 호스트에서 고르며, 네이티브 빌더에는 `--` 뒤에 `--jobs N`, `--no-start`를 줄 수 있습니다. [네이티브 빌더 설치 및 승인 절차](distribution-kernels.md#빌더-준비와-입력-고정)
 - SSH 접속 계정은 `-ssh-user`, 빌드 서비스 계정은 `-build-user`로 고릅니다. 실행 중인 빌더는 `-stop-running` 없이는 바꾸지 않습니다. `install -h`, `install-builder -h`, `autoenroll -h`, `bootstrap -h`로 상세 옵션을 확인하세요.
 - `bootstrap` 출력에는 등록 토큰이 있으므로 권한을 제한한 파일로 저장합니다. `ssh-key show -cloud-init`은 컨트롤러 공개키만 넣는 새 VM용 user-data를 출력하므로 템플릿에 둬도 됩니다.
 

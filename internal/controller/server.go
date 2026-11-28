@@ -118,6 +118,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/patches/{id}/diff", s.admin(s.handlePatchDiff))
 	m.HandleFunc("GET /api/audit", s.admin(s.handleAudit))
 	m.HandleFunc("POST /api/auto", s.admin(s.handleAutoPause))
+	m.HandleFunc("POST /api/distribution-proofs/base", s.admin(s.handleInstallBaseProof))
 	m.HandleFunc("POST /api/kernels/{kernel}/auto", s.admin(s.handleAutoHold))
 	m.HandleFunc("POST /api/kernels/{kernel}/commits/{commit}/exclude", s.admin(s.handleExcludeCommit))
 	m.HandleFunc("DELETE /api/kernels/{kernel}/commits/{commit}/exclude", s.admin(s.handleCancelExcludeCommit))

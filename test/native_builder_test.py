@@ -107,6 +107,146 @@ class NativeFixtures(unittest.TestCase):
         self.assertEqual(results[0]["distribution_proof"], base)
         self.assertTrue(results[0]["success"])
 
+    def test_auto_discover_and_collect(self):
+        track = "native__debian__12__amd64__6.1.0-55-amd64__6.1.192-1__" + "a" * 40
+        base = dict(track=track, revision="1" * 40, signer="05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0",
+                    source_sha256="2" * 64, package_sha256="3" * 64)
+        fixed_rev = "4" * 40
+        fixed = dict(abi="6.1.0-56-amd64", version="6.1.192-2", revision=fixed_rev,
+                     signer=base["signer"], source_sha256="5" * 64, package_sha256="6" * 64)
+        plan = dict(distro="debian", release="12", suite="bookworm-security", abi="6.1.0-55-amd64",
+                    version="6.1.192-1", revision=base["revision"], git="repo", keyring="key")
+        old, new = self.root / "auto-old", self.root / "auto-new"
+        for tree, bad_val, ok_val in ((old, "int a = 0;\n", "int b = 0;\n"), (new, "int a = 1;\n", "int b = 1;\n")):
+            (tree / "fs").mkdir(parents=True)
+            (tree / "fs/bad.c").write_text(bad_val)
+            (tree / "fs/ok.c").write_text(ok_val)
+        for name, payload in (("auto-base.json", plan), ("auto-proof.json", base), ("auto-worker.json", {"builder": "native"})):
+            (self.root / name).write_text(json.dumps(payload))
+        module = self.root / "auto.ko"
+        module.write_bytes(b"fixture")
+        tried_files, submitted = [], []
+
+        def fake_discover(suite_plan, cache, work, fetch, limit=4):
+            if suite_plan["suite"] == "bookworm-security":
+                return [dict(suite_plan, abi=fixed["abi"], version=fixed["version"], revision=fixed_rev)]
+            return []
+
+        def fake_prepare(selected, work, cache, fetch, source_only=False):
+            if source_only:
+                return new, {k: fixed[k] for k in ("revision", "signer", "source_sha256", "package_sha256")}
+            return dict(source=old, proof=base)
+
+        def fake_compile(plan, inputs, version, patches, work):
+            text = patches[-1].decode()
+            tried_files.append(text)
+            if "fs/bad.c" in text:
+                raise ValueError("struct changed")
+            return "auto", module
+
+        def fake_request(path, payload=None):
+            if path.endswith("/next"):
+                self.assertTrue(payload["can_auto_discover"])
+                return {"job": {}, "auto_discover": True}
+            if path.endswith("/known"):
+                return {"commits": [], "active_patches": []}
+            if path.endswith("/discovered"):
+                submitted.append(payload)
+                return {"added_patches": 1, "job_id": 1}
+            raise AssertionError(path)
+
+        fetch = self.root / "git"
+        fetch.write_text('#!/bin/sh\n[ "$GIT_ALLOW_PROTOCOL" = https ] && '
+                         '[ "$*" = "-C repo fetch --tags origin +refs/heads/*:refs/remotes/origin/*" ]\n')
+        fetch.chmod(0o755)
+        args = ["driver", "work", "--plan", str(self.root / "auto-base.json"), "--proof", str(self.root / "auto-proof.json"),
+                "--controller", str(self.root / "auto-worker.json"), "--cache", str(self.root), "--work-dir", str(self.root), "--fetch"]
+        with patch.dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}"), \
+                patch.object(sys, "argv", args), \
+                patch.object(nb, "discover", side_effect=fake_discover), \
+                patch.object(nb, "prepare", side_effect=fake_prepare), \
+                patch.object(nb, "git", return_value=ni.SALSA), \
+                patch.object(nb, "Controller") as client, \
+                patch.object(nb, "compile_module", side_effect=fake_compile):
+            client.return_value.request.side_effect = fake_request
+            nb.main()
+        self.assertEqual(len(tried_files), 2)
+        self.assertEqual(len(submitted), 1)
+        self.assertTrue(submitted[0]["auto_pin"])
+        self.assertEqual(submitted[0]["reviewed_base"], base)
+        self.assertEqual(submitted[0]["patches"][0]["title"], "6.1.192-2 (fs/ok.c)")
+        tried_state = json.loads((self.root / "auto-tried.json").read_text())
+        self.assertEqual(len(tried_state), 1)
+        self.assertIn("struct changed", next(iter(tried_state.values())))
+
+    def test_rocky_auto_discover_skips_old_tags_without_prepare(self):
+        track = "native__rocky__10__amd64__6.12.0-264.20.1.el10_3.x86_64__6.12.0-264.20.1.el10_3__" + "a" * 40
+        base = dict(track=track, revision="1" * 40, signer="FC226859C0860BF0DDB95B085B106C736FEDFC85",
+                    source_sha256="2" * 64, package_sha256="3" * 64)
+        plan = dict(distro="rocky", release="10", suite="BaseOS", abi="6.12.0-264.20.1.el10_3.x86_64",
+                    version="6.12.0-264.20.1.el10_3", revision=base["revision"], git="repo", keyring="key")
+        fetch = self.root / "git"
+        fetch.write_text('#!/bin/sh\nexit 0\n')
+        fetch.chmod(0o755)
+        # 1) 새 태그가 없으면 prepare 를 전혀 호출하지 않고 빠르게 종료
+        def git_only_old(_plan, *args):
+            if args[:2] == ("remote", "get-url"):
+                return ni.ROCKY
+            if args[0] == "tag":
+                return "patched/r10/kernel-6.12.0-264.20.1.el10_3\npatched/r10/kernel-6.12.0-264.19.1.el10_3"
+            raise AssertionError(args)
+        with patch.dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}"), \
+                patch.object(nb, "git", side_effect=git_only_old), \
+                patch.object(nb, "newer_version", side_effect=lambda d, a, b: b > a), \
+                patch.object(nb, "prepare", side_effect=AssertionError("old tags must not run prepare")):
+            self.assertFalse(nb.auto_discover_and_collect(None, plan, base, self.root, self.root))
+
+        # 2) 새 Rocky 10 태그가 있으면 그 태그만 선택해 시험 컴파일 후 auto_pin=True 로 제출
+        fixed_rev = "4" * 40
+        fixed = dict(abi="6.12.0-264.21.1.el10_3.x86_64", version="6.12.0-264.21.1.el10_3", revision=fixed_rev,
+                     signer=base["signer"], source_sha256="5" * 64, package_sha256="6" * 64)
+        old, new = self.root / "r10-old", self.root / "r10-new"
+        for tree, val in ((old, "int a = 0;\n"), (new, "int a = 1;\n")):
+            (tree / "mm").mkdir(parents=True)
+            (tree / "mm/truncate.c").write_text(val)
+        module = self.root / "r10.ko"
+        module.write_bytes(b"fixture")
+        submitted = []
+
+        def git_with_new(_plan, *args):
+            if args[:2] == ("remote", "get-url"):
+                return ni.ROCKY
+            if args[0] == "tag":
+                return "patched/r10/kernel-6.12.0-264.21.1.el10_3\npatched/r10/kernel-6.12.0-264.20.1.el10_3"
+            if args[0] == "rev-parse":
+                return fixed_rev
+            if args[0] == "merge-base":
+                return ""
+            raise AssertionError(args)
+
+        def fake_prepare(selected, work, cache, fetch, source_only=False):
+            if source_only:
+                self.assertEqual(selected["version"], fixed["version"])
+                return new, {k: fixed[k] for k in ("revision", "signer", "source_sha256", "package_sha256")}
+            return dict(source=old, proof=base)
+
+        class FakeClient:
+            def request(self, path, payload=None):
+                if path.endswith("/known"):
+                    return {"commits": [], "active_patches": []}
+                submitted.append(payload)
+                return {"added_patches": 1, "job_id": 1}
+
+        with patch.dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}"), \
+                patch.object(nb, "git", side_effect=git_with_new), \
+                patch.object(nb, "newer_version", side_effect=lambda d, a, b: b > a), \
+                patch.object(nb, "prepare", side_effect=fake_prepare), \
+                patch.object(nb, "compile_module", return_value=("r10", module)):
+            self.assertTrue(nb.auto_discover_and_collect(FakeClient(), plan, base, self.root, self.root))
+        self.assertEqual(len(submitted), 1)
+        self.assertTrue(submitted[0]["auto_pin"])
+        self.assertEqual(submitted[0]["patches"][0]["title"], "6.12.0-264.21.1.el10_3 (mm/truncate.c)")
+
     def test_git_packaging_trials_and_job_transport(self):
         for d, r, suite, abi, version in CASES:
             with self.subTest(d=d, r=r):

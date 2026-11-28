@@ -378,3 +378,80 @@ func TestInstallBuilderForceRefusesNativeAgentHost(t *testing.T) {
 	}
 	onlyPreflight(t, calls)
 }
+
+func TestAutoPinNativeBuilder(t *testing.T) {
+	for _, tc := range []struct {
+		name, host, distro, rel, abi, ver, signer string
+	}{
+		{"debian12", "10.0.0.165", "debian", "12", "6.1.0-57-amd64", "6.1.192-3", "05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0"},
+		{"rocky10", "10.0.0.175", "rocky", "10", "6.12.0-264.21.1.el10_3.x86_64", "6.12.0-264.21.1.el10_3", "FC226859C0860BF0DDB95B085B106C736FEDFC85"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := model.DistributionKernel{Distro: tc.distro, Release: tc.rel, Arch: "amd64", ABI: tc.abi, Version: tc.ver, BuildID: strings.Repeat("a", 40)}
+			track := k.Track()
+			proof := model.DistributionProof{
+				Track:         track,
+				Revision:      strings.Repeat("1", 40),
+				SourceSHA256:  strings.Repeat("2", 64),
+				PackageSHA256: strings.Repeat("3", 64),
+				Signer:        tc.signer,
+			}
+			proofListJSON, _ := json.Marshal([]model.DistributionProof{proof})
+
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.MkdirAll(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			fakeSSH := "#!/bin/bash\ncat >/dev/null\nprintf '%s\\n' '" + string(proofListJSON) + "'\n"
+			if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(fakeSSH), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			var pinnedTrack string
+			var autoPinEnabled bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/distribution-proofs/base":
+					var got model.DistributionProof
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode base proof: %v", err)
+					}
+					pinnedTrack = got.Track
+					w.Write([]byte(`{"installed":true}`))
+				case "/api/settings":
+					var got map[string]bool
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode settings: %v", err)
+					}
+					autoPinEnabled = got["native_auto_pin"]
+					w.Write([]byte(`{}`))
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+					w.WriteHeader(404)
+				}
+			}))
+			defer srv.Close()
+
+			c, err := client.New(srv.URL, "admin-token-0123456789", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sess := &remote.Session{
+				SSH:    &remote.SSH{},
+				Target: tc.host,
+				Facts:  remote.Facts{UID: "0"},
+			}
+			if err := autoPinNativeBuilder(c, sess, tc.host, []remote.NativeTarget{{ABI: k.ABI}}); err != nil {
+				t.Fatalf("autoPinNativeBuilder failed: %v", err)
+			}
+			if pinnedTrack != track {
+				t.Fatalf("pinnedTrack=%q, want %q", pinnedTrack, track)
+			}
+			if !autoPinEnabled {
+				t.Fatalf("expected native_auto_pin=true")
+			}
+		})
+	}
+}

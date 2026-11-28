@@ -80,7 +80,10 @@ type Config struct {
 	Rings []int `json:"rings"`
 	// MinSoakMinutes[링] = 이 링으로 promote 하기 전에 이전 링에서 최소 몇 분 관찰할지
 	MinSoakMinutes map[int]int `json:"min_soak_minutes"`
-	AutoRollout    AutoRollout `json:"auto_rollout"`
+	// AutoRollout 은 사람 승인 없이 패치를 배포하는 설정입니다.
+	AutoRollout AutoRollout `json:"auto_rollout"`
+	// NativeAutoPin: Debian/Rocky 네이티브 빌더가 공식 서명 릴리스에서 시험 컴파일을 통과한 수정 후보의 승인 핀을 자동 등록합니다.
+	NativeAutoPin bool `json:"native_auto_pin,omitempty"`
 	// AutoPrepareKernel: 명시한 빌더 범위 밖 호스트에 공식 GA 커널 준비를 요청합니다.
 	// 기존 설치의 동작을 유지하도록 기본은 꺼짐이며, 재부팅 승인과는 별개입니다.
 	AutoPrepareKernel bool `json:"auto_prepare_kernel"`

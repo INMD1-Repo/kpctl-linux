@@ -22,12 +22,13 @@ import (
 
 // Settings 는 실행 중에 바꿀 수 있는 설정입니다.
 type Settings struct {
-	AutoEnabled       bool        `json:"auto_enabled"`        // 자동 배포
-	AutoApproveOnly   bool        `json:"auto_approve_only"`   // 첫 번째 링까지만 자동
-	AutoSoakMinutes   int         `json:"auto_soak_minutes"`   // 자동 승급 전 관찰 시간
-	MinSoakMinutes    map[int]int `json:"min_soak_minutes"`    // 링별 최소 관찰 시간 (수동 promote 에도 적용)
-	HostStaleMinutes  int         `json:"host_stale_minutes"`  // 이 시간 넘게 보고가 없으면 연락 끊김
-	JobTimeoutMinutes int         `json:"job_timeout_minutes"` // 빌드가 이 시간 넘으면 다시 대기열로
+	AutoEnabled       bool        `json:"auto_enabled"`              // 자동 배포
+	AutoApproveOnly   bool        `json:"auto_approve_only"`         // 첫 번째 링까지만 자동
+	AutoSoakMinutes   int         `json:"auto_soak_minutes"`         // 자동 승급 전 관찰 시간
+	NativeAutoPin     bool        `json:"native_auto_pin,omitempty"` // 네이티브 빌더 자동 수집·승인 핀 등록
+	MinSoakMinutes    map[int]int `json:"min_soak_minutes"`          // 링별 최소 관찰 시간 (수동 promote 에도 적용)
+	HostStaleMinutes  int         `json:"host_stale_minutes"`        // 이 시간 넘게 보고가 없으면 연락 끊김
+	JobTimeoutMinutes int         `json:"job_timeout_minutes"`       // 빌드가 이 시간 넘으면 다시 대기열로
 }
 
 // SettingsUpdate 는 POST /api/settings 본문입니다. 비운(null) 항목은 바꾸지 않습니다.
@@ -35,6 +36,7 @@ type SettingsUpdate struct {
 	AutoEnabled       *bool       `json:"auto_enabled"`
 	AutoApproveOnly   *bool       `json:"auto_approve_only"`
 	AutoSoakMinutes   *int        `json:"auto_soak_minutes"`
+	NativeAutoPin     *bool       `json:"native_auto_pin"`
 	MinSoakMinutes    map[int]int `json:"min_soak_minutes"`
 	HostStaleMinutes  *int        `json:"host_stale_minutes"`
 	JobTimeoutMinutes *int        `json:"job_timeout_minutes"`
@@ -54,6 +56,7 @@ func settingsFromConfig(c *Config) Settings {
 	}
 	out := Settings{
 		AutoEnabled: c.AutoRollout.Enabled, AutoApproveOnly: c.AutoRollout.ApproveOnly, AutoSoakMinutes: c.AutoRollout.soak(),
+		NativeAutoPin:  c.NativeAutoPin,
 		MinSoakMinutes: m, HostStaleMinutes: c.HostStaleMinutes, JobTimeoutMinutes: c.JobTimeoutMinutes,
 	}
 	// LoadConfig 를 거치지 않은 설정(테스트 등)에도 같은 기본값
@@ -169,6 +172,10 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request, who s
 	if req.AutoSoakMinutes != nil {
 		note("자동관찰분", next.AutoSoakMinutes, *req.AutoSoakMinutes)
 		next.AutoSoakMinutes = *req.AutoSoakMinutes
+	}
+	if req.NativeAutoPin != nil {
+		note("네이티브자동핀", next.NativeAutoPin, *req.NativeAutoPin)
+		next.NativeAutoPin = *req.NativeAutoPin
 	}
 	if req.HostStaleMinutes != nil {
 		note("연락끊김분", next.HostStaleMinutes, *req.HostStaleMinutes)

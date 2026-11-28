@@ -69,6 +69,22 @@ func (s *Server) handleBuilderNext(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if req.CanAutoDiscover && s.settings().NativeAutoPin {
+				if k, ok := model.DistributionTrack(req.NativeTrack); ok && k.BuildBlock() == "" {
+					if _, hasBase := s.hasValidBaseProof(req.NativeTrack); hasBase {
+						u := st.upstream(req.NativeTrack)
+						if u.CheckedAt.IsZero() || time.Since(u.CheckedAt) >= 30*time.Minute || !u.RefreshRequestedAt.IsZero() {
+							now := time.Now()
+							u.CheckedAt = now
+							if !u.RefreshRequestedAt.IsZero() {
+								u.RefreshRequestedAt, u.RefreshTakenBy, u.RefreshTakenAt = time.Time{}, req.Builder, now
+							}
+							task = &model.BuildTask{AutoDiscover: true}
+							return nil
+						}
+					}
+				}
+			}
 			// 빌드할 작업이 없으면, 관리자가 바로 수집을 요청한 커널을 넘김
 			var refresh []string
 			for kernel, u := range st.Upstream {
@@ -531,6 +547,18 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 				}
 				if err = checkParent(latest, paths, dp.ParentCandidate); err != nil {
 					return fail(409, "%v", err)
+				}
+				if req.AutoPin {
+					if !s.settings().NativeAutoPin {
+						return fail(http.StatusForbidden, "네이티브 자동 승인 핀 등록이 비활성화되어 있습니다")
+					}
+					if req.ReviewedBase == nil {
+						return fail(http.StatusBadRequest, "자동 승인 핀 등록에는 기준 영수증(reviewed_base)이 필요합니다")
+					}
+					_, sum, _ := strings.Cut(candidateID, "/")
+					if err := s.installAutoCandidatePins(*req.ReviewedBase, *dp.FixedRelease, paths, normalizeCVEs(dp.CVEs), dp.ParentCandidate, dp.Title, sum); err != nil {
+						return err
+					}
 				}
 				if req.ReviewedBase != nil {
 					k, _ := model.DistributionTrack(kernel)

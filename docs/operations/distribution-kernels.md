@@ -54,7 +54,9 @@ sudo kpctl install-builder build-bookworm 6.1.0-57-amd64
 
 설치 직후 `kpctl-native-builder.timer`가 샌드박스 서비스에서 트랙별 작업을 조회한다. `-- --no-start`로 설치했다면 빌더에서 `sudo systemctl enable --now kpctl-native-builder.timer`로 시작한다. 재설치 전에는 진행 중인 작업을 확인하고 `-stop-running`을 사용한다. 이번에 지정하지 않은 기존 트랙은 계속 조회하므로 설치 경고를 확인한다.
 
-승인 핀은 운영자가 별도로 준비한다. 독립된 신뢰 환경에서 같은 계획과 정식 입력으로 `prepare`를 다시 실행하고 영수증의 track을 대상의 `kpctl-agent -identify` 결과와 대조한다. 독립 검증 영수증을 컨트롤러의 `data_dir/distribution-proofs/<track>.json`에 설치한다. [후보 검토와 작업 실행](#후보-검토와-작업-실행)에 따라 이후 릴리스의 fixed-proof와 검토한 파일의 candidate-proof를 같은 컨트롤러에 등록한다.
+기본 설치에서는 `kpctl install-builder`가 빌더의 `base-proof.json`을 가져와 컨트롤러 `data_dir/distribution-proofs/<track>.json`에 자동 등록하고 `native_auto_pin` 설정을 켠다. 이 상태에서는 새 공식 서명 릴리스가 나올 때 빌더 타이머가 자동으로 변경된 `.c` 소스를 찾고 시험 컴파일·모듈 검증을 통과한 후보의 `fixed-proof`·`candidate-proof` 등록과 누적 빌드까지 이어서 처리한다. 별도의 독립 신뢰 환경에서 수동으로 핀을 검증·설치하려면 `kpctl install-builder -no-auto-pin`으로 설치하고 아래 수동 절차를 따른다.
+
+수동 독립 검증 시에는 독립된 신뢰 환경에서 같은 계획과 정식 입력으로 `prepare`를 다시 실행하고 영수증의 track을 대상의 `kpctl-agent -identify` 결과와 대조한다. 독립 검증 영수증을 컨트롤러의 `data_dir/distribution-proofs/<track>.json`에 설치한다. [후보 검토와 작업 실행](#후보-검토와-작업-실행)에 따라 이후 릴리스의 fixed-proof와 검토한 파일의 candidate-proof를 같은 컨트롤러에 등록한다.
 
 다음은 수동으로 같은 기준 입력을 준비할 때 사용하는 패키지와 Git 경로다.
 

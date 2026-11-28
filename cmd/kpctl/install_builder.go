@@ -384,6 +384,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	force := fs.Bool("force", false, "점검에서 문제가 나와도 설치 진행 (원인을 알 때만)")
 	stopRunning := fs.Bool("stop-running", false, "실행 중인 kpctl-builder 를 멈추고 다시 설치 (진행 중인 빌드는 실패)")
 	resetConfig := fs.Bool("reset-config", false, "호스트에 있는 builder.json 을 버리고 이 컨트롤러 기준으로 새로 만듦")
+	noAutoPin := fs.Bool("no-auto-pin", false, "네이티브 빌더 설치 후 컨트롤러 승인 핀 자동 등록·자동 수집 활성화를 건너뜀 (수동 독립 검증 사용)")
 	buildUser := fs.String("build-user", "", "빌드 서비스 실행 계정 (비우면 kpbuild, 재설치 때는 기존 서비스 계정). 없으면 만듭니다")
 	timeout := fs.Duration("timeout", 4*time.Hour, "설치 명령 하나의 최대 시간 (커널 git clone·이미지 준비 포함)")
 	if err := fs.Parse(args); err != nil {
@@ -544,7 +545,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			return installNativeOnHost(c, s, nativeRun{
 				target: target, problems: problems, warnings: warnings, kernels: kernels, registered: registeredNative,
 				hostMode: hostMode, noStart: noStart, checkOnly: *checkOnly, force: *force, stopRunning: *stopRunning,
-				resetConfig: *resetConfig, ctrlURL: *ctrlURL, caFile: *caFile, token: token, setupArgs: setupArgs, bundle: bundle,
+				resetConfig: *resetConfig, noAutoPin: *noAutoPin, ctrlURL: *ctrlURL, caFile: *caFile, token: token, setupArgs: setupArgs, bundle: bundle,
 				assign: assign,
 			}, res)
 		}
@@ -651,6 +652,7 @@ type nativeRun struct {
 	checkOnly, force   bool
 	stopRunning        bool
 	resetConfig        bool
+	noAutoPin          bool
 	ctrlURL, caFile    string
 	token              string
 	setupArgs          []string
@@ -731,9 +733,15 @@ func installNativeOnHost(c *client.Client, s *remote.Session, n nativeRun, res h
 		res.result, res.note = "설치 실패", err.Error()
 		return res
 	}
-	hint := "컨트롤러 승인 핀과 수정 후보 준비" + nativeProofHint(targets)
-	progress(n.target, hint)
-	fmt.Fprintln(&s.Log, hint)
+	if n.noAutoPin {
+		hint := "컨트롤러 승인 핀과 수정 후보 준비 (-no-auto-pin)" + nativeProofHint(targets)
+		progress(n.target, hint)
+		fmt.Fprintln(&s.Log, hint)
+	} else if err := autoPinNativeBuilder(c, s, n.target, targets); err != nil {
+		warn := fmt.Sprintf("경고: 컨트롤러 승인 핀 자동 등록 실패 (%v). 수동 등록 안내:%s", err, nativeProofHint(targets))
+		progress(n.target, warn)
+		fmt.Fprintln(&s.Log, warn)
+	}
 	if n.noStart {
 		res.ok, res.result = true, "설치 완료"
 		res.note = "서비스 시작 안 함 (--no-start): systemctl enable --now kpctl-native-builder.timer"
@@ -748,6 +756,32 @@ func installNativeOnHost(c *client.Client, s *remote.Session, n nativeRun, res h
 	res.ok, res.result = true, "설치 완료"
 	res.note = fmt.Sprintf("%s, %s 네이티브 빌더, 커널 %s", b.Name, s.Facts.OSLabel(), strings.Join(labels, " "))
 	return res
+}
+
+// autoPinNativeBuilder 는 네이티브 빌더 설치 직후 생성된 base-proof.json 을 가져와 컨트롤러에 자동 등록하고,
+// 이후 새 공식 릴리스의 수정 후보 자동 수집·승인 핀 등록(native_auto_pin)을 켭니다.
+func autoPinNativeBuilder(c *client.Client, s *remote.Session, target string, targets []remote.NativeTarget) error {
+	progress(target, "컨트롤러 승인 핀 자동 등록 및 자동 수집 활성화")
+	proofs, err := s.FetchNativeBaseProofs(targets)
+	if err != nil {
+		return err
+	}
+	for _, p := range proofs {
+		if err := c.Do("POST", "/api/distribution-proofs/base", p, nil); err != nil {
+			return fmt.Errorf("%s 기준 핀 등록 실패: %w", p.Track, err)
+		}
+		line := fmt.Sprintf("  기준 승인 핀 등록 완료: %s", p.Track)
+		progress(target, line)
+		fmt.Fprintln(&s.Log, line)
+	}
+	on := true
+	if err := c.Do("POST", "/api/settings", map[string]any{"native_auto_pin": on}, nil); err != nil {
+		return fmt.Errorf("네이티브 자동 수집 설정(native_auto_pin) 활성화 실패: %w", err)
+	}
+	note := "  자동화 활성: 새 공식 릴리스가 나오면 빌더가 시험 컴파일 후 자동으로 핀 등록·누적 빌드합니다"
+	progress(target, note)
+	fmt.Fprintln(&s.Log, note)
+	return nil
 }
 
 // nativeExampleKernel 은 안내문에 쓸 그 릴리스의 커널 이름 예입니다 (docs/operations/distribution-kernels.md 표의 값).

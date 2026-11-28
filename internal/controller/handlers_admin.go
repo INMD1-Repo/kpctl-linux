@@ -623,9 +623,15 @@ func (s *Server) handleHostUpdate(w http.ResponseWriter, r *http.Request, who st
 // 아직 빌드하지 않은 활성 패치가 있으면 수집을 기다리지 않고 바로 빌드 작업도 만듭니다.
 func (s *Server) handleKernelRefresh(w http.ResponseWriter, r *http.Request, who string) {
 	kernel := r.PathValue("kernel")
-	if _, native := model.DistributionTrack(kernel); native {
-		writeErr(w, fail(http.StatusBadRequest, "배포판 빌더의 history·changes·collect에서 서명된 수정 릴리스를 선택하세요"))
-		return
+	if k, native := model.DistributionTrack(kernel); native {
+		if reason := k.BuildBlock(); reason != "" {
+			writeErr(w, fail(http.StatusConflict, "%s", reason))
+			return
+		}
+		if !s.settings().NativeAutoPin {
+			writeErr(w, fail(http.StatusBadRequest, "배포판 빌더의 history·changes·collect에서 서명된 수정 릴리스를 선택하세요"))
+			return
+		}
 	}
 	if !validKernel(kernel) {
 		writeErr(w, fail(http.StatusBadRequest, "커널 이름이 잘못됐습니다: %q", kernel))

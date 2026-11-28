@@ -499,3 +499,83 @@ func TestReviewedCandidatePolling(t *testing.T) {
 		t.Fatalf("expected incremental candidate with active parent: %+v", task)
 	}
 }
+
+func TestDistributionAutoPinAndDiscoveryFlow(t *testing.T) {
+	for _, tc := range []struct {
+		name, distro, rel, baseABI, baseVer, fixedABI, fixedVer, signer string
+	}{
+		{"debian12", "debian", "12", "6.1.0-57-amd64", "6.1.192-1", "6.1.0-58-amd64", "6.1.192-2", "05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0"},
+		{"rocky9", "rocky", "9", "5.14.0-741.24.1.el9_9.x86_64", "5.14.0-741.24.1.el9_9", "5.14.0-741.27.1.el9_9.x86_64", "5.14.0-741.27.1.el9_9", "21CB256AE16FC54C6E652949702D426D350D275D"},
+		{"rocky10", "rocky", "10", "6.12.0-264.20.1.el10_3.x86_64", "6.12.0-264.20.1.el10_3", "6.12.0-264.21.1.el10_3.x86_64", "6.12.0-264.21.1.el10_3", "FC226859C0860BF0DDB95B085B106C736FEDFC85"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newAutoServer(t, AutoRollout{})
+			key := testSigningKey(t, "fleet", true)
+			s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{key}}
+			k := model.DistributionKernel{Distro: tc.distro, Release: tc.rel, Arch: "amd64", ABI: tc.baseABI, Version: tc.baseVer, BuildID: strings.Repeat("1", 40)}
+			track := k.Track()
+			base := model.DistributionProof{Track: track, Revision: strings.Repeat("2", 40), SourceSHA256: strings.Repeat("3", 64), PackageSHA256: strings.Repeat("4", 64), Signer: tc.signer}
+			fixed := model.FixedRelease{ABI: tc.fixedABI, Version: tc.fixedVer, Revision: strings.Repeat("a", 40), SourceSHA256: strings.Repeat("5", 64), PackageSHA256: strings.Repeat("6", 64), Signer: base.Signer}
+			delta := "diff --git a/fs/x.c b/fs/x.c\n--- a/fs/x.c\n+++ b/fs/x.c\n@@ -1 +1 @@\n-old\n+new\n"
+
+			baseJSON, _ := json.Marshal(base)
+			// 빌더 토큰으로는 기준 승인 핀 등록 불가 (관리자 전용)
+			callBuilderAPI(t, s, "POST", "/api/distribution-proofs/base", string(baseJSON), 401)
+			// Debian 13 은 관리자도 등록 차단
+			trixie := model.DistributionKernel{Distro: "debian", Release: "13", Arch: "amd64", ABI: "6.12.118+deb13-amd64", Version: "6.12.118-1", BuildID: strings.Repeat("9", 40)}
+			trixieProof := model.DistributionProof{Track: trixie.Track(), Revision: strings.Repeat("2", 40), SourceSHA256: strings.Repeat("3", 64), PackageSHA256: strings.Repeat("4", 64), Signer: "5E04A1E3223A19A20706E20F9904613D4CCE68C6"}
+			trixieJSON, _ := json.Marshal(trixieProof)
+			callAPI(t, s, "POST", "/api/distribution-proofs/base", string(trixieJSON), 409)
+
+			// 관리자가 기준 승인 핀 자동 등록
+			callAPI(t, s, "POST", "/api/distribution-proofs/base", string(baseJSON), 200)
+
+			pollReq, _ := json.Marshal(model.NextJobRequest{Builder: "native-" + tc.name, NativeTrack: track, CanCollectReviewed: true, CanAutoDiscover: true})
+			// native_auto_pin 꺼짐 상태에서는 auto_discover 반환 안 함 + auto_pin 제출 거부
+			callBuilderAPI(t, s, "POST", "/api/builder/next", string(pollReq), 204)
+			discReq, _ := json.Marshal(model.DiscoveredRequest{
+				ReviewedBase:   &base,
+				AutoPin:        true,
+				ExpectedActive: []string{},
+				Patches:        []model.DiscoveredPatch{{Commit: fixed.Revision, FixedRelease: &fixed, Content: delta, Title: tc.fixedVer + " (fs/x.c)"}},
+			})
+			callBuilderAPI(t, s, "POST", "/api/builder/kernels/"+track+"/discovered", string(discReq), 403)
+
+			// native_auto_pin 켜기 → 첫 폴링에서 auto_discover=true, 직후 쿨다운 204, refresh 요청 시 다시 auto_discover=true
+			callAPI(t, s, "POST", "/api/settings", `{"native_auto_pin":true}`, 200)
+			var task model.BuildTask
+			if err := json.Unmarshal([]byte(callBuilderAPI(t, s, "POST", "/api/builder/next", string(pollReq), 200)), &task); err != nil {
+				t.Fatal(err)
+			}
+			if !task.AutoDiscover || task.Job.ID != 0 {
+				t.Fatalf("expected auto_discover task, got %+v", task)
+			}
+			callBuilderAPI(t, s, "POST", "/api/builder/next", string(pollReq), 204)
+			callAPI(t, s, "POST", "/api/kernels/"+track+"/refresh", "", 200)
+			if err := json.Unmarshal([]byte(callBuilderAPI(t, s, "POST", "/api/builder/next", string(pollReq), 200)), &task); err != nil {
+				t.Fatal(err)
+			}
+			if !task.AutoDiscover {
+				t.Fatalf("expected auto_discover after refresh, got %+v", task)
+			}
+
+			// 빌더가 시험 컴파일 통과한 후보를 auto_pin=true 로 제출 → fixed-proof·candidate-proof 자동 저장 + Job 1 생성
+			callBuilderAPI(t, s, "POST", "/api/builder/kernels/"+track+"/discovered", string(discReq), 200)
+
+			// 다음 폴링에서 Job 1 배정 → 모듈 업로드 → 별도 수동 파일 복사 없이 바로 승인 통과
+			if err := json.Unmarshal([]byte(callBuilderAPI(t, s, "POST", "/api/builder/next", string(pollReq), 200)), &task); err != nil {
+				t.Fatal(err)
+			}
+			if task.Job.ID != 1 || len(task.Patches) != 1 {
+				t.Fatalf("expected queued job 1, got %+v", task)
+			}
+			name := model.NativeModuleName(track, 1)
+			raw := klptest.Module(klptest.Options{Modinfo: "name=" + name + "\x00livepatch=Y\x00vermagic=" + k.ABI + " SMP modversions\x00"})
+			resBody, _ := json.Marshal(model.BuildResult{Builder: "native-" + tc.name, JobStartedAt: &task.Job.StartedAt, Success: true, ModuleName: name, ModuleBase64: base64.StdEncoding.EncodeToString(raw), DistributionProof: &base})
+			callBuilderAPI(t, s, "POST", "/api/builder/jobs/1/result", string(resBody), 200)
+			if _, _, _, err := s.approveJob(1, "operator"); err != nil {
+				t.Fatalf("approveJob after auto-pin failed: %v", err)
+			}
+		})
+	}
+}

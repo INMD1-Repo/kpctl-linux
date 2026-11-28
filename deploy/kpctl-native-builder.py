@@ -4,6 +4,7 @@ import argparse
 import base64
 import difflib
 import filecmp
+from functools import cmp_to_key
 import hashlib
 import json
 import os
@@ -265,12 +266,16 @@ def work_once(client, plan, inputs, name, work, prepare_target=None, can_collect
     claim = {"builder": name, "series": plan["distro"] + plan["release"], "native_track": track, "kernels": [track]}
     if can_collect:
         claim["can_collect_reviewed"] = True
+        claim["can_auto_discover"] = True
     task = client.request("/api/builder/next", claim)
     if not task:
         return
     if task.get("reviewed_candidates"):
         require(can_collect and not task["job"].get("id"), "unexpected collection task")
         return task["reviewed_candidates"]
+    if task.get("auto_discover"):
+        require(can_collect and not task.get("job", {}).get("id"), "unexpected auto-discover task")
+        return {"auto_discover": True}
     job = task["job"]
     result = {"builder": name, "job_started_at": job["started_at"]}
     stop = threading.Event()
@@ -419,6 +424,189 @@ def collect_reviewed(client, plan, base_proof, items, cache, work):
     require(not failures, "reviewed collection failed: " + ", ".join(failures))
 
 
+def _patch_paths(content):
+    paths = []
+    for line in content.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) == 4 and parts[2].startswith("a/"):
+                paths.append(parts[2][2:])
+    return paths
+
+
+def _load_auto_tried(state_path):
+    if not state_path or not state_path.is_file():
+        return {}
+    try:
+        data = json.loads(state_path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_auto_tried(state_path, data):
+    if not state_path:
+        return
+    tmp = state_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, state_path)
+
+
+def _discover_newer_releases(plan, cache, work):
+    distro = plan["distro"]
+    found = {}
+    if distro == "rocky":
+        # Rocky 는 공식 Git 태그를 먼저 필터링해 현재 기준보다 확실히 새 릴리스가 있을 때만 SRPM 을 받습니다.
+        rel = plan["release"]
+        prefix = f"patched/r{rel}/kernel-"
+        tags = git(plan, "tag", "--merged", f"refs/remotes/origin/r{rel}",
+                   "--sort=-version:refname", "-l", prefix + "*").splitlines()
+        for tag in tags[:16]:
+            ver = tag.removeprefix(prefix)
+            if not newer_version(distro, plan["version"], ver):
+                continue
+            try:
+                rev = git(plan, "rev-parse", f"refs/tags/{tag}^{{commit}}")
+            except subprocess.SubprocessError:
+                continue
+            if not rev or rev == plan["revision"]:
+                continue
+            try:
+                git(plan, "merge-base", "--is-ancestor", plan["revision"], rev)
+            except subprocess.SubprocessError:
+                continue
+            found.setdefault(rev, dict(plan, suite="BaseOS", abi=ver + ".x86_64", version=ver, revision=rev))
+    else:
+        stable = DEBIAN[plan["release"]][0]
+        for suite in (stable + "-security", stable):
+            suite_plan = {k: plan[k] for k in ("distro", "release", "git", "keyring")}
+            suite_plan["suite"] = suite
+            try:
+                releases = discover(suite_plan, cache, work, True, limit=8)
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
+                print(f"[auto-discover] {suite} 조회 건너뜀: {err}", file=sys.stderr)
+                continue
+            for item in releases:
+                rev = item.get("revision", "")
+                ver = item.get("version", "")
+                if not rev or rev == plan["revision"]:
+                    continue
+                if not newer_version(distro, plan["version"], ver):
+                    continue
+                try:
+                    git(plan, "merge-base", "--is-ancestor", plan["revision"], rev)
+                except subprocess.SubprocessError:
+                    continue
+                found.setdefault(rev, dict(plan, **item))
+    def cmp_rel(a, b):
+        if a["version"] == b["version"]:
+            return 0
+        return -1 if newer_version(distro, a["version"], b["version"]) else 1
+    return sorted(found.values(), key=cmp_to_key(cmp_rel))
+
+
+def auto_discover_and_collect(client, plan, base_proof, cache, work, state_path=None):
+    """공식 서명 릴리스에서 새 커널 수정(.c)을 자동 탐색·시험 컴파일해 컨트롤러에 자동 핀 등록합니다."""
+    origin = SALSA if plan["distro"] == "debian" else ROCKY
+    require(git(plan, "remote", "get-url", "origin") == origin, "wrong packaging Git origin")
+    subprocess.run(["git", "-C", plan["git"], "fetch", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                   env={**os.environ, "GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}, check=True)
+
+    newer = _discover_newer_releases(plan, cache, work)
+    if not newer:
+        return False
+
+    track = base_proof["track"]
+    api_base = "/api/builder/kernels/" + track
+    known = client.request(api_base + "/known") or {}
+    known_commits = set(known.get("commits") or [])
+    active_rows = known.get("active_patches") or []
+    active_ids = []
+    active_bytes = []
+    latest_by_path = {}
+    for row in active_rows:
+        content = row["content"]
+        cid = row["commit"] + "/" + hashlib.sha256(content.encode()).hexdigest()
+        require(cid == row.get("candidate_id"), "active candidate hash mismatch")
+        active_ids.append(cid)
+        active_bytes.append(content.encode())
+        for rel in _patch_paths(content):
+            latest_by_path[rel] = (cid, row.get("fixed_release"))
+
+    tried = _load_auto_tried(state_path)
+    base_inputs = None
+    prev_trees = {}
+
+    for idx, fixed in enumerate(newer):
+        if fixed["revision"] in known_commits:
+            continue
+        with tempfile.TemporaryDirectory(dir=work) as tmp:
+            scratch = Path(tmp)
+            if base_inputs is None:
+                base_inputs = prepare(plan, work / "auto-base", cache, True)
+                require(base_inputs["proof"] == base_proof, "prepared base differs from track receipt")
+            try:
+                fixed_tree, fixed_proof = prepare(fixed, scratch / f"fixed-{idx}", cache, True, source_only=True)
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
+                print(f"[auto-discover] {fixed['version']} 소스 준비 건너뜀: {err}", file=sys.stderr)
+                continue
+            fixed_receipt = {**fixed_proof, "abi": fixed["abi"], "version": fixed["version"]}
+            changed_c = [
+                str(rel) for status, rel in changed_sources(base_inputs["source"], fixed_tree)
+                if status in ("modified", "added") and rel.suffix == ".c"
+                and (not str(rel).startswith("arch/") or str(rel).startswith("arch/x86/"))
+            ]
+            for cidx, rel in enumerate(changed_c):
+                parent_id = ""
+                start_tree = base_inputs["source"]
+                if rel in latest_by_path:
+                    parent_id, prev_fixed = latest_by_path[rel]
+                    if not prev_fixed or not newer_version(plan["distro"], prev_fixed["version"], fixed["version"]):
+                        continue
+                    try:
+                        git(plan, "merge-base", "--is-ancestor", prev_fixed["revision"], fixed["revision"])
+                    except subprocess.SubprocessError:
+                        continue
+                    prev_rev = prev_fixed["revision"]
+                    if prev_rev not in prev_trees:
+                        prev_plan = reviewed_plan(plan, prev_fixed)
+                        prev_tree, _ = prepare(prev_plan, work / f"prev-{prev_rev[:12]}", cache, True, source_only=True)
+                        prev_trees[prev_rev] = prev_tree
+                    start_tree = prev_trees[prev_rev]
+                try:
+                    patch = candidate(start_tree, fixed_tree, [rel])
+                except ValueError:
+                    continue
+                checksum = hashlib.sha256(patch.encode()).hexdigest()
+                candidate_id = fixed["revision"] + "/" + checksum
+                if candidate_id in known_commits or candidate_id in tried:
+                    continue
+                try:
+                    compile_module(plan, base_inputs, 1, active_bytes + [patch.encode()], scratch / f"trial-{cidx}")
+                except (OSError, ValueError, subprocess.SubprocessError) as err:
+                    print(f"[auto-discover] {fixed['version']} {rel} 시험 빌드 건너뜀: {err}", file=sys.stderr)
+                    tried[candidate_id] = str(err)[:400]
+                    _save_auto_tried(state_path, tried)
+                    continue
+                added = dict(
+                    parent_candidate=parent_id,
+                    fixed_release=fixed_receipt,
+                    commit=fixed["revision"],
+                    title=f"{fixed['version']} ({rel})",
+                    cves=[],
+                    content=patch,
+                )
+                req = {
+                    "expected_active": active_ids,
+                    "reviewed_base": base_proof,
+                    "auto_pin": True,
+                    "patches": [added],
+                }
+                print(json.dumps(client.request(api_base + "/discovered", req)))
+                return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["discover", "history", "inspect", "candidate-proof", "prepare", "fixed-proof", "changes", "candidate", "collect", "work"])
@@ -477,7 +665,10 @@ def main():
                 client = Controller(config)
                 items = work_once(client, plan, {"proof": receipt}, config["builder"], work / "build", target_inputs,
                                   can_collect=opts.fetch)
-                if items:
+                if isinstance(items, dict) and items.get("auto_discover"):
+                    auto_discover_and_collect(client, plan, receipt, opts.cache.resolve(), work,
+                                              state_path=opts.proof.parent / "auto-tried.json")
+                elif items:
                     collect_reviewed(client, plan, receipt, items, opts.cache.resolve(), work)
             else:
                 work_once(Controller(config), plan, target_inputs(), config["builder"], work / "build")
