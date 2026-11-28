@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -29,8 +30,6 @@ type SigningConfig struct {
 	Keys []SigningKey `json:"keys"`
 }
 
-var signingKeyID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
-
 func (c *Config) validateSigning() error {
 	if c.Signing == nil {
 		return nil
@@ -47,7 +46,7 @@ func (c *Config) validateSigning() error {
 	active := 0
 	seen := map[string]bool{}
 	for _, key := range c.Signing.Keys {
-		if !signingKeyID.MatchString(key.ID) || seen[key.ID] {
+		if !model.ValidSigningKeyID(key.ID) || seen[key.ID] {
 			return fmt.Errorf("서명 키 ID 가 잘못됐거나 중복됩니다: %q", key.ID)
 		}
 		seen[key.ID] = true
@@ -99,7 +98,11 @@ func (s *Server) signingCerts() ([]model.SigningCert, error) {
 			return nil, fmt.Errorf("서명 키 %s 인증서가 DER X.509 형식이 아닙니다", key.ID)
 		}
 		h := sha256.Sum256(der)
-		if pinned := s.signingCertSHA256[key.ID]; pinned != "" && pinned != hex.EncodeToString(h[:]) {
+		pinned, initialized := s.signingCertSHA256[key.ID]
+		if initialized && pinned == "" {
+			return nil, fmt.Errorf("키 %s의 공개 DER를 준비한 뒤 컨트롤러를 재시작해 지문을 고정하세요", key.ID)
+		}
+		if pinned != "" && pinned != hex.EncodeToString(h[:]) {
 			return nil, fmt.Errorf("서명 키 %s 인증서 변경 감지: 새 키 ID로 교체해야 합니다", key.ID)
 		}
 		certs = append(certs, model.SigningCert{ID: key.ID, SHA256: hex.EncodeToString(h[:]), DER: der, Active: key.Active})
@@ -140,6 +143,9 @@ type signingRotation struct {
 // 오류는 API 응답·감사 로그에 실리므로 도구가 되돌려 준 키 경로가 그대로 노출되지 않게 합니다.
 // 실행 파일 이름(첫 인자)과 치환 자리표시자는 비밀이 아니므로 그대로 둡니다.
 func redactSigningOutput(out string, command []string) string {
+	if strings.Contains(out, "PRIVATE KEY-----") {
+		return "<redacted>"
+	}
 	for i, arg := range command {
 		if i == 0 || arg == "" || strings.Contains(arg, "{") {
 			continue
@@ -152,6 +158,21 @@ func redactSigningOutput(out string, command []string) string {
 func signingBytesSHA256(data []byte) string {
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+func signModule(key SigningKey, kernel, path, unsignedSum string, certDER []byte) (string, error) {
+	out, err := runCommand(key.SignCommand, map[string]string{"module": path, "kernel": kernel}, 5*time.Minute)
+	if err != nil {
+		if filepath.Base(key.SignCommand[0]) == "sign-file" && (errors.Is(err, os.ErrNotExist) || errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrPermission)) {
+			return "", fail(http.StatusInternalServerError, "키 %s: 컨트롤러의 linux-headers-%s 및 서비스 계정의 sign-file 실행 권한 확인: %v", key.ID, kernel, err)
+		}
+		return "", fail(http.StatusInternalServerError, "모듈 서명 실패 (키 %s): %v\n%s", key.ID, err, redactSigningOutput(out, key.SignCommand))
+	}
+	sum, err := verifyModuleSignature(path, unsignedSum, certDER)
+	if err != nil {
+		return "", fail(http.StatusInternalServerError, "모듈 서명 검증 실패 (키 %s): %v", key.ID, err)
+	}
+	return sum, nil
 }
 
 // writeSigningBytes는 서명 전 원본·variant를 임시 파일에서 원자적으로 게시합니다.
@@ -248,8 +269,13 @@ func (s *Server) pinnedUnsignedArtifact(id int, kernel, module string) ([]byte, 
 // 모든 키·모드의 시험이 끝난 뒤 최종 승인 경로에 검증된 바이트만 돌려줍니다.
 func (s *Server) prepareSigningArtifactsWithRotations(id int, kernel, module string) (artifacts map[string]model.SigningArtifact, activeKey string, rotations []signingRotation, err error) {
 	cfg := s.signingConfig()
-	if _, certErr := s.signingCerts(); certErr != nil && (s.cfg.Signing != nil || len(s.signingCertSHA256) > 0) {
+	certs, certErr := s.signingCerts()
+	if certErr != nil && (s.cfg.Signing != nil || len(s.signingCertSHA256) > 0) {
 		return nil, "", nil, certErr
+	}
+	certDER := make(map[string][]byte, len(certs))
+	for _, cert := range certs {
+		certDER[cert.ID] = cert.DER
 	}
 	modes, required := s.testVMRequirements(kernel)
 	shouldSign := cfg.Mode != "never" && (cfg.Mode == "always" || required)
@@ -291,6 +317,7 @@ func (s *Server) prepareSigningArtifactsWithRotations(id int, kernel, module str
 		}
 	})
 	artifacts = map[string]model.SigningArtifact{}
+	unsignedSum := signingBytesSHA256(data)
 	for _, key := range keys {
 		if !needed[key.ID] {
 			continue
@@ -303,19 +330,16 @@ func (s *Server) prepareSigningArtifactsWithRotations(id int, kernel, module str
 			return nil, "", nil, err
 		}
 		signed := shouldSign && len(key.SignCommand) > 0
+		sum := unsignedSum
 		if signed {
-			out, err := runCommand(key.SignCommand, map[string]string{"module": candidate, "kernel": kernel}, 5*time.Minute)
+			sum, err = signModule(key, kernel, candidate, unsignedSum, certDER[key.ID])
 			if err != nil {
-				return nil, "", nil, fail(http.StatusInternalServerError, "모듈 서명 실패 (키 %s): %v\n%s", key.ID, err, redactSigningOutput(out, key.SignCommand))
+				return nil, "", nil, err
 			}
-		}
-		sum, err := fileSHA256(candidate)
-		if err != nil {
-			return nil, "", nil, err
 		}
 		var evidence *model.VMTestResult
 		if s.cfg.TestVM.Enabled {
-			previous, rotation, prevErr := s.previousSigningCandidate(kernel, key, candidateDir, shouldSign)
+			previous, rotation, prevErr := s.previousSigningCandidate(kernel, key, candidateDir, signed, certDER[key.ID])
 			if prevErr != nil {
 				return nil, "", nil, prevErr
 			}
@@ -408,7 +432,7 @@ func (s *Server) previousSigningArtifact(kernel, key string) (string, error) {
 	return s.existingPreviousSigningArtifact(previous, key)
 }
 
-func (s *Server) previousSigningCandidate(kernel string, key SigningKey, candidateDir string, requireSigned bool) (string, *signingRotation, error) {
+func (s *Server) previousSigningCandidate(kernel string, key SigningKey, candidateDir string, requireSigned bool, certDER []byte) (string, *signingRotation, error) {
 	previous := s.deployedSigningJob(kernel)
 	if previous == nil {
 		return "", nil, nil
@@ -417,6 +441,11 @@ func (s *Server) previousSigningCandidate(kernel string, key SigningKey, candida
 	privateOnly := found && !existing.Signed && requireSigned
 	if found && !privateOnly || len(previous.SigningArtifacts) == 0 && s.cfg.Signing == nil && (key.ID == "default" || key.ID == "") {
 		path, err := s.existingPreviousSigningArtifact(previous, key.ID)
+		if err == nil && requireSigned {
+			// Older Signed metadata only recorded signer exit status. Recheck
+			// the released bytes against the selected certificate before reuse.
+			_, err = verifyModuleSignature(path, previous.UnsignedSHA256, certDER)
+		}
 		return path, nil, err
 	}
 	if previous.UnsignedSHA256 == "" {
@@ -433,10 +462,7 @@ func (s *Server) previousSigningCandidate(kernel string, key SigningKey, candida
 	if err := writeSigningBytes(path, data); err != nil {
 		return "", nil, err
 	}
-	if out, err := runCommand(key.SignCommand, map[string]string{"module": path, "kernel": kernel}, 5*time.Minute); err != nil {
-		return "", nil, fail(http.StatusInternalServerError, "이전 누적본 새 키 서명 실패 (키 %s): %v\n%s", key.ID, err, redactSigningOutput(out, key.SignCommand))
-	}
-	checksum, err := fileSHA256(path)
+	checksum, err := signModule(key, kernel, path, previous.UnsignedSHA256, certDER)
 	if err != nil {
 		return "", nil, err
 	}

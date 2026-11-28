@@ -2,9 +2,14 @@
 package model
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
+
+var signingKeyID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+func ValidSigningKeyID(id string) bool { return signingKeyID.MatchString(id) }
 
 // SignaturePolicy는 비어 있거나 읽지 못한 신호도 서명 필요로 판단합니다.
 // BIOS에서도 lockdown 또는 CONFIG_MODULE_SIG_FORCE가 서명을 요구할 수 있습니다.
@@ -47,10 +52,11 @@ type MOKImportRequest struct {
 }
 
 type MOKImportResult struct {
-	ID     string `json:"id"`
-	KeyID  string `json:"key_id"`
-	Status string `json:"status"`
-	Detail string `json:"detail,omitempty"`
+	ID          string `json:"id"`
+	KeyID       string `json:"key_id"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	PasswordSet bool   `json:"password_set,omitempty"` // This request performed the import.
 }
 
 // SigningArtifact는 동일한 모듈 이름을 유지하면서 키별 바이트와 해시를 고정합니다.

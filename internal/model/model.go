@@ -182,6 +182,7 @@ type HostStatus struct {
 	SecurityWarning   string            `json:"security_warning,omitempty"`
 	EnrolledCerts     map[string]string `json:"enrolled_certs,omitempty"`
 	MOKPending        bool              `json:"mok_pending,omitempty"`
+	MOKListEmpty      bool              `json:"mok_list_empty,omitempty"` // Successful --list-new, empty, and no per-cert pending.
 	MOKImport         *MOKImportResult  `json:"mok_import,omitempty"`
 	// KernelSignature: /proc/version_signature. 예: "Ubuntu 6.8.0-85.85-generic 6.8.12"
 	// 빌드 서버가 정확한 기준 태그(Ubuntu-6.8.0-85.85)를 고르고 HWE 커널을 가려낼 때 씁니다.
@@ -232,6 +233,7 @@ type Host struct {
 	RegisteredAt       time.Time           `json:"registered_at"`
 	LastSeen           time.Time           `json:"last_seen"`
 	Status             HostStatus          `json:"status"`
+	MOKRequest         *MOKImportResult    `json:"mok_request,omitempty"` // 관리자 상태 응답용. 요청 ID·키·결과만 표시.
 	RolloutEligibility *RolloutEligibility `json:"rollout_eligibility,omitempty"`
 }
 

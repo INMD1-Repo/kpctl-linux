@@ -28,18 +28,15 @@ type rotationFixture struct {
 	jobJSON  []byte
 }
 
-func rotationPayload(value, key string) string { return value + ":" + key + ":" + testKernel }
-
 func newRotationFixture(t *testing.T) *rotationFixture {
 	t.Helper()
 	s := newAutoServer(t, AutoRollout{})
 	runner := &vmArtifactRunner{}
 	enableArtifactVM(t, s, runner, testvm.Modes{"sb_on", "bios"})
-	signer := vmScript(t, t.TempDir(), "rotation-sign.sh", `printf ':%s:%s' "$2" "$3" >> "$1"`)
 	s.cfg.SignCommand = nil
 	s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{
-		{ID: "old", Active: true, SignCommand: []string{signer, "{module}", "old", "{kernel}"}},
-		{ID: "new", SignCommand: []string{signer, "{module}", "new", "{kernel}"}},
+		testSigningKey(t, "old", true),
+		testSigningKey(t, "new", false),
 	}}
 	previous, module := addArtifactBuilt(t, s, "previous")
 	if _, _, _, err := s.approveJob(previous, "tester"); err != nil {
@@ -90,11 +87,11 @@ func TestSigningRotationBootstrapsPreviousVariantOnlyAfterAllVMTests(t *testing.
 	id, _ := addArtifactBuilt(t, s, "candidate")
 	var newTests atomic.Int32
 	fixture.runner.onModule = func(invocation vmArtifactInvocation) error {
-		if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "new")); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "new")); !ok {
 			return nil
 		}
 		newTests.Add(1)
-		if _, ok := copyWithBytes(invocation, rotationPayload("previous", "new")); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "previous", "new")); !ok {
 			return errors.New("new-key previous variant was not tested")
 		}
 		var published bool
@@ -123,7 +120,7 @@ func TestSigningRotationBootstrapsPreviousVariantOnlyAfterAllVMTests(t *testing.
 			t.Errorf("rotation changed previous identity: %+v", previous)
 		}
 		variant, ok := previous.SigningArtifacts["new"]
-		want := signingBytesSHA256([]byte(rotationPayload("previous", "new")))
+		want := signingBytesSHA256([]byte(expectedPayload(t, s, "previous", "new")))
 		if !ok || !variant.Signed || variant.SHA256 != want || variant.VMTest == nil || variant.VMTest.Status != "passed" || variant.VMTest.SHA256 != want {
 			t.Errorf("previous signed variant lacks exact evidence: %+v", variant)
 		}
@@ -150,7 +147,7 @@ func TestSigningRotationBootstrapsPreviousVariantOnlyAfterAllVMTests(t *testing.
 		}
 	})
 	data, err := os.ReadFile(s.signingArtifactFile(testKernel, fixture.module, "new"))
-	if err != nil || string(data) != rotationPayload("previous", "new") {
+	if err != nil || string(data) != expectedPayload(t, s, "previous", "new") {
 		t.Fatalf("wrong published previous bytes: %q (%v)", data, err)
 	}
 	alias, err := os.ReadFile(s.artifactFile(testKernel, fixture.module))
@@ -186,9 +183,7 @@ func TestSigningRotationFailureNeverPublishesPreviousMetadata(t *testing.T) {
 			s := fixture.s
 			id, currentModule := addArtifactBuilt(t, s, "candidate")
 			if kind == "later-key VM failure" {
-				command := append([]string(nil), s.cfg.Signing.Keys[1].SignCommand...)
-				command[2] = "third"
-				s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, SigningKey{ID: "third", SignCommand: command})
+				s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, testSigningKey(t, "third", false))
 				if err := s.store.Update(func(st *State) error { st.Hosts["gpu-test"].Status.EnrolledCerts["third"] = "enrolled"; return nil }); err != nil {
 					t.Fatal(err)
 				}
@@ -197,29 +192,29 @@ func TestSigningRotationFailureNeverPublishesPreviousMetadata(t *testing.T) {
 				s.cfg.TestVM.Modes = nil
 			}
 			if kind == "previous signer failure" {
-				script := vmScript(t, t.TempDir(), "fail-previous.sh", `printf ':%s:%s' "$2" "$3" >> "$1"
-case "$1" in */previous/*) exit 1 ;; esac`)
-				s.cfg.Signing.Keys[1].SignCommand[0] = script
+				script := vmScript(t, t.TempDir(), "fail-previous.sh", `case "$5" in */previous/*) exit 1 ;; esac
+exec "$@"`)
+				s.cfg.Signing.Keys[1].SignCommand = append([]string{script}, s.cfg.Signing.Keys[1].SignCommand...)
 			}
 			if kind == "current original changed between keys" {
 				t.Setenv("KPCTL_TEST_ROTATION_UNSIGNED", s.unsignedArtifactFile(testKernel, currentModule))
-				script := vmScript(t, t.TempDir(), "change-source.sh", `printf ':%s:%s' "$2" "$3" >> "$1"
-case "$1" in */previous/*) ;; *) printf changed > "$KPCTL_TEST_ROTATION_UNSIGNED" ;; esac`)
-				s.cfg.Signing.Keys[1].SignCommand[0] = script
+				script := vmScript(t, t.TempDir(), "change-source.sh", `case "$5" in */previous/*) ;; *) printf changed > "$KPCTL_TEST_ROTATION_UNSIGNED" ;; esac
+exec "$@"`)
+				s.cfg.Signing.Keys[1].SignCommand = append([]string{script}, s.cfg.Signing.Keys[1].SignCommand...)
 			}
 			fixture.runner.onModule = func(invocation vmArtifactInvocation) error {
 				if kind == "new-key VM failure" {
-					if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "new")); ok {
+					if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "new")); ok {
 						return errors.New("new key VM rejected")
 					}
 				}
 				if kind == "later-key VM failure" {
-					if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "third")); ok {
+					if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "third")); ok {
 						return errors.New("later key VM rejected")
 					}
 				}
 				if kind == "outer fleet check" {
-					if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "new")); ok {
+					if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "new")); ok {
 						return s.store.Update(func(st *State) error {
 							st.Hosts["new-sb-off"] = &model.Host{ID: "new-sb-off", Status: model.HostStatus{Kernel: testKernel, Firmware: "uefi", SecureBoot: "off", Lockdown: "none", SigEnforce: "off"}}
 							return nil
@@ -263,7 +258,7 @@ func TestSigningRotationRequiresPinnedUnmodifiedPreviousOriginal(t *testing.T) {
 			id, _ := addArtifactBuilt(t, s, "candidate")
 			if kind == "changed during VM" {
 				fixture.runner.onModule = func(invocation vmArtifactInvocation) error {
-					if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "new")); ok {
+					if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "new")); ok {
 						return os.WriteFile(path, []byte("changed during VM"), 0o640)
 					}
 					return nil
@@ -280,9 +275,7 @@ func TestSigningRotationRequiresPinnedUnmodifiedPreviousOriginal(t *testing.T) {
 func TestSigningRotationPartialFilePublicationDoesNotExposeMetadata(t *testing.T) {
 	fixture := newRotationFixture(t)
 	s := fixture.s
-	command := append([]string(nil), s.cfg.Signing.Keys[1].SignCommand...)
-	command[2] = "third"
-	s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, SigningKey{ID: "third", SignCommand: command})
+	s.cfg.Signing.Keys = append(s.cfg.Signing.Keys, testSigningKey(t, "third", false))
 	if err := s.store.Update(func(st *State) error { st.Hosts["gpu-test"].Status.EnrolledCerts["third"] = "enrolled"; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -373,9 +366,8 @@ func TestSigningRotationTestsFormerlyUnsignedPreviousPrivately(t *testing.T) {
 	runner := &vmArtifactRunner{}
 	enableArtifactVM(t, s, runner, testvm.Modes{"sb_on", "bios"})
 	s.cfg.TestVM.Modes = testvm.Modes{"bios"}
-	signer := vmScript(t, t.TempDir(), "sign-prod.sh", `printf ':%s:%s' "$2" "$3" >> "$1"`)
 	s.cfg.SignCommand = nil
-	s.cfg.Signing = &SigningConfig{Mode: "when_required", Keys: []SigningKey{{ID: "prod", Active: true, SignCommand: []string{signer, "{module}", "prod", "{kernel}"}}}}
+	s.cfg.Signing = &SigningConfig{Mode: "when_required", Keys: []SigningKey{testSigningKey(t, "prod", true)}}
 	if err := s.store.Update(func(st *State) error {
 		host := st.Hosts["gpu-test"]
 		host.Status.Firmware, host.Status.SecureBoot, host.Status.Lockdown, host.Status.SigEnforce = "bios", "off", "none", "off"
@@ -407,10 +399,10 @@ func TestSigningRotationTestsFormerlyUnsignedPreviousPrivately(t *testing.T) {
 	id, _ := addArtifactBuilt(t, s, "candidate")
 	var privateTests atomic.Int32
 	runner.onModule = func(invocation vmArtifactInvocation) error {
-		if _, ok := copyWithBytes(invocation, rotationPayload("candidate", "prod")); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", "prod")); !ok {
 			return nil
 		}
-		if _, ok := copyWithBytes(invocation, rotationPayload("previous", "prod")); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "previous", "prod")); !ok {
 			return errors.New("former unsigned previous was not privately signed")
 		}
 		privateTests.Add(1)
@@ -443,5 +435,32 @@ func TestSigningRotationTestsFormerlyUnsignedPreviousPrivately(t *testing.T) {
 		if err != nil || string(data) != "previous" {
 			t.Errorf("historical unsigned bytes changed: %q (%v)", data, err)
 		}
+	}
+}
+
+func TestSigningRotationRejectsHistoricalSignerMismatch(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	// Simulate an old release whose checksum and Signed flag agree, but the
+	// bytes were signed by the wrong key. The rollback VM must not use it.
+	wrong := []byte(expectedPayload(t, s, "previous", "new"))
+	if err := os.WriteFile(s.signingArtifactFile(testKernel, f.module, "old"), wrong, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.Update(func(st *State) error {
+		j := st.job(f.previous)
+		v := j.SigningArtifacts["old"]
+		v.SHA256 = signingBytesSHA256(wrong)
+		j.SigningArtifacts["old"] = v
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := addArtifactBuilt(t, s, "candidate")
+	if _, _, _, err := s.approveJob(id, "tester"); err == nil || !strings.Contains(err.Error(), "openssl cms") {
+		t.Fatalf("invalid prior release used: %v", err)
+	}
+	if ringVersion(s, 1) != 1 {
+		t.Fatal("changed rollout")
 	}
 }

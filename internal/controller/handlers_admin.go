@@ -57,6 +57,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, who string
 		for _, h := range st.Hosts {
 			cp := *h
 			cp.TokenHash = "" // 토큰 해시는 내보내지 않음
+			if e := st.MOKRequests[h.ID]; e != nil {
+				cp.MOKRequest = &model.MOKImportResult{ID: e.Request.ID, KeyID: e.Request.KeyID, Status: "awaiting_agent"}
+				if e.Result != nil {
+					cp.MOKRequest.Status = e.Result.Status
+				}
+			}
 			cp.Status.SignatureRequired, cp.Status.SecurityWarning = hostSecurityPolicy(cp.Status)
 			cp.Status.SecurityWarning = joinSecurityWarnings(cp.Status.SecurityWarning, h.Status.SecurityWarning)
 			if t := st.Tracks[h.Status.Kernel]; t != nil {

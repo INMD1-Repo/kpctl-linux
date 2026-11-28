@@ -93,6 +93,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/status", s.admin(s.handleStatus))
 	m.HandleFunc("GET /api/signing", s.admin(s.handleSigningList))
 	m.HandleFunc("POST /api/signing/{id}/rollout-cert", s.admin(s.handleRolloutCert))
+	m.HandleFunc("POST /api/signing/{id}/hosts/{host}/rollout-cert", s.admin(s.handleRolloutCert))
 	m.HandleFunc("GET /api/hosts/{id}/mok-password", s.admin(s.handleMOKPassword))
 	m.HandleFunc("GET /api/builders/{name}", s.admin(s.handleBuilderDetail))
 	m.HandleFunc("GET /api/coverage", s.admin(s.handleCoverage))

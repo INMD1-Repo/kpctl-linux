@@ -190,7 +190,7 @@ func (a *Agent) report() (model.ReportResponse, error) {
 	var resp model.ReportResponse
 	target, problem := a.bootTarget()
 	security := a.securityStatus()
-	enrolled, pending, certWarning := a.enrollmentStatus(security)
+	enrolled, pending, listEmpty, certWarning := a.enrollmentStatus(security)
 	var moduleSHA string
 	if a.st.Version != 0 && a.st.ModuleName != "" {
 		moduleSHA, _ = fileSHA256(a.installedModulePath(a.st.ModuleName))
@@ -214,6 +214,7 @@ func (a *Agent) report() (model.ReportResponse, error) {
 			SecurityWarning:   strings.Join(securityWarnings, "; "),
 			EnrolledCerts:     enrolled,
 			MOKPending:        pending,
+			MOKListEmpty:      listEmpty,
 			MOKImport:         a.st.MOKImport,
 			KernelSignature:   a.kernelSignature(),
 			Version:           a.st.Version,

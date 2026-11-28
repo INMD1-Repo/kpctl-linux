@@ -119,12 +119,10 @@ func enableArtifactVM(t *testing.T, s *Server, r *vmArtifactRunner, modes testvm
 
 func configureArtifactSigning(t *testing.T, s *Server, oldKey bool) {
 	t.Helper()
-	signer := vmScript(t, t.TempDir(), "sign-key.sh", `printf ':%s' "$2" >> "$1"`)
 	s.cfg.SignCommand = nil
-	s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{
-		{ID: "new", Active: true, SignCommand: []string{signer, "{module}", "new"}},
-		{ID: "old", SignCommand: []string{signer, "{module}", "old"}},
-	}}
+	if s.cfg.Signing == nil {
+		s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{testSigningKey(t, "new", true), testSigningKey(t, "old", false)}}
+	}
 	if oldKey {
 		addHost(t, s, "old-key-host", 1)
 		if err := s.store.Update(func(st *State) error {
@@ -171,7 +169,7 @@ func TestVMApprovalTransfersUnsignedOriginalAndSameKeyPreviousArtifact(t *testin
 	seen := map[string]int{}
 	for _, invocation := range runner.invocations() {
 		for _, key := range []string{"new", "old"} {
-			current, ok := copyWithBytes(invocation, "candidate:"+key)
+			current, ok := copyWithBytes(invocation, expectedPayload(t, s, "candidate", key))
 			if !ok {
 				continue
 			}
@@ -181,14 +179,14 @@ func TestVMApprovalTransfersUnsignedOriginalAndSameKeyPreviousArtifact(t *testin
 					t.Errorf("%s: unsigned original missing or collides with signed path: %+v", key, invocation)
 				}
 			}
-			if _, ok := copyWithBytes(invocation, "previous:"+key); !ok {
+			if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "previous", key)); !ok {
 				t.Errorf("%s: previous artifact signed by same key missing: %+v", key, invocation)
 			}
 			other := "new"
 			if key == "new" {
 				other = "old"
 			}
-			if _, ok := copyWithBytes(invocation, "previous:"+other); ok {
+			if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "previous", other)); ok {
 				t.Errorf("%s: replacement used another signing key", key)
 			}
 		}
@@ -206,12 +204,12 @@ func TestVMApprovalTransfersUnsignedOriginalAndSameKeyPreviousArtifact(t *testin
 		}
 		for _, key := range []string{"new", "old"} {
 			artifact := job.SigningArtifacts[key]
-			expected := fmt.Sprintf("%x", sha256.Sum256([]byte("candidate:"+key)))
+			expected := fmt.Sprintf("%x", sha256.Sum256([]byte(expectedPayload(t, s, "candidate", key))))
 			if artifact.SHA256 != expected || artifact.VMTest == nil || artifact.VMTest.SHA256 != expected {
 				t.Errorf("%s: evidence hash differs from tested bytes: %+v", key, artifact)
 			}
 			data, err := os.ReadFile(s.signingArtifactFile(testKernel, module, key))
-			if err != nil || string(data) != "candidate:"+key {
+			if err != nil || string(data) != expectedPayload(t, s, "candidate", key) {
 				t.Errorf("%s: published bytes differ: %q (%v)", key, data, err)
 			}
 			for _, mode := range []string{"sb_on", "bios"} {
@@ -227,7 +225,7 @@ func TestVMApprovalTransfersUnsignedOriginalAndSameKeyPreviousArtifact(t *testin
 			}
 		}
 		active, err := os.ReadFile(s.artifactFile(testKernel, module))
-		if err != nil || string(active) != "candidate:new" || job.SHA256 != fmt.Sprintf("%x", sha256.Sum256(active)) {
+		if err != nil || string(active) != expectedPayload(t, s, "candidate", "new") || job.SHA256 != fmt.Sprintf("%x", sha256.Sum256(active)) {
 			t.Errorf("legacy default URL does not serve exact active tested bytes: %q (%v)", active, err)
 		}
 	})
@@ -258,14 +256,14 @@ func TestVMReplacementUsesCurrentlyDeployedVersion(t *testing.T) {
 	}
 	found := false
 	for _, invocation := range runner.invocations() {
-		if _, ok := copyWithBytes(invocation, "next:new"); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "next", "new")); !ok {
 			continue
 		}
 		found = true
-		if _, ok := copyWithBytes(invocation, "deployed:new"); !ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "deployed", "new")); !ok {
 			t.Error("replacement omitted currently deployed artifact")
 		}
-		if _, ok := copyWithBytes(invocation, "released-but-rolled-back:new"); ok {
+		if _, ok := copyWithBytes(invocation, expectedPayload(t, s, "released-but-rolled-back", "new")); ok {
 			t.Error("replacement selected latest historical release instead of rollout target")
 		}
 	}

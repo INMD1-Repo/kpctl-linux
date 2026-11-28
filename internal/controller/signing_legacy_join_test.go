@@ -2,10 +2,103 @@
 package controller
 
 import (
+	"encoding/json"
+	"net/http"
+	"strings"
 	"testing"
 
 	"kpctl/internal/model"
 )
+
+func TestNoSignerReportOnlyServesUnsignedToLegacyOrUnenforced(t *testing.T) {
+	s, _ := rebootFixture(t)
+	id := addBuilt(t, s, "manual")
+	if _, _, _, err := s.approveJob(id, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		status model.HostStatus
+		block  bool
+	}{
+		{"old wire format", model.HostStatus{}, false},
+		{"off", model.HostStatus{SecureBoot: "off", Lockdown: "none", SigEnforce: "off"}, false},
+		{"on before receiving certs", model.HostStatus{SecureBoot: "on"}, true},
+		{"integrity", model.HostStatus{Lockdown: "integrity"}, true},
+		{"enforced", model.HostStatus{SigEnforce: "on"}, true},
+		{"explicit policy only", model.HostStatus{SignatureRequired: true}, true},
+		{"unknown signals", model.HostStatus{SecureBoot: "unknown"}, true},
+		{"unknown cert", model.HostStatus{EnrolledCerts: map[string]string{"retired": "unknown"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.status.Kernel = testKernel
+			body := agentRebootAPI(t, s, "/api/agent/report", model.ReportRequest{Status: tc.status}, http.StatusOK)
+			var resp model.ReportResponse
+			if err := json.Unmarshal([]byte(body), &resp); err != nil {
+				t.Fatal(err)
+			}
+			d := resp.Desired
+			if d.Blocked != tc.block || tc.block && (d.URL != "" || d.Warning == "") || !tc.block && (d.Version == 0 || d.URL == "") {
+				t.Fatalf("desired = %+v", d)
+			}
+		})
+	}
+}
+
+func TestNewSigningReportsCannotUseHistoricalUnsignedFallback(t *testing.T) {
+	s, j := signingFixture()
+	s.cfg.Signing, s.cfg.SignCommand = nil, []string{"external-signer", "{module}"}
+	h := signingHost(map[string]string{"default": "unknown"})
+	j.SigningArtifacts = nil
+	if got := s.rolloutEligibility(h, j); got.Status != "blocked_artifact" {
+		t.Fatal(got)
+	}
+	j.ActiveSigningKey = "default"
+	j.SigningArtifacts = map[string]model.SigningArtifact{"default": {KeyID: "default", SHA256: j.SHA256}}
+	if got := s.rolloutEligibility(h, j); got.Status != "blocked_artifact" {
+		t.Fatal(got)
+	}
+	h.Status.Version = j.Version
+	st := &State{Jobs: []*model.Job{j}, Tracks: map[string]*model.Track{testKernel: {RingVersions: map[int]int{1: j.Version}}}}
+	if d := s.desired(st, h); !d.Blocked || d.Version != j.Version || d.URL != "" {
+		t.Fatal(d)
+	}
+	st.Tracks[testKernel].RingVersions[1] = 0
+	if d := s.desired(st, h); d.Blocked || d.Version != 0 {
+		t.Fatal(d)
+	}
+}
+
+func TestSignedReleaseDeliveredAfterMOKEnrollmentReport(t *testing.T) {
+	s, _ := rebootFixture(t)
+	s.cfg.Signing = &SigningConfig{Mode: "always", Keys: []SigningKey{testSigningKey(t, "test", true)}}
+	id := addBuilt(t, s, "manual")
+	if _, _, _, err := s.approveJob(id, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	status := signingHost(map[string]string{"test": "not_enrolled"}).Status
+	status.MOKPending = true
+	report := func() model.ReportResponse {
+		var resp model.ReportResponse
+		if err := json.Unmarshal([]byte(agentRebootAPI(t, s, "/api/agent/report", model.ReportRequest{Status: status}, http.StatusOK)), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	pending := report()
+	if !pending.Desired.Blocked || pending.Desired.URL != "" || !strings.Contains(pending.Desired.Warning, "콘솔") || len(pending.SigningCerts) != 1 || pending.SigningCerts[0].ID != "test" || pending.Reboot != nil {
+		t.Fatalf("pending: %+v", pending.Desired)
+	}
+	status.MOKPending, status.EnrolledCerts["test"] = false, "enrolled"
+	d := report().Desired
+	if d.Blocked || d.Version == 0 || d.Warning != "" {
+		t.Fatal(d)
+	}
+	data := callAPI(t, s, "GET", d.URL, "", http.StatusOK)
+	if data != expectedPayload(t, s, "module", "test") || signingBytesSHA256([]byte(data)) != d.SHA256 {
+		t.Fatal("download does not match signed release")
+	}
+}
 
 func TestSigningLegacyNewHostKeepsJobDefaultAcrossFirstApply(t *testing.T) {
 	s, j := signingFixture()

@@ -54,9 +54,10 @@ func fakeMOKFixture(t *testing.T, a *Agent, root, state string) {
 set -eu
 printf '%s\n' "$*" >> "$MOK_TEST_ROOT/calls"
 case "$1" in
-  --help) printf '%s\n' '--hash-file <hash file>' ;;
-  --list-new) if [ -f "$MOK_TEST_ROOT/pending" ]; then printf '[key 1]\n'; fi ;;
+  --help) printf '%s\n' '--hash-file <hash file>' '--ignore-keyring'; exit 255 ;;
+  --list-new) if [ -f "$MOK_TEST_ROOT/pending" ] || [ -f "$MOK_TEST_ROOT/other" ]; then printf '[key 1]\n'; fi ;;
   --test-key)
+    [ "$3" = --ignore-keyring ]
     if [ -f "$MOK_TEST_ROOT/pending" ]; then
       printf '%s is already in the enrollment request\n' "$2"
     else
@@ -65,6 +66,11 @@ case "$1" in
         db) printf '%s is already in db\n' "$2" ;;
         not_enrolled) printf '%s is not enrolled\n' "$2"; exit 1 ;;
         pending) printf '%s is already in the enrollment request\n' "$2" ;;
+        enrolled06) printf '%s is already enrolled\n' "$2"; exit 1 ;;
+        missing06) printf '%s is not enrolled\n' "$2" ;;
+        pending06) printf '%s is already in the enrollment request\n' "$2"; exit 1 ;;
+        badexit) printf '%s is already enrolled\n' "$2"; exit 2 ;;
+        unrelated) printf 'another.der is already enrolled\n'; exit 1 ;;
         blocked) printf '%s is blocked in dbx\n' "$2" ;;
         *) printf '%s\n' 'cannot read EFI variables'; exit 2 ;;
       esac
@@ -75,6 +81,12 @@ case "$1" in
     [ "$(stat -c %a "$4")" = 600 ]
     printf '%s\n' "$*" >> "$MOK_TEST_ROOT/imports"
     touch "$MOK_TEST_ROOT/pending"
+    case "${MOK_TEST_OUTPUT:-}" in
+      warn) echo 'Warning: locale diagnostic' >&2 ;;
+      race) echo "SKIP: $2 is already in the enrollment request" ;;
+      skip) echo "SKIP: unrecognized diagnostic" ;;
+      misc) echo "unspecified output" ;;
+    esac
     ;;
   *) exit 2 ;;
 esac
@@ -89,17 +101,19 @@ func TestMOKEnrollmentReportsExactOutputAndExitContract(t *testing.T) {
 		state, want string
 		pending     bool
 	}{
-		{"enrolled", "enrolled", false}, {"db", "enrolled", false},
+		{"enrolled", "enrolled", false}, {"db", "in_db", false},
 		{"not_enrolled", "not_enrolled", false}, {"pending", "not_enrolled", true},
 		{"blocked", "not_enrolled", false}, {"unreadable", "unknown", false},
+		{"enrolled06", "enrolled", false}, {"missing06", "not_enrolled", false},
+		{"pending06", "not_enrolled", true}, {"badexit", "unknown", false}, {"unrelated", "unknown", false},
 	} {
 		t.Run(tc.state, func(t *testing.T) {
 			a, root := newTestAgent(t)
 			fakeMOKFixture(t, a, root, tc.state)
 			cert := signingCertFixture(t)
 			a.st.SigningCerts = []model.SigningCert{cert}
-			states, pending, warning := a.enrollmentStatus(a.securityStatus())
-			if states[cert.ID] != tc.want || pending != tc.pending || (warning != "") != (tc.want == "unknown") {
+			states, pending, empty, warning := a.enrollmentStatus(a.securityStatus())
+			if states[cert.ID] != tc.want || empty == tc.pending || pending != tc.pending || (warning != "") != (tc.want == "unknown" || tc.want == "in_db") {
 				t.Fatalf("states=%v pending=%v warning=%q", states, pending, warning)
 			}
 		})
@@ -114,8 +128,8 @@ func TestMOKNonUEFIAndMissingToolAreUnknown(t *testing.T) {
 			a.cfg.MokutilBin = filepath.Join(root, "missing-mokutil")
 			cert := signingCertFixture(t)
 			a.st.SigningCerts = []model.SigningCert{cert}
-			states, pending, _ := a.enrollmentStatus(hostSecurity{firmware: firmware})
-			if states[cert.ID] != "unknown" || pending {
+			states, pending, empty, _ := a.enrollmentStatus(hostSecurity{firmware: firmware})
+			if states[cert.ID] != "unknown" || pending || empty {
 				t.Fatal(states, pending)
 			}
 		})
@@ -128,7 +142,7 @@ func TestMOKRejectsChangedDERBeforeToolChecks(t *testing.T) {
 	cert := signingCertFixture(t)
 	cert.DER[0] ^= 0xff
 	a.st.SigningCerts = []model.SigningCert{cert}
-	states, _, warning := a.enrollmentStatus(a.securityStatus())
+	states, _, _, warning := a.enrollmentStatus(a.securityStatus())
 	calls, _ := os.ReadFile(filepath.Join(root, "mok/calls"))
 	if states[cert.ID] != "unknown" || warning == "" || strings.Contains(string(calls), "--test-key") {
 		t.Fatalf("tampered DER checked by mokutil: states=%v warning=%s calls=%s", states, warning, calls)
@@ -170,7 +184,7 @@ func TestMOKImportCycleDefersIndependentRebootUntilNextCycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "rebooted")); !os.IsNotExist(err) {
 		t.Fatal("MOK import called reboot hook")
 	}
-	if len(reports) < 2 || reports[1].Status.MOKImport == nil || reports[1].Status.MOKImport.Status != "pending" || !reports[1].Status.MOKPending || !reports[1].AutoImportCert {
+	if len(reports) < 2 || reports[1].Status.MOKImport == nil || reports[1].Status.MOKImport.Status != "pending" || !reports[1].Status.MOKImport.PasswordSet || !reports[1].Status.MOKPending || !reports[1].AutoImportCert {
 		t.Fatalf("MOK result not reported: %+v", reports)
 	}
 	imports, err := os.ReadFile(filepath.Join(root, "mok/imports"))
@@ -280,5 +294,52 @@ func TestMOKImportUnsupportedReportsManualProcedure(t *testing.T) {
 	result := a.importMOK(model.MOKImportRequest{ID: "request", KeyID: cert.ID})
 	if result.Status != "unsupported" || !strings.Contains(result.Detail, "수동 mokutil --import") || !strings.Contains(result.Detail, "자동 재부팅하지 않음") {
 		t.Fatal(result)
+	}
+}
+
+func TestImportPreservesPendingRequests(t *testing.T) {
+	for _, tc := range []struct {
+		state, status string
+		other         bool
+	}{
+		{"pending", "pending_existing", false}, {"not_enrolled", "failed", true}, {"db", "unsupported", false},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			a, root := newTestAgent(t)
+			fakeMOKFixture(t, a, root, tc.state)
+			cert := signingCertFixture(t)
+			a.st.SigningCerts = []model.SigningCert{cert}
+			if tc.other {
+				writeTestFile(t, filepath.Join(root, "mok/other"), "existing request")
+			}
+			result := a.importMOK(model.MOKImportRequest{ID: "new", KeyID: cert.ID, PasswordHash: "$6$fixture"})
+			if result.Status != tc.status || result.Detail == "" || result.PasswordSet {
+				t.Fatal(result)
+			}
+			if _, err := os.Stat(filepath.Join(root, "mok/imports")); !os.IsNotExist(err) {
+				t.Fatalf("unexpected import: %v", err)
+			}
+		})
+	}
+}
+
+func TestImportMOKSuccessWithDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		output, status string
+		owned          bool
+	}{
+		{"", "pending", true}, {"warn", "pending", false}, {"race", "pending_existing", false}, {"skip", "pending_uncertain", false}, {"misc", "pending_uncertain", false},
+	} {
+		t.Run(tc.output, func(t *testing.T) {
+			a, root := newTestAgent(t)
+			fakeMOKFixture(t, a, root, "not_enrolled")
+			cert := signingCertFixture(t)
+			a.st.SigningCerts = []model.SigningCert{cert}
+			t.Setenv("MOK_TEST_OUTPUT", tc.output)
+			got := a.importMOK(model.MOKImportRequest{ID: "r", KeyID: cert.ID, PasswordHash: "$6$test"})
+			if got.Status != tc.status || got.PasswordSet != tc.owned || got.Detail == "" {
+				t.Fatal(got)
+			}
+		})
 	}
 }
