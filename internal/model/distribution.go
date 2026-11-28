@@ -37,6 +37,40 @@ func SupportsDistributionABI(distro, release, arch, abi string) bool {
 	return ok && (distro == "debian" || distro == "rocky") && (arch == "x86_64" || arch == "amd64") && p[0].MatchString(abi)
 }
 
+// DistributionForABI 는 uname -r 값이 지원하는 Debian/Rocky 기본 AMD64 커널이면 배포판과 주 릴리스를 돌려줍니다.
+// 예: "6.12.0-264.21.1.el10_3.x86_64" → ("rocky", "10"), "6.1.0-57-amd64" → ("debian", "12"). 아니면 ("", "").
+func DistributionForABI(abi string) (distro, release string) {
+	for _, name := range []string{"debian12", "debian13", "rocky9", "rocky10"} {
+		if profiles[name][0].MatchString(abi) {
+			d := strings.TrimRight(name, "0123456789")
+			return d, name[len(d):]
+		}
+	}
+	return "", ""
+}
+
+// nativeKernelNames 는 Debian·RHEL 계열(Rocky 등) uname -r 모양입니다. 지원 여부와 무관합니다.
+// 호스트 이름(예: 10.0.0-build-amd64)과 헷갈리지 않도록 Debian 은 ABI 번호(-57-) 또는 +debNN 표식,
+// RHEL 계열은 .elN 표식과 RPM 아키텍처를 요구합니다.
+//
+//	Debian: 6.1.0-57-amd64, 6.1.0-57-686-pae, 6.1.0-57-rt-arm64, 6.12.118+deb13-amd64, 6.12.118+deb13.1-cloud-amd64
+//	RHEL:   6.12.0-264.21.1.el10_3.x86_64, 5.14.0-427.el9.ppc64le, 4.18.0-553.el8_10.x86_64+debug
+var nativeKernelNames = []*regexp.Regexp{
+	regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+|\+deb[0-9]+(\.[0-9]+)?)-([a-z0-9]+-)*(amd64|arm64|686|686-pae|armmp|armmp-lpae|marvell|rpi|powerpc64le|ppc64el|s390x|loong64|riscv64|mips64r2el|mips32r2el|octeon|4kc-malta|5kc-malta)$`),
+	regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(\.[0-9A-Za-z_]+)*\.el[0-9]+(_[0-9]+)*(\.[0-9A-Za-z_]+)*\.(x86_64|aarch64|ppc64le|s390x)(\+[a-z0-9_]+)?$`),
+}
+
+// IsDistributionKernelName 은 Ubuntu 가 아닌 배포판(Debian·Rocky 등)의 uname -r 모양인지 봅니다.
+// 지원 프로필 밖의 커널(예: Rocky 8, Debian arm64)도 참입니다. Ubuntu 빌더 대상이 아님을 판정하는 데 씁니다.
+func IsDistributionKernelName(kernel string) bool {
+	for _, re := range nativeKernelNames {
+		if re.MatchString(kernel) {
+			return true
+		}
+	}
+	return false
+}
+
 func (k DistributionKernel) Track() string {
 	p, ok := profiles[k.Distro+k.Release]
 	if !ok || (k.Distro != "debian" && k.Distro != "rocky") || k.Arch != "amd64" || !buildID.MatchString(k.BuildID) || !p[0].MatchString(k.ABI) {
@@ -183,4 +217,19 @@ func (f *FixedRelease) ValidFor(base DistributionKernel, commit string) bool {
 	key := base.Track()
 	proof := DistributionProof{Track: key, Revision: f.Revision, SourceSHA256: f.SourceSHA256, PackageSHA256: f.PackageSHA256, Signer: f.Signer}
 	return key != "" && proof.Valid(key)
+}
+
+// DistroLabel 은 /etc/os-release 의 ID 를 표시용 이름으로 바꿉니다. 모르는 값은 그대로, 빈 값은 "알 수 없는 OS".
+func DistroLabel(id string) string {
+	switch id {
+	case "ubuntu":
+		return "Ubuntu"
+	case "debian":
+		return "Debian"
+	case "rocky":
+		return "Rocky"
+	case "", "unknown":
+		return "알 수 없는 OS"
+	}
+	return id
 }
