@@ -50,19 +50,101 @@ var buildUserName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 var kernelArg = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[A-Za-z0-9_-]+$`)
 
-// nativeBuilderHint 는 Debian/Rocky 커널·빌드 서버를 받았을 때의 안내입니다 (setup-builder.sh 도 Ubuntu 가 아니면 거부).
-const nativeBuilderHint = "install-builder 는 Ubuntu 빌드 서버 전용입니다. Debian/Rocky 커널은 대상과 같은 배포판의 별도 격리 빌더에서 " +
-	"kpctl-native-builder.py 로 빌드합니다 (docs/operations/distribution-kernels.md 의 \"빌더 준비와 입력 고정\")"
+// nativeBuilderHint 는 빌드할 수 없는 배포판 커널을 받았을 때의 안내입니다.
+const nativeBuilderHint = "Debian/Rocky 커널은 대상과 같은 배포판·릴리스의 전용 VM 에 kpctl install-builder 로 네이티브 빌더를 설치해 빌드합니다. " +
+	"지원: Debian 12, Rocky 9·10 AMD64 (docs/operations/distribution-kernels.md)"
 
-// nativeKernelProblem 은 Ubuntu 빌더 대상이 아닌 배포판 커널이면 이유를 돌려줍니다. Ubuntu 모양이면 "".
+// nativeKernelProblem 은 네이티브 빌더로도 빌드할 수 없는 배포판 커널이면 이유를 돌려줍니다.
+// Ubuntu 모양이거나 빌드할 수 있는 Debian 12·Rocky 9·10 커널이면 "".
 func nativeKernelProblem(k string) string {
 	if !model.IsDistributionKernelName(k) {
 		return ""
 	}
-	if d, r := model.DistributionForABI(k); d != "" {
-		return fmt.Sprintf("%s 는 %s %s 배포판 커널입니다", k, model.DistroLabel(d), r)
+	d, r := model.DistributionForABI(k)
+	if d == "" {
+		return fmt.Sprintf("%s 는 지원하지 않는 배포판 커널입니다 (Debian 12·13, Rocky 9·10 AMD64 지원 프로필에 없음)", k)
 	}
-	return fmt.Sprintf("%s 는 Ubuntu 가 아닌 배포판 커널입니다 (Debian 12·13, Rocky 9·10 AMD64 지원 프로필에도 없음)", k)
+	if ok, reason := model.NativeBuilderRelease(d, r); !ok {
+		return fmt.Sprintf("%s 는 %s %s 커널이라 빌드할 수 없습니다: %s", k, model.DistroLabel(d), r, reason)
+	}
+	return ""
+}
+
+// registeredNativeKernels 는 컨트롤러 등록 호스트 중 식별이 끝난(track 이 있는) 빌드 가능한 Debian/Rocky 커널입니다 (track 순, 중복 제거).
+func registeredNativeKernels(st *model.StatusResponse) []model.DistributionKernel {
+	seen := map[string]bool{}
+	var out []model.DistributionKernel
+	for _, h := range st.Hosts {
+		d := h.Status.Distribution
+		if d == nil || h.Status.TrackKey() == "" || seen[h.Status.TrackKey()] {
+			continue
+		}
+		if ok, _ := model.NativeBuilderRelease(d.Distro, d.Release); !ok {
+			continue
+		}
+		seen[h.Status.TrackKey()] = true
+		out = append(out, *d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Track() < out[j].Track() })
+	return out
+}
+
+// nativeTargetsFor 는 네이티브 빌더 호스트(distro, release) 하나의 대상 커널입니다.
+// 커널을 지정했으면 그중 같은 릴리스의 것만, 아니면 같은 릴리스의 등록 호스트 커널 전부입니다.
+// 등록 호스트와 ABI 가 같은 커널은 그 track(빌드 ID 포함)을 붙여, 원격 prepare 영수증과 정확히 대조하게 합니다.
+// 같은 ABI 의 track 이 여럿이면(패키지 재빌드) 모두 대상으로 넣습니다.
+func nativeTargetsFor(kernels []string, registered []model.DistributionKernel, distro, release string) []remote.NativeTarget {
+	var out []remote.NativeTarget
+	add := func(abi string) {
+		matched := false
+		for _, k := range registered {
+			if k.ABI == abi && k.Distro == distro && k.Release == release {
+				out = append(out, remote.NativeTarget{ABI: abi, Track: k.Track()})
+				matched = true
+			}
+		}
+		if !matched {
+			out = append(out, remote.NativeTarget{ABI: abi})
+		}
+	}
+	if len(kernels) > 0 {
+		for _, k := range kernels {
+			if d, r := model.DistributionForABI(k); d == distro && r == release {
+				add(k)
+			}
+		}
+		return out
+	}
+	var abis []string
+	for _, k := range registered {
+		if k.Distro == distro && k.Release == release {
+			abis = append(abis, k.ABI)
+		}
+	}
+	for _, abi := range unique(abis) {
+		add(abi)
+	}
+	return out
+}
+
+// nativeWorkerConfig 는 원격 /etc/kpctl/native-builder/worker.json 입니다 (토큰은 token_file 로 따로).
+// builder 는 컨트롤러에 보고할 빌더 이름입니다 (hostname).
+func nativeWorkerConfig(ctrlURL, caFile, builder string) ([]byte, error) {
+	cfg := map[string]string{"controller_url": ctrlURL, "token_file": "/etc/kpctl/native-builder/token", "builder": builder}
+	if caFile != "" {
+		cfg["ca_file"] = "/etc/kpctl/tls/ca.crt"
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// nativeProofHint 는 설치 후 운영자가 할 일입니다. 승인 핀은 빌더와 독립된 환경에서 만들어 넣어야 합니다.
+//
+// TODO(codex): targets 의 track 을 나열하고, docs/operations/distribution-kernels.md 의 "후보 검토와 작업 실행" 절차대로
+// (1) 독립 신뢰 환경에서 같은 계획(빌더의 /var/lib/kpctl-native/tracks/<track>/base.json)으로 prepare 를 다시 실행해
+// track 과 대상 kpctl-agent -identify 출력을 대조하고 컨트롤러 data_dir/distribution-proofs/<track>.json 에 설치,
+// (2) 수정 후보는 빌더에서 collect 로 사람이 검토해 제출한다는 안내를 한국어 여러 줄로 돌려줍니다. 실행 가능한 경로를 씁니다.
+func nativeProofHint(targets []remote.NativeTarget) string {
+	return ""
 }
 
 // isKernelArg 는 위치 인자가 호스트가 아니라 커널 이름(uname -r)인지 봅니다. Debian/Rocky 모양도 커널로 봅니다.
@@ -90,7 +172,8 @@ func defaultBuilderBundleDir() string {
 }
 
 // splitBuilderArgs 는 위치 인자를 호스트, 대상 커널, "--" 뒤 setup-builder.sh 옵션으로 나눕니다.
-// Debian/Rocky 커널은 호스트로 오인해 SSH 로 접속하지 않고, 접속 전에 네이티브 빌더 안내와 함께 거부합니다.
+// Debian/Rocky 커널을 호스트로 오인해 SSH 로 접속하지 않습니다. 빌드할 수 없는 배포판 커널(Debian 13, Rocky 8 등)은
+// 접속 전에 이유와 함께 거부합니다.
 func splitBuilderArgs(args []string) (hosts, kernels, setup []string, err error) {
 	var native []string
 	for i, a := range args {
@@ -101,7 +184,7 @@ func splitBuilderArgs(args []string) (hosts, kernels, setup []string, err error)
 		switch {
 		case nativeKernelProblem(a) != "":
 			native = append(native, nativeKernelProblem(a))
-		case kernelArg.MatchString(a):
+		case isKernelArg(a): // Ubuntu 커널, 또는 네이티브 빌더로 빌드할 Debian 12·Rocky 9·10 커널
 			kernels = append(kernels, a)
 		case strings.HasPrefix(a, "-"):
 			return nil, nil, nil, fmt.Errorf("%q 가 옵션처럼 보입니다. kpctl 옵션은 호스트 앞에, setup-builder.sh 옵션은 -- 뒤에 쓰세요", a)
@@ -278,6 +361,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	}
 
 	var config []byte
+	token := ""
 	if !*checkOnly {
 		if err := checkReadable(*tokenFile, "빌더 토큰"); err != nil {
 			return nil, err
@@ -286,7 +370,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		token := strings.TrimSpace(string(data))
+		token = strings.TrimSpace(string(data))
 		if len(token) < 16 {
 			return nil, fmt.Errorf("빌더 토큰이 너무 짧습니다 (%s)", *tokenFile)
 		}
@@ -298,12 +382,23 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 	hostMode := hasArg(setupArgs, "--host-mode")
 	noStart := hasArg(setupArgs, "--no-start")
 	var registered []string
-	if len(kernels) == 0 && !hostMode {
+	var registeredNative []model.DistributionKernel
+	anyNative := false
+	for _, k := range kernels {
+		anyNative = anyNative || model.IsDistributionKernelName(k)
+	}
+	if len(kernels) == 0 && !hostMode || anyNative {
+		// 커널을 생략했으면 등록 호스트에서 고르고, Debian/Rocky 커널을 지정했으면 등록 호스트의 track(빌드 ID)과 대조합니다
 		var st model.StatusResponse
 		if err := c.Do("GET", "/api/status", nil, &st); err != nil {
-			return nil, fmt.Errorf("대상 커널을 고르려고 컨트롤러 상태를 읽지 못했습니다 (커널을 직접 지정하세요): %w", err)
+			if !anyNative {
+				return nil, fmt.Errorf("대상 커널을 고르려고 컨트롤러 상태를 읽지 못했습니다 (커널을 직접 지정하세요): %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "경고: 컨트롤러 상태를 읽지 못해 등록 호스트 track 대조 없이 진행합니다: %v\n", err)
+		} else {
+			registered = registeredKernels(&st)
+			registeredNative = registeredNativeKernels(&st)
 		}
-		registered = registeredKernels(&st)
 	}
 	series := make([]string, 0, len(model.SupportedLTS))
 	for _, l := range model.SupportedLTS {
@@ -330,6 +425,14 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 			return hostResult{result: "접속 실패", note: err.Error()}
 		}
 
+		if s.Facts.IsNativeBuilderOS() {
+			return installNativeOnHost(c, s, nativeRun{
+				target: target, problems: problems, warnings: warnings, kernels: kernels, registered: registeredNative,
+				hostMode: hostMode, noStart: noStart, checkOnly: *checkOnly, force: *force, stopRunning: *stopRunning,
+				resetConfig: *resetConfig, ctrlURL: *ctrlURL, caFile: *caFile, token: token, setupArgs: setupArgs, bundle: bundle,
+			}, res)
+		}
+
 		// 대상 커널: 지정한 것 중 이 시리즈 → 없으면 등록 호스트 중 이 시리즈
 		hostKernels := kernelsForSeries(kernels, s.Facts.Codename)
 		if len(kernels) == 0 {
@@ -350,7 +453,7 @@ func runBuilderInstall(c *client.Client, args []string) ([]hostResult, error) {
 		for _, w := range warnings {
 			progress(target, "경고: "+w)
 		}
-		// Ubuntu 가 아닌 빌드 서버는 -force 로도 진행하지 않습니다. setup-builder.sh 가 어차피 거부하며,
+		// Ubuntu 도 Debian/Rocky 도 아닌 빌드 서버는 -force 로도 진행하지 않습니다. setup-builder.sh 가 어차피 거부하며,
 		// 그 전에 빌더 토큰이 담긴 builder.json 을 보내거나 (-stop-running 이면) 기존 서비스를 멈추게 됩니다.
 		if len(problems) > 0 && (*checkOnly || !*force || s.Facts.Distro != "ubuntu") {
 			res.result, res.note = "점검 실패", strings.Join(problems, "\n")
@@ -413,4 +516,118 @@ func waitBuilder(c *client.Client, name string, timeout time.Duration) (*model.B
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// nativeRun 은 호스트 한 대의 네이티브 빌더 설치에 필요한 runBuilderInstall 의 값입니다.
+type nativeRun struct {
+	target             string
+	problems, warnings []string
+	kernels            []string
+	registered         []model.DistributionKernel
+	hostMode, noStart  bool
+	checkOnly, force   bool
+	stopRunning        bool
+	resetConfig        bool
+	ctrlURL, caFile    string
+	token              string
+	setupArgs          []string
+	bundle             *remote.Bundle
+}
+
+// nativeSetupArgs 는 setup-native-builder.sh 가 받는 "--" 뒤 옵션입니다 (나머지는 Ubuntu setup-builder.sh 전용).
+var nativeSetupArgs = map[string]bool{"--jobs": true, "--no-start": true, "--user": true}
+
+// installNativeOnHost 는 Preflight 가 끝난 Debian/Rocky 호스트에 네이티브 빌더를 점검·설치합니다.
+// -force 는 일반 점검 문제만 넘기고, NativeBuilderHardBlock(지원 릴리스·컨테이너·에이전트 호스트)은 넘기지 않습니다.
+func installNativeOnHost(c *client.Client, s *remote.Session, n nativeRun, res hostResult) hostResult {
+	problems, warnings := n.problems, n.warnings
+	distro, release := s.Facts.Distro, s.Facts.NativeRelease()
+	targets := nativeTargetsFor(n.kernels, n.registered, distro, release)
+	if n.hostMode {
+		problems = append(problems, "--host-mode 는 Ubuntu 빌더 전용입니다 (네이티브 빌더는 항상 호스트의 배포판 패키지로 빌드)")
+	}
+	for i := 0; i < len(n.setupArgs); i++ {
+		a := n.setupArgs[i]
+		if !nativeSetupArgs[a] {
+			problems = append(problems, fmt.Sprintf("setup-native-builder.sh 는 %s 옵션을 받지 않습니다 (가능: --jobs N, --no-start, -build-user)", a))
+		} else if a == "--jobs" || a == "--user" {
+			i++ // 값
+		}
+	}
+	if len(targets) == 0 {
+		if len(n.kernels) > 0 {
+			problems = append(problems, fmt.Sprintf("지정한 커널 중 %s %s 커널이 없습니다", model.DistroLabel(distro), release))
+		} else {
+			problems = append(problems, fmt.Sprintf("컨트롤러에 %s %s 커널을 쓰는 식별된 등록 호스트가 없어 대상 커널을 고르지 못했습니다. 대상 호스트의 uname -r 값을 직접 지정하세요 (예: kpctl install-builder %s %s)",
+				model.DistroLabel(distro), release, n.target, nativeExampleKernel(distro, release)))
+		}
+	}
+	for _, t := range targets {
+		if t.Track == "" {
+			warnings = append(warnings, fmt.Sprintf("%s 를 쓰는 식별된 등록 호스트가 없어 빌드 ID 대조 없이 준비합니다 (호스트 등록 후 다시 설치하면 대조)", t.ABI))
+		}
+	}
+	keepConfig := s.Facts.NativeBuilderConfig == "yes" && !n.resetConfig
+	if keepConfig {
+		warnings = append(warnings, "기존 /etc/kpctl/native-builder/worker.json·토큰을 유지합니다 (새로 쓰려면 -reset-config)")
+	}
+	for _, w := range warnings {
+		progress(n.target, "경고: "+w)
+	}
+	hard := remote.NativeBuilderHardBlock(s.Facts)
+	if len(problems) > 0 && (n.checkOnly || !n.force || hard != "") {
+		res.result, res.note = "점검 실패", strings.Join(problems, "\n")
+		return res
+	}
+	var labels []string
+	for _, t := range targets {
+		labels = append(labels, t.ABI)
+	}
+	if n.checkOnly {
+		res.ok, res.result = true, "점검 통과"
+		res.note = fmt.Sprintf("%s 네이티브 빌더, 커널 %s", s.Facts.OSLabel(), strings.Join(labels, " "))
+		return res
+	}
+
+	opts := remote.NativeBuilderInstallOptions{
+		ControllerURL: n.ctrlURL, CAFile: n.caFile, Targets: targets, SetupArgs: n.setupArgs, StopRunning: n.stopRunning,
+	}
+	if !keepConfig {
+		worker, err := nativeWorkerConfig(n.ctrlURL, n.caFile, s.Facts.Hostname)
+		if err != nil {
+			res.result, res.note = "설치 실패", err.Error()
+			return res
+		}
+		opts.Worker, opts.Token = worker, n.token
+	}
+	if err := s.InstallNativeBuilder(n.bundle, opts); err != nil {
+		res.result, res.note = "설치 실패", err.Error()
+		return res
+	}
+	hint := nativeProofHint(targets)
+	if n.noStart {
+		res.ok, res.result = true, "설치 완료"
+		res.note = "서비스 시작 안 함 (--no-start): systemctl enable --now kpctl-native-builder.timer" + hint
+		return res
+	}
+	progress(n.target, "컨트롤러에 빌더 보고 확인")
+	b, err := waitBuilder(c, res.hostname, 3*time.Minute)
+	if err != nil {
+		res.result, res.note = "보고 미확인", err.Error()
+		return res
+	}
+	res.ok, res.result = true, "설치 완료"
+	res.note = fmt.Sprintf("%s, %s 네이티브 빌더, 커널 %s", b.Name, s.Facts.OSLabel(), strings.Join(labels, " ")) + hint
+	return res
+}
+
+// nativeExampleKernel 은 안내문에 쓸 그 릴리스의 커널 이름 예입니다 (docs/operations/distribution-kernels.md 표의 값).
+func nativeExampleKernel(distro, release string) string {
+	switch distro + release {
+	case "debian12":
+		return "6.1.0-57-amd64"
+	case "rocky9":
+		return "5.14.0-741.27.1.el9_9.x86_64"
+	}
+	return "6.12.0-264.21.1.el10_3.x86_64"
 }

@@ -233,3 +233,22 @@ func DistroLabel(id string) string {
 	}
 	return id
 }
+
+// NativeBuilderRelease 는 Debian/Rocky 네이티브 빌더를 설치할 수 있는 배포판·주 릴리스인지 봅니다.
+// 빌더는 대상과 같은 배포판·릴리스에서만 빌드합니다 (kpctl-native-builder.py 의 native_environment).
+// Debian 13 은 기본 커널의 IBT 제약으로 빌드할 수 없어 이유를 돌려줍니다 (TrixieBlocked).
+func NativeBuilderRelease(distro, release string) (ok bool, reason string) {
+	switch distro + release {
+	case "debian12", "rocky9", "rocky10":
+		return true, ""
+	case "debian13":
+		return false, TrixieBlocked
+	}
+	return false, fmt.Sprintf("%s %s 는 네이티브 빌더 지원 릴리스가 아닙니다 (Debian 12, Rocky 9·10 AMD64)", DistroLabel(distro), release)
+}
+
+// NativeBuilderNeedsKpatch 는 그 릴리스가 고정 kpatch(kpctl-kpatch-fixes.sh)를 빌드해야 하는지 봅니다.
+// Rocky 10 은 정식 커널의 CONFIG_KLP_BUILD=y 로 in-tree klp-build 를 씁니다.
+func NativeBuilderNeedsKpatch(distro, release string) bool {
+	return distro+release == "debian12" || distro+release == "rocky9"
+}

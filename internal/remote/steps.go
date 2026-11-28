@@ -44,6 +44,12 @@ type Facts struct {
 	BuilderActive string // yes | no — kpctl-builder 서비스가 돌고 있는지
 	BuilderConfig string // yes | no — /etc/kpctl/builder.json 이 이미 있는지
 
+	// Debian/Rocky 네이티브 빌더 설치용 (native_builder.go 의 nativeBuilderChecks 가 판정)
+	NativeBuilderActive string // yes | no — kpctl-native-builder.timer 가 켜져 있는지
+	NativeBuilderConfig string // yes | no — /etc/kpctl/native-builder/worker.json 이 이미 있는지
+	Virt                string // systemd-detect-virt --vm (none = 물리 서버)
+	X86V3               string // yes | no — x86-64-v3 CPU 기능 (Rocky 10 필요)
+
 	// 호스트가 컨트롤러 이름을 DNS 로 찾지 못할 때만 채워집니다.
 	// ViaIP 는 SSH 로 접속해 온 주소($SSH_CONNECTION 의 첫 칸 = 호스트에서 본 컨트롤러 IP)로 접속한 /healthz 응답 코드.
 	// 에이전트 설치용 (hostChecks 가 판정)
@@ -209,6 +215,11 @@ if [ "$ID" = ubuntu ] && [ -n "$(dpkg --audit 2>/dev/null)" ]; then echo "dpkg=b
 echo "now=$(date +%s)"
 if systemctl is-active --quiet kpctl-builder 2>/dev/null; then echo "builderactive=yes"; else echo "builderactive=no"; fi
 if [ -e /etc/kpctl/builder.json ]; then echo "builderconfig=yes"; else echo "builderconfig=no"; fi
+if systemctl is-active --quiet kpctl-native-builder.timer 2>/dev/null; then echo "nativebuilderactive=yes"; else echo "nativebuilderactive=no"; fi
+if [ -e /etc/kpctl/native-builder/worker.json ]; then echo "nativebuilderconfig=yes"; else echo "nativebuilderconfig=no"; fi
+echo "virt=$(systemd-detect-virt --vm 2>/dev/null || true)"
+# x86-64-v3: AVX2·BMI1/2·FMA·MOVBE 등 (Rocky 10 실행 호스트와 빌더에 필요)
+if grep -qw avx2 /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo && grep -qw movbe /proc/cpuinfo; then echo "x86v3=yes"; else echo "x86v3=no"; fi
 `
 
 // PreflightOptions 는 점검 기준입니다.
@@ -254,6 +265,7 @@ func (s *Session) Preflight(o PreflightOptions) (problems, warnings []string, er
 		Sudo: kv["sudo"], Livepatch: kv["livepatch"], SecureBoot: kv["secureboot"],
 		Controller: kv["controller"], Agent: kv["agent"], Role: kv["role"], Codename: kv["codename"],
 		BuilderActive: kv["builderactive"], BuilderConfig: kv["builderconfig"],
+		NativeBuilderActive: kv["nativebuilderactive"], NativeBuilderConfig: kv["nativebuilderconfig"], Virt: kv["virt"], X86V3: kv["x86v3"],
 		NameResolves: kv["nameresolves"], ControllerIP: kv["controllerip"], ViaIP: kv["viaip"],
 		Container: kv["container"], Systemd: kv["systemd"], Modules: kv["modules"], Lockdown: kv["lockdown"],
 		OtherPatches: kv["otherpatches"], BootFreeKB: kv["bootfree"], VarFreeKB: kv["varfree"],
@@ -292,24 +304,23 @@ func (s *Session) Preflight(o PreflightOptions) (problems, warnings []string, er
 		}
 		switch {
 		case supported:
-		case f.Distro == "debian" || f.Distro == "rocky":
-			// setup-builder.sh 도 Ubuntu 가 아니면 거부합니다. 접속 전에 이유와 대안을 알려 줍니다.
-			problems = append(problems, fmt.Sprintf("%s 호스트입니다. install-builder 는 Ubuntu(%s) 빌드 서버 전용입니다. "+
-				"Debian/Rocky 커널은 대상과 같은 배포판의 별도 격리 빌더에서 kpctl-native-builder.py 로 빌드합니다 (docs/operations/distribution-kernels.md)",
-				f.OSLabel(), strings.Join(o.Series, ", ")))
+		case f.IsNativeBuilderOS():
+			// Debian/Rocky 는 setup-native-builder.sh 로 설치하는 네이티브 빌더 (native_builder.go)
+			p, w := nativeBuilderChecks(f, o)
+			problems, warnings = append(problems, p...), append(warnings, w...)
 		case f.Distro == "ubuntu":
 			problems = append(problems, fmt.Sprintf("지원하지 않는 Ubuntu 시리즈 %s (지원: %s). 빌더는 대상 LTS 와 같은 Ubuntu 에 설치합니다", f.OSLabel(), strings.Join(o.Series, ", ")))
 		default:
-			problems = append(problems, fmt.Sprintf("지원하지 않는 OS %s 입니다. 빌더는 대상 LTS 와 같은 Ubuntu(%s) 에 설치합니다", f.OSLabel(), strings.Join(o.Series, ", ")))
+			problems = append(problems, fmt.Sprintf("지원하지 않는 OS %s 입니다. 빌더는 Ubuntu(%s) 또는 대상과 같은 Debian 12·Rocky 9·10 에 설치합니다", f.OSLabel(), strings.Join(o.Series, ", ")))
 		}
-		if f.BuilderActive == "yes" {
+		if f.BuilderActive == "yes" && !f.IsNativeBuilderOS() {
 			if o.StopBuilder {
 				warnings = append(warnings, "실행 중인 kpctl-builder 를 멈추고 다시 설치합니다 (진행 중인 빌드는 실패로 끝납니다)")
 			} else {
 				problems = append(problems, "kpctl-builder 가 실행 중입니다. 작업이 끝난 뒤 -stop-running 으로 다시 실행하세요")
 			}
 		}
-		if f.Agent == "installed" && !o.AllowWithAgent {
+		if f.Agent == "installed" && !o.AllowWithAgent && !f.IsNativeBuilderOS() { // 네이티브는 NativeBuilderHardBlock
 			problems = append(problems, "에이전트가 설치된 운영 호스트입니다. 빌더는 패치 대상과 분리된 서버에 설치하세요 (원인을 알면 -force)")
 		}
 	}

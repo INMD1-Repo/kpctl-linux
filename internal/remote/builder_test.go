@@ -125,3 +125,90 @@ echo "기타 출력"
 		}
 	}
 }
+
+// 네이티브 빌더 설치 (codex 구현): 묶음 복사, worker.json·토큰(0600, 표준 입력), CA, --target 인자, 진행 표시, 임시 디렉터리 정리.
+// 토큰은 명령줄·로그 어디에도 남지 않아야 합니다.
+func TestInstallNativeBuilderCopiesBundleAndRunsSetup(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash 없음")
+	}
+	bundle := t.TempDir()
+	for _, f := range builderBundleFiles {
+		p := filepath.Join(bundle, f)
+		if f == "kpatch-fixes" || f == "build-environment" {
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report := filepath.Join(t.TempDir(), "report")
+	setup := `#!/bin/bash
+HERE=$(cd "$(dirname "$0")" && pwd)
+{ echo "args=$*"
+  while [ $# -gt 0 ]; do case "$1" in
+    --worker) echo "worker=$(cat "$2")"; echo "wmode=$(stat -c %a "$2")"; shift ;;
+    --token-file) echo "token=$(cat "$2")"; echo "tmode=$(stat -c %a "$2")"; shift ;;
+    --ca-file) echo "ca=$(cat "$2")"; shift ;;
+  esac; shift; done
+  test -f "$HERE/kpctl-native-builder.py" && echo "driver=ok"
+} > ` + report + `
+echo "■ 대상 커널 계획"
+echo "기타 출력"
+`
+	if err := os.WriteFile(filepath.Join(bundle, "setup-native-builder.sh"), []byte(setup), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ca := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(ca, []byte("CA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sshBin, scpBin := fakeTools(t)
+	var steps []string
+	s := &Session{SSH: &SSH{SSHBin: sshBin, SCPBin: scpBin}, Target: "build-rocky10",
+		Facts: Facts{UID: "0"}, OnStep: func(_, m string) { steps = append(steps, m) }}
+	track := "native__rocky__10__amd64__6.12.0-264.21.1.el10_3.x86_64__6.12.0-264.21.1.el10_3__" + strings.Repeat("a", 40)
+	err := s.InstallNativeBuilder(&Bundle{Dir: bundle}, NativeBuilderInstallOptions{
+		ControllerURL: "https://ctl.example:8443", Worker: []byte(`{"builder":"build-rocky10"}`), Token: "native-secret-token-0123", CAFile: ca,
+		Targets:   []NativeTarget{{ABI: "6.12.0-264.21.1.el10_3.x86_64", Track: track}, {ABI: "6.12.0-265.1.1.el10_3.x86_64"}},
+		SetupArgs: []string{"--jobs", "4"},
+	})
+	if err != nil {
+		t.Fatalf("InstallNativeBuilder: %v\n%s", err, s.Log.String())
+	}
+	out, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	for _, want := range []string{`worker={"builder":"build-rocky10"}`, "wmode=600", "token=native-secret-token-0123", "tmode=600", "ca=CA", "driver=ok",
+		"--jobs 4 --target 6.12.0-264.21.1.el10_3.x86_64=" + track + " --target 6.12.0-265.1.1.el10_3.x86_64"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("setup-native-builder.sh 기록에 %q 없음:\n%s", want, got)
+		}
+	}
+	if strings.Contains(s.Log.String(), "native-secret-token-0123") {
+		t.Error("토큰이 로그에 남았습니다")
+	}
+	joined := strings.Join(steps, "\n")
+	if !strings.Contains(joined, "■ 대상 커널 계획") || strings.Contains(joined, "기타 출력") {
+		t.Errorf("진행 표시: %s", joined)
+	}
+	for _, line := range strings.Split(s.Log.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, "/tmp/kpctl-native-builder."); ok {
+			if _, err := os.Stat("/tmp/kpctl-native-builder." + rest); err == nil {
+				t.Errorf("임시 디렉터리가 남았습니다: /tmp/kpctl-native-builder.%s", rest)
+			}
+		}
+	}
+	// Worker 를 주면서 토큰이 없거나 짧으면 원격에 아무것도 하지 않고 오류
+	for _, tok := range []string{"", "short"} {
+		s := &Session{SSH: &SSH{SSHBin: "/nonexistent-ssh"}, Target: "x", Facts: Facts{UID: "0"}}
+		if err := s.InstallNativeBuilder(&Bundle{Dir: bundle}, NativeBuilderInstallOptions{Worker: []byte("{}"), Token: tok}); err == nil || strings.Contains(s.Log.String(), "mktemp") {
+			t.Errorf("토큰 %q: err=%v log=%s", tok, err, s.Log.String())
+		}
+	}
+}

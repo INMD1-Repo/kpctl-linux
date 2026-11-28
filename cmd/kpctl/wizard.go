@@ -302,7 +302,7 @@ func askBuilderPlan(p *prompter) (*wizardPlan, error) {
 			if why := nativeKernelProblem(f); why != "" {
 				return nil, fmt.Errorf("%s.\n%s", why, nativeBuilderHint)
 			}
-			if !kernelArg.MatchString(f) {
+			if !isKernelArg(f) {
 				bad = f
 			}
 		}

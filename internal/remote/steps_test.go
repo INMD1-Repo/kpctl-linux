@@ -103,25 +103,35 @@ func TestPreflightScriptFallsBackToSSHAddress(t *testing.T) {
 	}
 }
 
-// 빌드 서버 점검: Rocky(VERSION_CODENAME 없음)·Debian 호스트는 빈 시리즈 "" 대신 OS 와 네이티브 빌더 안내를 보여야 합니다.
+// 빌드 서버 점검: Debian 12·Rocky 9·10 은 네이티브 빌더 점검을, 그 밖의 OS 는 빈 시리즈 "" 대신 OS 이름을 보여야 합니다.
 func TestPreflightBuilderNonUbuntuHosts(t *testing.T) {
+	native := "release_type=stable\nx86v3=yes\nvirt=kvm\ncontainer=none\nsystemd=yes\nvarfree=209715200\nnativebuilderactive=no\nnativebuilderconfig=no\n"
 	for _, tc := range []struct {
 		name, facts, want, avoid string
 		ok                       bool
 	}{
-		{"rocky10", "distro=rocky\nrelease=10.1\ncodename=\nkernel=6.12.0-264.21.1.el10_3.x86_64\n", "Rocky 10.1 호스트입니다", `""`, false},
-		{"debian12", "distro=debian\nrelease=12\ncodename=bookworm\nkernel=6.1.0-57-amd64\n", "Debian 12 (bookworm) 호스트입니다", `""`, false},
-		{"focal", "distro=ubuntu\nrelease=20.04\ncodename=focal\nkernel=5.4.0-200-generic\n", "지원하지 않는 Ubuntu 시리즈 Ubuntu 20.04 (focal)", "kpctl-native-builder.py", false},
-		{"alpine", "distro=alpine\nrelease=3.20\ncodename=\nkernel=6.6.0-0-lts\n", "지원하지 않는 OS alpine 3.20", "kpctl-native-builder.py", false},
+		{"rocky10", native + "distro=rocky\nrelease=10.1\ncodename=\n", "", "", true},
+		{"rocky10-no-v3", strings.Replace(native, "x86v3=yes", "x86v3=no", 1) + "distro=rocky\nrelease=10.1\ncodename=\n", "x86-64-v3", `""`, false},
+		{"rocky9-agent", native + "distro=rocky\nrelease=9.9\ncodename=\nagent=installed\n", "-force 로도 넘길 수 없음", "", false},
+		{"debian12", native + "distro=debian\nrelease=12\ncodename=bookworm\n", "", "", true},
+		{"debian12-small", strings.Replace(native, "varfree=209715200", "varfree=10485760", 1) + "distro=debian\nrelease=12\ncodename=bookworm\n", "40 GiB", "", false},
+		{"debian12-container", strings.Replace(native, "container=none", "container=lxc", 1) + "distro=debian\nrelease=12\ncodename=bookworm\n", "컨테이너(lxc)", "", false},
+		{"debian13", native + "distro=debian\nrelease=13\ncodename=trixie\n", "IBT", "", false},
+		{"rocky-beta", strings.Replace(native, "release_type=stable", "release_type=development", 1) + "distro=rocky\nrelease=10.0\ncodename=\n", "정식(stable)", "", false},
+		{"rocky8", native + "distro=rocky\nrelease=8.10\ncodename=\n", "Rocky 8 는 네이티브 빌더 지원 릴리스가 아닙니다", "", false},
+		{"native-running", strings.Replace(native, "nativebuilderactive=no", "nativebuilderactive=yes", 1) + "distro=rocky\nrelease=9.9\ncodename=\n", "-stop-running", "", false},
+		{"focal", "distro=ubuntu\nrelease=20.04\ncodename=focal\nkernel=5.4.0-200-generic\n", "지원하지 않는 Ubuntu 시리즈 Ubuntu 20.04 (focal)", "", false},
+		{"alpine", "distro=alpine\nrelease=3.20\ncodename=\nkernel=6.6.0-0-lts\n", "지원하지 않는 OS alpine 3.20", "", false},
 		{"noble", "distro=ubuntu\nrelease=24.04\ncodename=noble\nkernel=6.8.0-136-generic\n", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sshBin := filepath.Join(t.TempDir(), "ssh")
+			// 뒤에 오는 같은 키가 이깁니다 (tc.facts 의 agent=installed 등)
 			body := "#!/bin/bash\ncat >/dev/null\ncat <<'FACTS'\nhostname=build\nuid=0\narch=x86_64\nsudo=ok\ncontroller=200\nnameresolves=yes\nagent=none\nbuilderactive=no\nbuilderconfig=no\n" + tc.facts + "FACTS\n"
 			if err := os.WriteFile(sshBin, []byte(body), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			s := &Session{SSH: &SSH{SSHBin: sshBin}, Target: "10.0.0.175"}
+			s := &Session{SSH: &SSH{SSHBin: sshBin}, Target: "10.0.0.176"}
 			problems, _, err := s.Preflight(PreflightOptions{ForBuilder: true, Arch: "x86_64", ControllerURL: "https://ctl:8443", Series: []string{"jammy", "noble", "resolute"}})
 			if err != nil {
 				t.Fatal(err)
@@ -130,8 +140,8 @@ func TestPreflightBuilderNonUbuntuHosts(t *testing.T) {
 			if tc.ok != (len(problems) == 0) || tc.want != "" && !strings.Contains(all, tc.want) || tc.avoid != "" && strings.Contains(all, tc.avoid) {
 				t.Fatalf("problems:\n%s", all)
 			}
-			if (tc.name == "rocky10" || tc.name == "debian12") && !strings.Contains(all, "kpctl-native-builder.py") {
-				t.Fatalf("네이티브 빌더 안내가 없습니다:\n%s", all)
+			if strings.Count(all, "에이전트가 설치된") > 1 {
+				t.Fatalf("에이전트 문제가 중복됐습니다:\n%s", all)
 			}
 		})
 	}

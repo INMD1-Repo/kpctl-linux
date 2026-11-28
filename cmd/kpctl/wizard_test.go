@@ -227,16 +227,21 @@ func TestRunWizardWithoutCheckedHosts(t *testing.T) {
 	}
 }
 
-// 질문형 설치: Rocky 커널은 호스트 칸·커널 칸 어디에 넣어도 CLI 와 같이 네이티브 빌더 안내 후 중단합니다.
-func TestBuilderWizardRejectsDistributionKernels(t *testing.T) {
-	p, _ := scripted("10.0.0.175 6.12.0-264.21.1.el10_3.x86_64")
-	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "호스트 주소가 아닙니다") ||
-		!strings.Contains(err.Error(), "Rocky 10 배포판 커널") || !strings.Contains(err.Error(), "kpctl-native-builder.py") {
+// 질문형 설치: Rocky 10 커널은 호스트 칸에서는 거부하고 커널 칸에서는 받습니다.
+// 빌드할 수 없는 Debian 13 커널은 커널 칸에서 이유와 함께 중단합니다.
+func TestBuilderWizardDistributionKernels(t *testing.T) {
+	p, _ := scripted("10.0.0.176 6.12.0-264.21.1.el10_3.x86_64")
+	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "호스트 주소가 아닙니다") {
 		t.Fatalf("호스트 칸: %v", err)
 	}
-	p, out := scripted("build-noble", "", "", "6.12.0-264.21.1.el10_3.x86_64", "", "", "", "", "")
-	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "Rocky 10 배포판 커널입니다") || !strings.Contains(err.Error(), "kpctl-native-builder.py") {
-		t.Fatalf("커널 칸: %v\n%s", err, out)
+	p, out := scripted("build-rocky10", "", "", "6.12.0-264.21.1.el10_3.x86_64", "", "", "", "", "")
+	w, err := askBuilderPlan(p)
+	if err != nil || !reflect.DeepEqual(w.kernels, []string{"6.12.0-264.21.1.el10_3.x86_64"}) {
+		t.Fatalf("커널 칸: %v %v\n%s", w, err, out)
+	}
+	p, out = scripted("build-trixie", "", "", "6.12.118+deb13-amd64", "", "", "", "", "")
+	if _, err := askBuilderPlan(p); err == nil || !strings.Contains(err.Error(), "IBT") {
+		t.Fatalf("Debian 13: %v\n%s", err, out)
 	}
 	// 호스트 이름이 -amd64 로 끝나도 커널로 오인하지 않음
 	p, _ = scripted("10.0.0-build-amd64", "", "", "", "", "", "", "")
