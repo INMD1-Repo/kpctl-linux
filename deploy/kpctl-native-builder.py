@@ -2,6 +2,8 @@
 """Release-specific, unprivileged builder for Debian and Rocky Linux AMD64."""
 import argparse
 import base64
+from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 import difflib
 import filecmp
 from functools import cmp_to_key
@@ -18,7 +20,7 @@ import tempfile
 import threading
 import urllib.request
 
-from native_inputs import discover, DEBIAN, KEYS, ROCKY, SALSA, NoRedirect, public_module_cert, git, native_environment, prepare, require, run
+from native_inputs import digest, discover, DEBIAN, KEYS, ROCKY, SALSA, NoRedirect, public_module_cert, git, native_environment, prepare, require, run
 
 
 def require_build_target(plan):
@@ -235,7 +237,7 @@ class Controller:
     def request(self, path, payload=None):
         data = None if payload is None else json.dumps(payload).encode()
         req = urllib.request.Request(self.url + path, data=data, headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
-        with self.opener.open(req, timeout=180) as resp:
+        with self.opener.open(req, timeout=8 if path == "/api/builder/heartbeat" else 180) as resp:
             return json.load(resp) if resp.status != 204 else None
 
 
@@ -251,52 +253,153 @@ def assigned_patches(task):
     return result
 
 
-def heartbeat(client, claim, job, stop):
-    activity = dict(phase="build", job_id=job["id"], kernel=job["kernel"], job_started_at=job["started_at"])
-    while not stop.wait(30):
+class NativeMonitor:
+    limit = 256 * 1024  # model.BuilderLogLimit
+
+    def __init__(self, client, claim, jobs, work):
+        self.client, self.claim = client, claim
+        self.jobs, self.disk = jobs, work.parent
+        self.activity = {"kernel": claim["native_track"], "phase": "idle", "message": "다음 작업 조회 대기"}
+        self.compile_dir = None
+        self.log = ""
+        self.truncated = False
+        self.lock = threading.Lock()
+
+    def read_log(self):
+        if self.compile_dir is None:
+            return
+        # kpatch-build writes detailed compiler output under CACHEDIR on Debian 12 and Rocky 9.
+        tails = []
+        truncated = False
+        for name in ("build.log", "cache/build.log"):
+            try:
+                with (self.compile_dir / name).open("rb") as stream:
+                    end = stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, end - self.limit))
+                    chunk = stream.read(self.limit)
+            except OSError:
+                continue  # Files appear during compilation and disappear at cleanup.
+            if chunk:
+                tails.append(chunk)
+                truncated |= end > self.limit
+        if tails:
+            data = b"\n".join(tails).decode(errors="replace").encode()
+            self.log = data[-self.limit:].decode(errors="ignore")
+            self.truncated = truncated or len(data) > self.limit
+
+    def send(self):
+        with self.lock:
+            try:
+                self.read_log()
+                mem = {}
+                for line in Path("/proc/meminfo").read_text().splitlines():
+                    key, _, value = line.partition(":")
+                    if key in ("MemTotal", "MemAvailable"):
+                        mem[key] = int(value.split()[0]) * 1024
+                disk = shutil.disk_usage(self.disk)
+                activity = self.activity.copy()
+                activity["message"] = activity["message"].encode()[:4000].decode(errors="ignore")
+                log = self.log
+                truncated = self.truncated
+                if activity["phase"] == "failed":
+                    data = (log + "\n" + activity["message"]).encode()
+                    log = data[-self.limit:].decode(errors="ignore")
+                    truncated = truncated or len(data) > self.limit
+                self.client.request("/api/builder/heartbeat", dict(
+                    self.claim, activity=activity, environment="distribution", log=log,
+                    job_log=log if activity.get("job_id") else "", log_truncated=truncated,
+                    resources=dict(cpus=os.cpu_count() or 1, jobs=self.jobs, load1=os.getloadavg()[0],
+                                   memory_total=mem["MemTotal"], memory_available=mem["MemAvailable"],
+                                   disk_total=disk.total, disk_available=disk.free)))
+            except (OSError, ValueError, KeyError) as err:
+                print("builder heartbeat:", err, file=sys.stderr)
+
+    @contextmanager
+    def running(self, phase, message, job=None):
+        self.activity.update(phase=phase, message=message, started_at=datetime.now(timezone.utc).isoformat())
+        if job:
+            self.activity.update(job_id=job["id"], job_started_at=job["started_at"], version=job["version"])
+        self.send()
+        stop = threading.Event()
+        def repeat():
+            while not stop.wait(10):
+                self.send()
+        thread = threading.Thread(target=repeat, daemon=True)
+        thread.start()
         try:
-            client.request("/api/builder/heartbeat", {**claim, "activity": activity, "environment": "distribution"})
-        except (OSError, ValueError) as err:
-            print("builder heartbeat:", err, file=sys.stderr)
+            yield
+        except Exception as err:
+            self.activity = dict(kernel=self.claim["native_track"], phase="failed",
+                                 message=str(err).encode()[-4000:].decode(errors="ignore"))
+            raise
+        else:
+            self.activity = dict(kernel=self.claim["native_track"], phase="idle", message="다음 작업 조회 대기")
+        finally:
+            stop.set()
+            thread.join()
+            self.send()
+
+    @contextmanager
+    def compiler(self, work, message):
+        previous = self.activity
+        with self.lock:
+            self.activity = dict(previous, phase="building" if previous.get("job_id") else "trial", message=message)
+            self.compile_dir = work
+            self.log, self.truncated = "", False
+        self.send()
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.read_log()
+                self.compile_dir = None
+                self.activity = previous
 
 
-def work_once(client, plan, inputs, name, work, prepare_target=None, can_collect=False):
+def work_once(client, plan, inputs, name, work, prepare_target=None, can_collect=False, collect=None):
     require_build_target(plan)
     track = inputs["proof"]["track"]
     claim = {"builder": name, "series": plan["distro"] + plan["release"], "native_track": track, "kernels": [track]}
+    verifier = shutil.which("kpctl-builder")
+    if verifier:
+        try:
+            claim["binary_sha256"] = digest(Path(verifier))
+        except OSError as err:
+            print("module verifier fingerprint:", err, file=sys.stderr)
     if can_collect:
         claim["can_collect_reviewed"] = True
         claim["can_auto_discover"] = True
+    monitor = NativeMonitor(client, claim, plan.get("jobs", 2), work)
     task = client.request("/api/builder/next", claim)
     if not task:
+        monitor.send()
         return
-    if task.get("reviewed_candidates"):
-        require(can_collect and not task["job"].get("id"), "unexpected collection task")
-        return task["reviewed_candidates"]
-    if task.get("auto_discover"):
-        require(can_collect and not task.get("job", {}).get("id"), "unexpected auto-discover task")
-        return {"auto_discover": True}
+    if task.get("reviewed_candidates") or task.get("auto_discover"):
+        require(can_collect and not task.get("job", {}).get("id"), "unexpected collection task")
+        items = task.get("reviewed_candidates") or {"auto_discover": True}
+        if collect is None:
+            return items
+        with monitor.running("discovering", "배포판 릴리스와 후보 확인 중"):
+            collect(items, monitor)
+        return
     job = task["job"]
     result = {"builder": name, "job_started_at": job["started_at"]}
-    stop = threading.Event()
-    thread = threading.Thread(target=heartbeat, args=(client, claim, job, stop), daemon=True)
-    thread.start()
-    try:
-        require(job["kernel"] == track and job["version"] > 0 and not job.get("prerelease"), "wrong distro, package, build ID or channel")
-        if prepare_target:
-            expected = inputs["proof"]
-            inputs = prepare_target()
-            require(inputs["proof"] == expected, "prepared packages differ from the scheduled receipt")
-        module, file = compile_module(plan, inputs, job["version"], assigned_patches(task), work)
-        result.update(success=True, module_name=module, module_base64=base64.b64encode(file.read_bytes()).decode(), distribution_proof=inputs["proof"], log=json.dumps(inputs["proof"]))
-    except (OSError, ValueError, subprocess.SubprocessError) as err:
-        result.update(success=False, error=str(err), log=str(err))
-    finally:
-        stop.set()
-        thread.join()
-    reply = client.request(f"/api/builder/jobs/{job['id']}/result", result)
-    require(reply.get("result") == "ok", "controller no longer owns this build attempt")
-    require(result["success"], result.get("error", ""))
+    with monitor.running("building", "서명 패키지와 커널 빌드 입력 확인 중", job):
+        try:
+            require(job["kernel"] == track and job["version"] > 0 and not job.get("prerelease"), "wrong distro, package, build ID or channel")
+            if prepare_target:
+                expected = inputs["proof"]
+                inputs = prepare_target()
+                require(inputs["proof"] == expected, "prepared packages differ from the scheduled receipt")
+            with monitor.compiler(work, "누적 모듈 컴파일 및 검증 중"):
+                module, file = compile_module(plan, inputs, job["version"], assigned_patches(task), work)
+            result.update(success=True, module_name=module, module_base64=base64.b64encode(file.read_bytes()).decode(),
+                          distribution_proof=inputs["proof"], log=(monitor.log + "\n" + json.dumps(inputs["proof"])).strip())
+        except (OSError, ValueError, subprocess.SubprocessError) as err:
+            result.update(success=False, error=str(err), log=(monitor.log + "\n" + str(err)).strip())
+        reply = client.request(f"/api/builder/jobs/{job['id']}/result", result)
+        require(reply.get("result") == "ok", "controller no longer owns this build attempt")
+        require(result["success"], result.get("error", ""))
 
 
 def newer_version(distro, previous, fixed):
@@ -308,7 +411,7 @@ def newer_version(distro, previous, fixed):
 
 
 def process_release(action, plan, base, fixed, *, work, cache, fetch, paths, cves, title,
-                    prior=None, parent=None, client=None, reviewed=None):
+                    prior=None, parent=None, client=None, reviewed=None, monitor=None):
     distro = plan["distro"]
     preview = action in ("candidate", "changes", "fixed-proof")
     inputs = {"source": base[0]} if preview else base
@@ -378,7 +481,9 @@ def process_release(action, plan, base, fixed, *, work, cache, fetch, paths, cve
     if parent_id:
         require(parent_id in active_ids, "parent is no longer active")
     active = [p["content"].encode() for p in active_rows]
-    compile_module(plan, inputs, 1, active + [patch.encode()], work / "trial")
+    trial = work / "trial"
+    with monitor.compiler(trial, title) if monitor else nullcontext():
+        compile_module(plan, inputs, 1, active + [patch.encode()], trial)
     added = dict(parent_candidate=parent_id, fixed_release=fixed_receipt, commit=fixed["revision"], title=title, cves=cves, content=patch)
     request = {"expected_active": active_ids, "patches": [added]}
     if reviewed is not None:
@@ -396,7 +501,7 @@ def reviewed_plan(base, fixed):
     return dict(base, suite=suite, **{k: fixed[k] for k in ("version", "abi", "revision")})
 
 
-def collect_reviewed(client, plan, base_proof, items, cache, work):
+def collect_reviewed(client, plan, base_proof, items, cache, work, monitor=None):
     origin = SALSA if plan["distro"] == "debian" else ROCKY
     require(git(plan, "remote", "get-url", "origin") == origin, "wrong packaging Git origin")
     subprocess.run(["git", "-C", plan["git"], "fetch", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"],
@@ -416,7 +521,7 @@ def collect_reviewed(client, plan, base_proof, items, cache, work):
                 title = pin.get("title") or f"{fixed['version']} ({', '.join(pin['paths'])})"
                 process_release("collect", plan, base, fixed, work=scratch, cache=cache, fetch=True,
                                 paths=pin["paths"], cves=pin["cves"], title=title, prior=prior, parent=parent,
-                                client=client, reviewed=pin)
+                                client=client, reviewed=pin, monitor=monitor)
             break  # Give the resulting cumulative job priority on the next poll.
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
             print(f"{pin['candidate_id']}: {err}", file=sys.stderr)
@@ -505,7 +610,7 @@ def _discover_newer_releases(plan, cache, work):
     return sorted(found.values(), key=cmp_to_key(cmp_rel))
 
 
-def auto_discover_and_collect(client, plan, base_proof, cache, work, state_path=None):
+def auto_discover_and_collect(client, plan, base_proof, cache, work, state_path=None, monitor=None):
     """공식 서명 릴리스에서 새 커널 수정(.c)을 자동 탐색·시험 컴파일해 컨트롤러에 자동 핀 등록합니다."""
     origin = SALSA if plan["distro"] == "debian" else ROCKY
     require(git(plan, "remote", "get-url", "origin") == origin, "wrong packaging Git origin")
@@ -582,7 +687,9 @@ def auto_discover_and_collect(client, plan, base_proof, cache, work, state_path=
                 if candidate_id in known_commits or candidate_id in tried:
                     continue
                 try:
-                    compile_module(plan, base_inputs, 1, active_bytes + [patch.encode()], scratch / f"trial-{cidx}")
+                    trial = scratch / f"trial-{cidx}"
+                    with monitor.compiler(trial, f"{fixed['version']} {rel}") if monitor else nullcontext():
+                        compile_module(plan, base_inputs, 1, active_bytes + [patch.encode()], trial)
                 except (OSError, ValueError, subprocess.SubprocessError) as err:
                     print(f"[auto-discover] {fixed['version']} {rel} 시험 빌드 건너뜀: {err}", file=sys.stderr)
                     tried[candidate_id] = str(err)[:400]
@@ -663,13 +770,14 @@ def main():
                 receipt = json.loads(opts.proof.read_text())
                 require(receipt["revision"] == plan["revision"], "wrong polling receipt for plan")
                 client = Controller(config)
-                items = work_once(client, plan, {"proof": receipt}, config["builder"], work / "build", target_inputs,
-                                  can_collect=opts.fetch)
-                if isinstance(items, dict) and items.get("auto_discover"):
-                    auto_discover_and_collect(client, plan, receipt, opts.cache.resolve(), work,
-                                              state_path=opts.proof.parent / "auto-tried.json")
-                elif items:
-                    collect_reviewed(client, plan, receipt, items, opts.cache.resolve(), work)
+                def collect(items, monitor):
+                    if isinstance(items, dict) and items.get("auto_discover"):
+                        auto_discover_and_collect(client, plan, receipt, opts.cache.resolve(), work,
+                                                  state_path=opts.proof.parent / "auto-tried.json", monitor=monitor)
+                    else:
+                        collect_reviewed(client, plan, receipt, items, opts.cache.resolve(), work, monitor)
+                work_once(client, plan, {"proof": receipt}, config["builder"], work / "build", target_inputs,
+                          can_collect=opts.fetch, collect=collect)
             else:
                 work_once(Controller(config), plan, target_inputs(), config["builder"], work / "build")
             return

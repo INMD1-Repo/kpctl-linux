@@ -275,3 +275,22 @@ func TestLatestCumulativeUpdateSkipsAndPinsVersions(t *testing.T) {
 		t.Fatal("unapproved build was selected")
 	}
 }
+
+func TestNativeIdleHeartbeatPreservesCompilerLog(t *testing.T) {
+	s := newAutoServer(t, AutoRollout{})
+	req := model.BuilderHeartbeatRequest{
+		NextJobRequest: model.NextJobRequest{Builder: "rocky", Series: "rocky10"},
+		Activity:       model.BuilderActivity{Phase: "trial"}, Environment: "distribution",
+		Log: "compiler output", LogTruncated: true,
+	}
+	heartbeat(t, s, req, http.StatusNoContent)
+	req.Activity.Phase, req.Log, req.LogTruncated = "idle", "", false
+	heartbeat(t, s, req, http.StatusNoContent)
+	var detail model.BuilderDetail
+	if err := json.Unmarshal([]byte(callAPI(t, s, "GET", "/api/builders/rocky", "", http.StatusOK)), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Log != "compiler output" || !detail.Builder.LogTruncated || detail.Builder.Activity.Phase != "idle" {
+		t.Fatalf("idle status lost compiler output: %+v", detail)
+	}
+}

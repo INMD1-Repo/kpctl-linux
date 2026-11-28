@@ -34,6 +34,38 @@ class NativeFixtures(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
+    def test_idle_poll_and_bounded_native_job_heartbeat(self):
+        from unittest.mock import Mock
+        client = Mock()
+        client.request.return_value = None
+        plan = {"distro": "rocky", "release": "10", "jobs": 3}
+        target = {"proof": {"track": "native-track"}}
+        work = self.root / "build"
+        nb.work_once(client, plan, target, "rocky", work)
+        path, idle = client.request.call_args.args
+        self.assertEqual((path, idle["activity"]["phase"], idle["resources"]["jobs"]),
+                         ("/api/builder/heartbeat", "idle", 3))
+        self.assertGreater(idle["resources"]["disk_total"], 0)
+        work.mkdir()
+        monitor = nb.NativeMonitor(client, {"native_track": "native-track"}, 3, work)
+        job = {"id": 7, "started_at": "2026-11-28T00:00:00Z", "version": 3}
+        with monitor.running("building", "preparing", job), monitor.compiler(work, "compiling"):
+            (work / "build.log").write_bytes(b"x"*monitor.limit + b"\xff" + "컴파일".encode())
+            monitor.send()
+            report = client.request.call_args.args[1]
+            self.assertEqual(report["activity"]["job_started_at"], job["started_at"])
+            self.assertTrue(report["job_log"].endswith("컴파일"))
+            self.assertLessEqual(len(report["log"].encode()), monitor.limit)
+            self.assertEqual(report["job_log"], report["log"])
+            self.assertTrue(report["log_truncated"])
+            (work / "cache").mkdir()
+            (work / "cache/build.log").write_text("CC kernel/time/time.o")
+            monitor.send()
+            live = client.request.call_args.args[1]
+            self.assertEqual(live["activity"]["phase"], "building")
+            self.assertTrue(live["job_log"].endswith("CC kernel/time/time.o"))
+            self.assertLessEqual(len(live["job_log"].encode()), monitor.limit)
+
     def test_timer_collects_only_reproduced_review_then_builds_job(self):
         plan = dict(distro="debian", release="12", suite="bookworm", git="repo",
                     abi="6.1.0-50-amd64", version="6.1.176-1", revision="1"*40)
@@ -54,7 +86,7 @@ class NativeFixtures(unittest.TestCase):
             (self.root/name).write_text(json.dumps(payload))
         module = self.root/"fixture.ko"
         module.write_bytes(b"fixture")
-        compiled, submitted, results = [], [], []
+        compiled, submitted, results, reports = [], [], [], []
         def prepare(selected, work, cache, fetch, source_only=False):
             self.assertTrue(fetch)
             if source_only:
@@ -64,8 +96,15 @@ class NativeFixtures(unittest.TestCase):
         def compile_module(plan, inputs, version, patches, work):
             self.assertEqual(patches, [delta.encode()])
             compiled.append(work.name)
+            work.mkdir()
+            (work / "build.log").write_text("compiler fixture log")
+            (work / "cache").mkdir()
+            (work / "cache/build.log").write_text("CC kernel/time/time.o")
             return "fixture", module
         def request(path, payload=None):
+            if path.endswith("/heartbeat"):
+                reports.append(payload)
+                return
             if path.endswith("/next"):
                 self.assertTrue(payload["can_collect_reviewed"])
                 if not submitted:
@@ -101,6 +140,12 @@ class NativeFixtures(unittest.TestCase):
             build.side_effect = compile_module
             nb.main()
             nb.main()
+        phases = [r["activity"]["phase"] for r in reports]
+        for phase in ("discovering", "trial", "building", "failed", "idle"):
+            self.assertIn(phase, phases)
+        self.assertEqual(reports[-1]["log"], "compiler fixture log\nCC kernel/time/time.o")
+        self.assertIn("CC kernel/time/time.o", results[0]["log"])
+        self.assertEqual(reports[-1]["activity"]["phase"], "idle")
         self.assertEqual(compiled, ["trial", "build"])
         self.assertEqual(submitted[0]["reviewed_base"], base)
         self.assertEqual(submitted[0]["patches"][0]["title"], pin["title"])
@@ -145,6 +190,9 @@ class NativeFixtures(unittest.TestCase):
             return "auto", module
 
         def fake_request(path, payload=None):
+            if path.endswith("/heartbeat"):
+                self.assertEqual(payload["environment"], "distribution")
+                return
             if path.endswith("/next"):
                 self.assertTrue(payload["can_auto_discover"])
                 return {"job": {}, "auto_discover": True}
@@ -292,6 +340,10 @@ class NativeFixtures(unittest.TestCase):
                 result = {}
                 class FixtureAPI:
                     def request(self, path, payload):
+                        if path.endswith("/heartbeat"):
+                            self_test.assertEqual(payload["native_track"], target)
+                            self_test.assertEqual(payload["binary_sha256"], ni.digest(verify))
+                            return
                         if path.endswith("/next"):
                             self_test.assertEqual(payload["native_track"], target)
                             return {"job":dict(id=7, kernel=target, version=1, patch_ids=["p1"], started_at="now"),
@@ -300,7 +352,8 @@ class NativeFixtures(unittest.TestCase):
                         result.update(payload)
                         return {"result": "ok"}
                 self_test = self
-                with patch.object(nb, "tool_env", return_value={**os.environ, "PATH":str(bins)+":"+os.environ["PATH"]}):
+                with patch.dict(os.environ, PATH=str(bins)+":"+os.environ["PATH"]), \
+                        patch.object(nb, "tool_env", return_value=dict(os.environ)):
                     if r=="13":
                         with self.assertRaisesRegex(ValueError,"IBT"):
                             nb.work_once(FixtureAPI(),plan,data,"fixture",root/"build")

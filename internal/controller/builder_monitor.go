@@ -84,8 +84,13 @@ func (s *Server) handleBuilderHeartbeat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	err := s.store.Update(func(st *State) error {
-		if err := saveLiveLog(s.builderLogFile(req.Builder), req.Log); err != nil {
-			return err
+		// A native oneshot sends an empty idle heartbeat between timer runs.
+		// Keep the previous compiler output available until the next activity.
+		keepLog := req.Environment == "distribution" && req.Activity.Phase == "idle" && req.Log == ""
+		if !keepLog {
+			if err := saveLiveLog(s.builderLogFile(req.Builder), req.Log); err != nil {
+				return err
+			}
 		}
 		// An old attempt or another builder cannot renew a claim, nor overwrite
 		// the running attempt's log. Finished job logs use a separate file.
@@ -102,7 +107,10 @@ func (s *Server) handleBuilderHeartbeat(w http.ResponseWriter, r *http.Request) 
 			b.Maintenance = req.Maintenance
 		}
 		b.HeartbeatAt, b.Activity, b.Resources = time.Now(), &req.Activity, &req.Resources
-		b.Environment, b.LogTruncated = req.Environment, req.LogTruncated
+		b.Environment = req.Environment
+		if !keepLog {
+			b.LogTruncated = req.LogTruncated
+		}
 		if req.Cache != nil {
 			b.Cache = req.Cache
 		}

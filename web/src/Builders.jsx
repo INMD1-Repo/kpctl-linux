@@ -9,23 +9,28 @@ const PHASES = {
 };
 const gib = bytes => Number.isFinite(bytes) ? (bytes / 1073741824).toFixed(1) + ' GiB' : '-';
 
-function health(builder, now) {
+function health(builder, now, native) {
   if (builder.activity?.phase === 'stopped') return ['종료됨', 'warn'];
-  if (isSet(builder.heartbeat_at)) return new Date(now) - new Date(builder.heartbeat_at) > 30000
+  const timerWaiting = native && ['idle', 'failed'].includes(builder.activity?.phase);
+  if (isSet(builder.heartbeat_at)) return new Date(now) - new Date(builder.heartbeat_at) > (timerWaiting ? 120000 : 30000)
     ? ['상태 보고 지연', 'bad'] : ['연결됨', 'ok'];
   return new Date(now) - new Date(builder.last_seen) > 300000
-    ? ['최근 연결 없음', 'warn'] : ['실시간 보고 미지원', 'warn'];
+    ? ['최근 연결 없음', 'warn'] : native ? ['작업 조회 확인', 'ok'] : ['실시간 보고 미지원', 'warn'];
 }
 
 function BuilderStatus({ builder, now }) {
   const a = builder.activity;
   const r = builder.resources;
   const cache = builder.cache;
+  const native = builder.environment === 'distribution' || builder.kernels?.some(k => k.startsWith('native__'));
   return <>
     <div className="actions builder-state">
-      <Badge value={health(builder, now)} />
-      {a && <Badge value={PHASES[a.phase] || [a.phase, '']} />}
-      <Badge value={builder.up_to_date ? ['최신 빌더', 'ok'] : ['빌더 업데이트 대기', 'warn']} />
+      <Badge value={health(builder, now, native)} />
+      {a && <Badge value={native && a.phase === 'discovering' ? ['후보 수집', 'warn']
+        : native && a.phase === 'trial' ? ['후보 시험 빌드', 'warn'] : PHASES[a.phase] || [a.phase, '']} />}
+      {native
+        ? <Badge value={builder.sha256 && !builder.up_to_date ? ['모듈 검증 도구 갱신 필요', 'warn'] : ['설치 묶음으로 관리', '']} />
+        : <Badge value={builder.up_to_date ? ['최신 빌더', 'ok'] : ['빌더 업데이트 대기', 'warn']} />}
     </div>
     {a ? <div className="builder-activity">
       {a.kernel && <div className="mono wrap">{a.kernel}{a.job_id > 0 && ` · 작업 ${a.job_id} ${ver(a.version)}`}</div>}
@@ -34,7 +39,8 @@ function BuilderStatus({ builder, now }) {
       <div className={a.phase === 'failed' ? 'error wrap' : 'wrap'}>{a.message}</div>
       {a.step && <strong className="wrap">{a.step}</strong>}
       {isSet(a.started_at) && a.phase !== 'idle' && <div className="muted small-note">시작 {ago(a.started_at, now)}</div>}
-    </div> : <p className="hint">빌더가 업데이트되면 진행 단계와 실행 로그를 보고합니다.</p>}
+    </div> : <p className="hint">{native ? '네이티브 빌더의 첫 상태 보고 대기 중입니다. 작업 조회만 계속되면 최신 묶음으로 빌더를 다시 설치하세요.'
+      : '빌더가 업데이트되면 진행 단계와 실행 로그를 보고합니다.'}</p>}
     {r && <dl className="builder-metrics">
       <div><dt>CPU · 병렬 빌드</dt><dd>{r.cpus}개 · {r.jobs || '자동'}</dd></div>
       <div><dt>서버 부하 (1분)</dt><dd>{Number(r.load1).toFixed(2)}</dd></div>
@@ -49,7 +55,7 @@ function BuilderStatus({ builder, now }) {
       {cache.warning && <p role="status"><Badge value={['캐시 성능 확인', 'warn']} /> {cache.warning}</p>}
     </div>}
     <div className="muted small-note">
-      {builder.environment === 'isolated' ? '일회용 격리 환경' : builder.environment === 'host' ? '호스트 빌드 환경' : '환경 정보 대기'}
+      {native ? '배포판 네이티브 빌더' : builder.environment === 'isolated' ? '일회용 격리 환경' : builder.environment === 'host' ? '호스트 빌드 환경' : '환경 정보 대기'}
       {' · '}{builder.series || '시리즈 미지정'} · {builder.addr || '주소 대기'}
     </div>
     <div className="muted small-note">마지막 상태 보고 {ago(isSet(builder.heartbeat_at) ? builder.heartbeat_at : builder.last_seen, now)}</div>

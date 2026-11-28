@@ -30,6 +30,21 @@ async function ready() { await screen.findByRole('navigation', { name: '화면' 
 async function page(name) { fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name, exact: true })); }
 
 describe('React 관리자 화면', () => {
+  it.each([['debian', '12'], ['rocky', '10']])('%s %s 타이머의 정상 대기와 이전 빌더의 작업 조회를 구분한다', async (distro, release) => {
+    const native = builderFixture({ name: distro, series: distro + release, up_to_date: false,
+      kernels: [`native__${distro}__${release}__amd64__fixture`], environment: 'distribution',
+      heartbeat_at: new Date(Date.now() - 70000).toISOString(), activity: { phase: 'idle' } });
+    const old = { ...native, name: 'old', environment: '', activity: null, heartbeat_at: null };
+    const outdated = { ...native, name: 'outdated', sha256: 'a'.repeat(64) };
+    mount({ status: statusFixture({ builders: { [distro]: native, old, outdated } }) });
+    await ready(); await page('빌드 작업');
+    expect(screen.getAllByText('연결됨')).toHaveLength(2);
+    expect(screen.getByText('작업 조회 확인')).toBeTruthy();
+    expect(screen.getAllByText('설치 묶음으로 관리')).toHaveLength(2);
+    expect(screen.getByText('모듈 검증 도구 갱신 필요')).toBeTruthy();
+    expect(screen.queryByText('빌더 업데이트 대기')).toBeNull();
+    expect(screen.queryByText('실시간 보고 미지원')).toBeNull();
+  });
   it('수집 실패 유형을 표시하고 사유가 있어야 커밋별 관리자 제외를 전송한다', async () => {
     const kernel = '6.8.0-136-generic', commit = 'a'.repeat(40);
     const problem = { problem: 'objtool: unexpected klp reloc for new symbol', problem_kind: 'unsupported',
