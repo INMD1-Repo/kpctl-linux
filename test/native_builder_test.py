@@ -1,4 +1,5 @@
 """Offline fixtures for archive verification, Git pinning, native compilation and dispatch."""
+import base64
 import datetime
 import hashlib
 import io
@@ -393,6 +394,15 @@ kpatch() { return 0; }
         key.write_bytes(subprocess.check_output([*gpg,"--armor","--export"]))
         db = self.root / "rpmdb"
         ni.run("rpmkeys","--dbpath",db,"--import",key)
+        # 다른 키도 같은 rpmdb 에 들여옵니다: 그 키의 정상 서명은 고정 키 서명으로 인정하지 않아야 합니다
+        ni.run(*gpg,"--passphrase","","--quick-generate-key","other-signer <other@localhost>","rsa2048","sign","1d")
+        other = next(l.split(":")[9] for l in ni.run(*gpg,"--with-colons","--list-keys","other@localhost").splitlines() if l.startswith("fpr:"))
+        other_key = self.root / "other-key"
+        other_key.write_bytes(subprocess.check_output([*gpg,"--armor","--export",other]))
+        ni.run("rpmkeys","--dbpath",db,"--import",other_key)
+        keys = ni.openpgp_keys(key) + ni.openpgp_keys(other_key)
+        ni.run(*gpg,"--passphrase","","--quick-generate-key","stranger <stranger@localhost>","rsa2048","sign","1d")
+        stranger = next(l.split(":")[9] for l in ni.run(*gpg,"--with-colons","--list-keys","stranger@localhost").splitlines() if l.startswith("fpr:"))
         for major in ("9","10"):
             with self.subTest(major=major):
                 spec = self.root / "kernel.spec"
@@ -404,12 +414,113 @@ kpatch() { return 0; }
                 ni.run("rpmbuild","-bb","--define",f"_topdir {self.root}",spec)
                 rpm = next((self.root/"RPMS").rglob(f"kernel-core-1-1.el{major}.noarch.rpm"))
                 with self.assertRaises((ValueError,subprocess.CalledProcessError)):
-                    ni.verify_rpm(rpm,db)
+                    ni.verify_rpm(rpm,db,fpr,keys)
+                unsigned = rpm.read_bytes()
+                ni.run("rpmsign","--define",f"_gpg_path {home}","--define",f"_gpg_name {other}",
+                       "--define",f"_openpgp_sign_id {other}","--addsign",rpm)
+                ni.verify_rpm(rpm,db,other,keys)  # 그 키를 고정했다면 통과
+                with self.assertRaisesRegex(ValueError,"pinned release key"):
+                    ni.verify_rpm(rpm,db,fpr,keys)
+                rpm.write_bytes(unsigned)
+                # 들여오지 않은 키의 서명(NOKEY)이 함께 있어도 고정 키 서명이 유효하면 통과 (rpmkeys 는 1 로 끝남)
+                ni.run("rpmsign","--define",f"_gpg_path {home}","--define",f"_gpg_name {stranger}",
+                       "--define",f"_openpgp_sign_id {stranger}","--addsign",rpm)
+                with self.assertRaisesRegex(ValueError,"pinned release key|rpmkeys exited"):
+                    ni.verify_rpm(rpm,db,fpr,keys)
                 ni.run("rpmsign","--define",f"_gpg_path {home}","--define",f"_gpg_name {fpr}",
                        "--define",f"_openpgp_sign_id {fpr}","--addsign",rpm)
-                ni.verify_rpm(rpm,db)
+                ni.verify_rpm(rpm,db,fpr,keys)
                 blob = bytearray(rpm.read_bytes())
                 blob[-8] ^= 1
                 rpm.write_bytes(blob)
                 with self.assertRaises((ValueError,subprocess.CalledProcessError)):
-                    ni.verify_rpm(rpm,db)
+                    ni.verify_rpm(rpm,db,fpr,keys)
+
+    def test_rpm_signature_must_name_pinned_key(self):
+        # Rocky 10 의 rpm 4.19 출력(짧은 key ID)과 rpm 6 출력(전체 지문·16자리 key ID)
+        pin = "FC226859C0860BF0DDB95B085B106C736FEDFC85"
+        v6 = "AB" * 32
+        keys = [(4, pin, True), (6, v6, True)]
+        ok419 = "    V4 RSA/SHA256 Signature, key ID 6fedfc85: OK\n"
+        ok6 = "    Header OpenPGP V4 RSA/SHA512 signature, key fingerprint: " + pin.lower() + ": OK\n"
+        v6sig = "    Header OpenPGP V6 ML-DSA-65+Ed25519/SHA512 signature, key fingerprint: " + v6.lower() + ": OK\n"
+        payload = "    Payload SHA256 digest: OK\n"
+        def check(body, rc=0, key_list=keys):
+            out = subprocess.CompletedProcess([], rc, ("x.rpm:\n" + body).encode(), b"")
+            with patch.object(ni.subprocess, "run", return_value=out):
+                ni.verify_rpm(Path("x.rpm"), Path("db"), pin, key_list)
+        check("    Header V4 RSA/SHA256 Signature, key ID 6fedfc85: OK\n    Header SHA256 digest: OK\n" + payload + ok419)
+        check(ok6 + payload)
+        check(v6sig + ok6 + payload)  # Rocky 10.3 의 v4·v6 이중 서명, 두 키 모두 들여온 경우
+        check("    Header OpenPGP V6 signature, key ID abababababababab: NOKEY\n" + ok6 + payload, rc=1)
+        for body, rc, key_list, reason in [
+            (v6sig + payload, 0, keys, "pinned release key"),
+            (ok419, 0, keys, "payload"),
+            (ok6 + payload.replace("OK", "BAD"), 1, keys, "verification failed"),
+            (ok6.replace("OK", "BAD") + ok6 + payload, 1, keys, "verification failed"),
+            ("    Header OpenPGP V4 signature, key ID 5b106c736fedfc85: NOKEY\n" + payload, 1, keys, "pinned release key"),
+            (ok6 + payload, 1, keys, "rpmkeys exited"),
+            ("    Header OpenPGP V6 signature, key ID abababababababab: NOKEY\n" + ok6 + payload, -9, keys, "rpmkeys exited"),
+            # 여러 단어 결과(BAD (Expected …))도 실패로 봄
+            ("    Header OpenPGP V6 signature, key ID abababababababab: NOKEY\n" + ok6 + payload +
+             "    Payload SHA512 digest: BAD (Expected 1111 != 2222)\n", 1, keys, "verification failed"),
+            (ok6 + payload + "    Header SHA256 digest: NOKEY\n", 0, keys, "NOKEY on a digest"),
+            # 줄인 지문은 전체 지문으로 인정하지 않음
+            ("    Header OpenPGP V4 RSA/SHA512 signature, key fingerprint: 5b106c736fedfc85: OK\n" + payload, 0, keys, "pinned release key"),
+            # v6 key ID 는 지문 앞 64비트: 그 끝이 고정 키의 짧은 ID 와 겹치면 고정 키라고 단정하지 않음
+            (ok419 + payload, 0, keys + [(6, "00000000" + "6FEDFC85" + "0" * 48, True)], "pinned release key"),
+            (ok419 + payload, 0, keys + [(4, "0" * 32 + "6FEDFC85", True)], "pinned release key"),
+        ]:
+            with self.subTest(body=body, keys=len(key_list)), self.assertRaisesRegex(ValueError, reason):
+                check(body, rc, key_list)
+
+    @unittest.skipUnless(shutil.which("gpg"), "needs GnuPG")
+    def test_release_key_file_with_v6_key(self):
+        # Rocky 10.3 의 RPM-GPG-KEY-Rocky-10 처럼 v4 고정 키 옆에 RFC 9580 v6 키가 있는 파일
+        home = self.root / "gnupg6"
+        home.mkdir(mode=0o700)
+        gpg = ["gpg","--homedir",str(home),"--batch"]
+        ni.run(*gpg,"--passphrase","","--quick-generate-key","release <release@localhost>","rsa2048","sign","1d")
+        fpr = next(l.split(":")[9] for l in ni.run(*gpg,"--with-colons","--list-keys").splitlines() if l.startswith("fpr:"))
+        v4 = subprocess.check_output([*gpg,"--export"])
+        v6_body = bytes([6]) + (1767225600).to_bytes(4,"big") + bytes([27]) + (32).to_bytes(4,"big") + bytes(range(32))
+        v6_packet = bytes([0xC0 | 6, len(v6_body)]) + v6_body
+        def armor(data):
+            b64 = base64.b64encode(data).decode()
+            lines = "\n".join(b64[i:i+64] for i in range(0, len(b64), 64))
+            crc = base64.b64encode(hashlib.sha256(data).digest()[:3]).decode()  # 틀린 CRC 라도 거부하지 않음 (RFC 9580 §6.1)
+            return f"-----BEGIN PGP PUBLIC KEY BLOCK-----\nVersion: fixture\n\n{lines}\n={crc}\n-----END PGP PUBLIC KEY BLOCK-----\n"
+        expected_v6 = hashlib.sha256(b"\x9b" + len(v6_body).to_bytes(4,"big") + v6_body).hexdigest().upper()
+        for name, content in (("one-block", armor(v4 + v6_packet)), ("two-blocks", armor(v4) + armor(v6_packet)), ("binary", v4 + v6_packet)):
+            with self.subTest(name):
+                key = self.root / name
+                key.write_bytes(content if isinstance(content, bytes) else content.encode())
+                signer, keys = ni.pinned_signer(key, {fpr})
+                self.assertEqual(signer, fpr)
+                self.assertIn((6, expected_v6, True), keys)
+                with self.assertRaisesRegex(ValueError, "pinned release signing key"):
+                    ni.pinned_signer(key, {"0"*40})
+        # GnuPG 2.4 는 이 파일을 통째로 거부합니다 (설치 실패의 원인)
+        bad = subprocess.run([*gpg,"--with-colons","--show-keys",self.root/"one-block"], capture_output=True)
+        if bad.returncode == 0:
+            self.assertIn(fpr, bad.stdout.decode())
+        spaced = armor(v4).splitlines()
+        spaced[3] = " ".join(spaced[3][k:k+16] for k in range(0, len(spaced[3]), 16)) + "  "
+        (self.root / "spaced").write_text("\n".join(spaced) + "\n")
+        self.assertEqual(ni.pinned_signer(self.root / "spaced", {fpr})[0], fpr)
+        # base64 패딩 "==" 만 따로 한 줄에 있어도 CRC 줄로 오인하지 않음
+        b64 = base64.b64encode(v4).decode()
+        while not b64.endswith("=="):
+            v4 += b"\xb4\x00"  # 빈 user ID 패킷(무시됨)으로 길이를 맞춰 패딩 "==" 를 만듦
+            b64 = base64.b64encode(v4).decode()
+        (self.root / "padding").write_text("-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + b64[:-2] + "\n==\n=AAAA\n-----END PGP PUBLIC KEY BLOCK-----\n")
+        self.assertEqual(ni.pinned_signer(self.root / "padding", {fpr})[0], fpr)
+        # 바이너리 키의 user ID 에 armor 머리글 문자열이 있어도 바이너리로 읽음
+        uid = b"-----BEGIN PGP PUBLIC KEY BLOCK-----"
+        (self.root / "uid").write_bytes(v4 + bytes([0xC0 | 13, len(uid)]) + uid)
+        self.assertEqual(ni.pinned_signer(self.root / "uid", {fpr})[0], fpr)
+        for name, blob in (("header", v4 + b"\xc6"), ("length", v4 + b"\xc6\xff\x00"), ("body", v4 + b"\xc6\x05\x04")):
+            with self.subTest(truncated=name):
+                (self.root / name).write_bytes(blob)
+                with self.assertRaisesRegex(ValueError, "truncated"):
+                    ni.pinned_signer(self.root / name, {fpr})

@@ -1,4 +1,5 @@
 """Verify and unpack one official AMD64 distribution kernel in a private directory."""
+import base64
 import datetime
 import email.utils
 import hashlib
@@ -206,9 +207,139 @@ def extract_deb(plan, work, cache, fetch, source_only):
     return tree, proof, root, debug, headers / ".config", headers / "Module.symvers"
 
 
-def verify_rpm(path, db):
-    status = run("rpmkeys", "--dbpath", db, "--checksig", "--verbose", path)
-    require(re.search(r"(?im)^\s*.*signature.*: OK$", status) and re.search(r"(?im)^\s*Payload SHA256 digest: OK$", status), "missing RPM signature or SHA256 payload: " + str(path))
+ARMOR = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----[^\n]*\n(.*?)-----END PGP PUBLIC KEY BLOCK-----", re.S)
+
+
+def dearmor(text):
+    """Binary OpenPGP data of every ASCII-armored public key block (RFC 9580 §6.2).
+
+    The CRC24 footer is optional and must not cause rejection (RFC 9580 §6.1); key
+    fingerprints are pinned, so integrity does not depend on it.
+    """
+    blocks = []
+    for body in ARMOR.findall(text):
+        lines = [line.strip() for line in body.splitlines()]
+        if "" in lines and all(":" in line for line in lines[:lines.index("")]):
+            lines = lines[lines.index("") + 1:]
+        while lines and not lines[-1]:
+            lines.pop()
+        if lines and re.fullmatch(r"=[A-Za-z0-9+/]{4}", lines[-1]):
+            lines.pop()  # CRC24 footer; "==" padding on its own line stays data
+        data = re.sub(r"\s+", "", "".join(lines))
+        blocks.append(base64.b64decode(data, validate=True))
+    return blocks
+
+
+def openpgp_packets(data):
+    i = 0
+    def take(n):
+        require(i + n <= len(data), "truncated OpenPGP packet header")
+        return data[i:i + n]
+    while i < len(data):
+        head = data[i]
+        require(head & 0x80, "invalid OpenPGP packet header")
+        if head & 0x40:
+            tag = head & 0x3F
+            i += 1
+            first = take(1)[0]
+            if first < 192:
+                size, i = first, i + 1
+            elif first < 224:
+                size, i = ((first - 192) << 8) + take(2)[1] + 192, i + 2
+            else:
+                require(first == 255, "partial-length packet in a public key")
+                size, i = int.from_bytes(take(5)[1:], "big"), i + 5
+        else:
+            tag, kind = (head >> 2) & 0x0F, head & 3
+            require(kind != 3, "indeterminate-length packet in a public key")
+            width = (1, 2, 4)[kind]
+            i += 1
+            size, i = int.from_bytes(take(width), "big"), i + width
+        body = data[i:i + size]
+        require(len(body) == size, "truncated OpenPGP packet")
+        yield tag, body
+        i += size
+
+
+def key_fingerprint(body):
+    # v4: SHA-1 over 0x99 + 2-octet length; v5/v6: SHA-256 over 0x9A/0x9B + 4-octet length (RFC 9580 §5.5.4).
+    version = body[0]
+    if version == 4:
+        return 4, hashlib.sha1(b"\x99" + len(body).to_bytes(2, "big") + body).hexdigest().upper()
+    if version in (5, 6):
+        prefix = b"\x9a" if version == 5 else b"\x9b"
+        return version, hashlib.sha256(prefix + len(body).to_bytes(4, "big") + body).hexdigest().upper()
+    return version, ""
+
+
+def key_id(version, fingerprint):
+    # v4 key ID is the low 64 bits of the fingerprint, v5/v6 the high 64 bits (RFC 9580 §5.5.4).
+    return fingerprint[-16:] if version == 4 else fingerprint[:16]
+
+
+def openpgp_keys(path):
+    """(version, fingerprint, primary) of every key in an armored or binary key file.
+
+    GnuPG 2.4 rejects a whole file that contains an RFC 9580 v6 key, and Rocky 10.3
+    ships its v4 release key next to a v6 key. RPM itself accepts both.
+    """
+    raw = Path(path).read_bytes()
+    # Binary OpenPGP starts with a packet header (high bit set); anything else must be armor.
+    blocks = [raw] if raw[:1] and raw[0] & 0x80 else dearmor(raw.decode("ascii", "replace"))
+    keys = []
+    for block in blocks:
+        for tag, body in openpgp_packets(block):
+            if tag in (6, 14):
+                require(body, "empty OpenPGP key packet")
+                keys.append((*key_fingerprint(body), tag == 6))
+    require(keys, "no OpenPGP keys in " + str(path))
+    return keys
+
+
+def pinned_signer(path, pins):
+    keys = openpgp_keys(path)
+    return one((fpr for version, fpr, primary in keys if primary and version == 4 and fpr in pins), "pinned release signing key"), keys
+
+
+RPM_RESULT = re.compile(r"\s+(.+): (OK|NOKEY)")
+RPM_SIGNER = re.compile(r"(?i)signature,\s*key (id|fingerprint:?)\s*([0-9a-f]+)$")
+
+
+def verify_rpm(path, db, signer, keys=()):
+    """Valid RPM signature by the pinned v4 key and a valid SHA256 payload digest.
+
+    The keyring can hold more keys than the pin (Rocky 10.3 adds a v6 key), so an OK
+    signature from any imported key is not enough: one OK signature must name the
+    pinned key, by its exact fingerprint or by a key ID that no other keyring key
+    shares. Other signatures may only be OK or NOKEY (rpmkeys then exits 1 even
+    though the pinned signature verified); any other result rejects the package.
+    """
+    proc = subprocess.run(["rpmkeys", "--dbpath", str(db), "--checksig", "--verbose", str(path)],
+                          capture_output=True, env={**os.environ, "LC_ALL": "C"})
+    # Every indented result line must be exactly "<check>: OK" or "<check>: NOKEY";
+    # anything else (BAD, "BAD (Expected ...)", NOTTRUSTED, ...) rejects the package.
+    lines = [line for line in proc.stdout.decode().splitlines() if line[:1].isspace() and line.strip()]
+    matches = [(line, RPM_RESULT.fullmatch(line)) for line in lines]
+    failed = [line.strip() for line, m in matches if not m]
+    results = [(m[1], m[2]) for _, m in matches if m]
+    require(results and not failed, f"RPM verification failed: {path}: " + "; ".join(failed or [proc.stderr.decode().strip()]))
+    nokey = [what for what, result in results if result == "NOKEY"]
+    require(all(RPM_SIGNER.search(what) for what in nokey), f"RPM verification failed: {path}: NOKEY on a digest")
+    require(proc.returncode == 0 or proc.returncode == 1 and nokey,
+            f"rpmkeys exited {proc.returncode}: {path}: {proc.stderr.decode().strip()}")
+    require(("Payload SHA256 digest", "OK") in results, "missing RPM SHA256 payload digest: " + str(path))
+    known = list(keys) + [(4, signer, True)]
+    def names_signer(what):
+        m = RPM_SIGNER.search(what)
+        if not m:
+            return False
+        reported = m[2].upper()
+        if m[1].lower().startswith("fingerprint"):
+            return reported == signer
+        require(len(reported) in (8, 16), "unexpected RPM key ID: " + what)
+        return {fpr for version, fpr, _ in known if key_id(version, fpr).endswith(reported)} == {signer}
+    require(any(names_signer(what) for what, result in results if result == "OK"),
+            "no valid RPM signature by the pinned release key: " + str(path))
 
 
 def unpack_rpm(path, dest):
@@ -247,15 +378,14 @@ def extract_rocky(plan, work, cache, fetch, source_only):
     pin(plan, ROCKY, "r" + rel, f"patched/r{rel}/kernel-{ver}")
     archive = Archive(cache / ("rocky" + rel), f"https://dl.rockylinux.org/pub/rocky/{rel}", fetch)
     key = Path(plan["keyring"]).resolve()
-    signer = one((l.split(":")[9] for l in run("gpg", "--batch", "--with-colons", "--show-keys", key).splitlines() if l.startswith("fpr:")), "Rocky signing key")
-    require(signer in KEYS[rel], "wrong Rocky release signing key")
+    signer, keys = pinned_signer(key, KEYS[rel])
     db = work / "rpmdb"
     run("rpmkeys", "--dbpath", db, "--import", key)
     srpm_name = f"kernel-{ver}.src.rpm"
     def query(pkg):
         return run("rpm", "--dbpath", db, "-qp", "--qf", "%{NAME} %{EPOCHNUM} %{VERSION}-%{RELEASE} %{ARCH} %{SOURCERPM} %{SOURCEPACKAGE}", pkg).split()
     def verify_source(file):
-        verify_rpm(file, db)
+        verify_rpm(file, db, signer, keys)
         info = query(file)
         require(info[:3] == ["kernel", "0", ver] and info[-1] == "1", "wrong SRPM NEVR")
     src, _ = archive.authenticated("BaseOS/source/tree/Packages/k/" + srpm_name, verify_source)
@@ -276,7 +406,7 @@ def extract_rocky(plan, work, cache, fetch, source_only):
     require("kernel.spec" in expected and expected == {p.name for p in specdir.iterdir()}, "SRPM contains unidentified sources")
     def package(name, repo):
         def verify_binary(file):
-            verify_rpm(file, db)
+            verify_rpm(file, db, signer, keys)
             require(query(file)[:5] == [name, "0", ver, "x86_64", srpm_name], "wrong build: " + name)
         pkg, _ = archive.authenticated(f"{repo}/Packages/k/{name}-{abi}.rpm", verify_binary)
         return pkg

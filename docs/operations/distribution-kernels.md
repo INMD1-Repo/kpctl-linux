@@ -96,7 +96,7 @@ Rocky 9에서 실제 컴파일한 별도 사례의 base.json은 다음과 같다
 }
 ```
 
-Rocky 10의 위와 같은 BaseOS 계획에는 `release=10`, 기준 버전 `6.12.0-264.20.1.el10_3`, 기준 commit `109ca28ad1835f6f597dbfb8d547b750d2a3482d`, `RPM-GPG-KEY-Rocky-10`을 지정한다. ABI는 버전 뒤에 `.x86_64`를 붙인다. fixed 계획에는 표의 `.21.1` 버전·ABI·commit을 넣고 `--path mm/truncate.c`를 사용한다. in-tree klp-build는 기준 커널과 모듈 오브젝트 전체를 빌드하므로 build_dirs를 생략한다.
+Rocky 10의 위와 같은 BaseOS 계획에는 `release=10`, 기준 버전 `6.12.0-264.20.1.el10_3`, 기준 commit `109ca28ad1835f6f597dbfb8d547b750d2a3482d`, `RPM-GPG-KEY-Rocky-10`을 지정한다. ABI는 버전 뒤에 `.x86_64`를 붙인다. fixed 계획에는 표의 `.21.1` 버전·ABI·commit을 넣고 `--path mm/truncate.c`를 사용한다. in-tree klp-build는 기준 커널과 모듈 오브젝트 전체를 빌드하므로 build_dirs를 생략한다. Rocky 10.3의 `RPM-GPG-KEY-Rocky-10`에는 고정한 v4 키 옆에 RFC 9580 v6 키가 함께 있어 GnuPG 2.4가 파일 전체를 거부한다. 그래서 키 지문은 GnuPG 없이 OpenPGP 패킷에서 직접 계산하고, 모든 SRPM·RPM은 고정 v4 키(`FC226859C0860BF0DDB95B085B106C736FEDFC85`)의 유효한 서명이 있어야 통과한다. 함께 들어 있는 다른 키의 서명만으로는 통과하지 않는다.
 
 ## 후보 검토와 작업 실행
 
