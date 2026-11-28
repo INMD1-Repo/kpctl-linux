@@ -135,7 +135,15 @@ class NativeInstall(unittest.TestCase):
         self.assertTrue(all("Dir::Etc::sourceparts=-" in row for row in self.calls.read_text().splitlines()))
 
         self.release("rocky", "10")
-        self.fake("dnf", 'echo "$*" >> "$FIXTURE/calls"')
+        self.fake("dnf", """echo "$*" >> "$FIXTURE/calls"
+for arg do
+    case "$arg" in
+        download) touch "$FIXTURE/kernel-$KVER.src.rpm";;
+        *.spec) test "$(cat "$arg")" = 'BuildRequires: perl(ExtUtils::Embed)' || exit 1;;
+    esac
+done""")
+        self.fake("rpm2cpio", """test -f "$1" && echo 'BuildRequires: perl(ExtUtils::Embed)'""")
+        self.fake("cpio", 'cat > kernel.spec')
         self.fake("rpmkeys", 'echo "$*" >> "$FIXTURE/calls"')
         self.fake("rpm", 'case "$*" in *-Kv*) echo "$SIGNATURE";; *) echo "kernel-$KVER 1";; esac')
         self.env.update(SIGNATURE="Payload SHA256 digest: OK", KVER=R10.removesuffix(".x86_64"))
@@ -143,12 +151,56 @@ class NativeInstall(unittest.TestCase):
             self.calls.unlink()
             if signed:
                 self.env["SIGNATURE"] += "\nHeader RSA/SHA256 Signature: OK"
-            p = self.setup_command("--target", R10, body=script)
+            (self.root / f"kernel-{self.env['KVER']}.src.rpm").unlink(missing_ok=True)
+            p = self.setup_command("--target", R10, "--target", R10, body=script)
             self.assertEqual(p.returncode, 0 if signed else 1, p.stderr)
             calls = self.calls.read_text()
             self.assertIn("--enablerepo=baseos,appstream,crb,devel", calls)
             self.assertIn("download --source", calls)
-            self.assertEqual(" builddep " in calls, signed)
+            self.assertEqual(calls.count("download --source"), 1)
+            deps = [line for line in calls.splitlines() if " builddep " in line]
+            if signed:
+                self.assertEqual(len(deps), 2)
+                self.assertTrue(deps[0].endswith(f"kernel-{self.env['KVER']}.src.rpm"))
+                self.assertIn("--define dist .el10_3", deps[1])
+                self.assertTrue(deps[1].endswith("/kernel.spec"))
+            else:
+                self.assertEqual(deps, [])
+
+    def test_rocky_missing_tag_and_prepare_failure_are_distinct(self):
+        self.release("rocky", "10")
+        repo = self.root / "inputs/rocky-kernel"
+        repo.mkdir(parents=True)
+        def git(*args):
+            return subprocess.check_output(["git", "-C", repo, *args], text=True).strip()
+        git("init", "-q")
+        git("-c", "user.name=fixture", "-c", "user.email=fixture@example.org",
+            "-c", "commit.gpgSign=false", "commit", "--allow-empty", "-qm", "kernel")
+        version = R10.removesuffix(".x86_64")
+        tag = f"patched/r10/kernel-{version}"
+        script = ('parse_args "$@"\ncheck_host\nSTAGE=$(mktemp -d "$FIXTURE/plan.XXXXXX")\n'
+                  'as_builder() { "$@"; }\nplan_targets\nprepare_targets')
+        p = self.setup_command("--target", R10, body=script)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(f"공식 Git 태그를 찾지 못했습니다 ({tag})", p.stderr)
+
+        git("tag", tag)
+        (self.root / "kpctl-native-builder.py").write_text("""
+import json, sys
+from pathlib import Path
+assert sys.argv[1] == "prepare"
+plan = json.loads(Path(sys.argv[sys.argv.index("--plan") + 1]).read_text())
+Path(plan["git"]).joinpath("observed.json").write_text(json.dumps(plan))
+sys.exit("rpmbuild -bp: newt-devel is needed")
+""")
+        p = self.setup_command("--target", R10, body=script)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("rpmbuild -bp: newt-devel is needed", p.stderr)
+        self.assertNotIn("태그를 찾지 못했습니다", p.stderr)
+        plan = json.loads((repo / "observed.json").read_text())
+        self.assertEqual((plan["abi"], plan["version"], plan["revision"], plan["suite"]),
+                         (R10, version, git("rev-parse", "HEAD"), "BaseOS"))
+        self.assertFalse((self.root / "tracks").exists())
 
     def test_config_permissions_and_timer(self):
         # 소유권만 모의 처리하고 파일 생성·권한·교체는 실제 install/mv 로 확인합니다.
@@ -254,7 +306,7 @@ set -eu
 shift 5
 [[ $1 == --plan && $3 == --proof && $4 == "${2%/*}/base-proof.json" ]]
 [[ $5 == --cache && $6 == "$KPCTL_NATIVE_ROOT/cache" && $7 == --work-dir && $8 == "$KPCTL_NATIVE_ROOT/work" ]]
-[[ $9 == --controller && ${10} == "$KPCTL_NATIVE_WORKER" ]]
+[[ $9 == --controller && ${10} == "$KPCTL_NATIVE_WORKER" && ${11} == --fetch ]]
 echo "$2" >> "$KPCTL_NATIVE_ROOT/calls"
 [[ $2 != */first/base.json ]]
 """)

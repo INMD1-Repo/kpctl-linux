@@ -161,7 +161,7 @@ func nativeProofHint(targets []remote.NativeTarget) string {
 	hint.WriteString("\n  독립된 신뢰 환경에 같은 공식 Git 과 키를 준비하고, 빌더의 /var/lib/kpctl-native/tracks/<track>/base.json 과 같은 계획으로 다시 검증하세요.")
 	hint.WriteString("\n  mkdir -p cache work && python3 /opt/kpctl/native-builder/kpctl-native-builder.py prepare --plan base.json --cache cache --work-dir work --fetch > base-proof.json")
 	hint.WriteString("\n  영수증의 track 과 대상 kpctl-agent -identify 출력을 대조한 뒤 영수증을 컨트롤러 data_dir/distribution-proofs/<track>.json 에 설치하세요.")
-	hint.WriteString("\n  수정 후보는 사람이 변경 경로와 제목을 검토하고 빌더의 /opt/kpctl/native-builder/kpctl-native-builder.py collect 로 제출하세요 (docs/operations/distribution-kernels.md 의 ‘후보 검토와 작업 실행’).")
+	hint.WriteString("\n  검토한 수정의 fixed-proof와 candidate-proof를 같은 컨트롤러에 설치하면 빌더 타이머가 collect, 시험 컴파일과 누적 빌드를 자동 실행합니다 (docs/operations/distribution-kernels.md).")
 	return hint.String()
 }
 

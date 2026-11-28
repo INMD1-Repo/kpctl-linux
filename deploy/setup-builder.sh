@@ -329,6 +329,9 @@ PY
   )
 fi
 install -m 0755 -o root -g root "$HERE/kpctl-builder" /usr/local/bin/kpctl-builder
+if [ -x "$HERE/kpctl" ]; then
+  install -m 0755 -o root -g root "$HERE/kpctl" /usr/local/bin/kpctl
+fi
 install -d -m 0750 -o root -g "$BUILD_GROUP" /etc/kpctl
 source_for_config=""
 if [ "$HOST_MODE" = 0 ] && [ -n "$SOURCES" ]; then

@@ -56,6 +56,9 @@ var commands = map[string]command{
 
 	// 관리망 DHCP (dhcp.go)
 	"dhcp": {"dhcp leases | reserve | unreserve | restart        관리망 DHCP 임대 보기·IP 고정·재시작", cmdDHCP},
+
+	// Git 자동 업데이트 (update.go)
+	"update": {"update [-dev|now] [-check] [-install-hook]       릴리즈(-dev 개발판 / now 현재 브랜치)로 컨트롤러·빌더 업데이트", cmdUpdate},
 }
 
 func main() {
@@ -70,7 +73,7 @@ func main() {
 	}
 
 	var c *client.Client
-	local := os.Args[1] == "signing" && len(os.Args) > 2 && os.Args[2] == "init-key"
+	local := os.Args[1] == "update" || (os.Args[1] == "signing" && len(os.Args) > 2 && os.Args[2] == "init-key")
 	if !local {
 		c = adminClient()
 	}

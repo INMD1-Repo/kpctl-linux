@@ -34,6 +34,79 @@ class NativeFixtures(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
+    def test_timer_collects_only_reproduced_review_then_builds_job(self):
+        plan = dict(distro="debian", release="12", suite="bookworm", git="repo",
+                    abi="6.1.0-50-amd64", version="6.1.176-1", revision="1"*40)
+        track = "__".join(["native", "debian", "12", "amd64", plan["abi"], plan["version"], "a"*40])
+        base = dict(track=track, revision=plan["revision"])
+        fixed = dict(abi="6.1.0-57-amd64", version="6.1.192-3", revision="2"*40,
+                     signer=next(iter(ni.KEYS["bookworm-security"])), source_sha256="3"*64, package_sha256="4"*64)
+        rel = "fs/change.c"
+        old, new = self.root/"old", self.root/"new"
+        for tree, value in ((old, 1), (new, 2)):
+            (tree/"fs").mkdir(parents=True)
+            (tree/rel).write_text(f"int value = {value};\n")
+        delta = nb.candidate(old, new, [rel])
+        checksum = hashlib.sha256(delta.encode()).hexdigest()
+        pin = dict(base=base, fixed=fixed, paths=[rel], cves=[], parent_candidate="", sha256=checksum,
+                   candidate_id=fixed["revision"]+"/"+checksum, title="Reviewed change")
+        for name, payload in (("base", plan), ("proof", base), ("worker", {"builder": "native"})):
+            (self.root/name).write_text(json.dumps(payload))
+        module = self.root/"fixture.ko"
+        module.write_bytes(b"fixture")
+        compiled, submitted, results = [], [], []
+        def prepare(selected, work, cache, fetch, source_only=False):
+            self.assertTrue(fetch)
+            if source_only:
+                self.assertEqual(selected["suite"], "bookworm-security")
+                return new, {k: fixed[k] for k in ("revision", "signer", "source_sha256", "package_sha256")}
+            return dict(source=old, proof=base)
+        def compile_module(plan, inputs, version, patches, work):
+            self.assertEqual(patches, [delta.encode()])
+            compiled.append(work.name)
+            return "fixture", module
+        def request(path, payload=None):
+            if path.endswith("/next"):
+                self.assertTrue(payload["can_collect_reviewed"])
+                if not submitted:
+                    return {"job": {}, "reviewed_candidates": [{"pin": pin}]}
+                return {"job": dict(id=1, started_at="now", kernel=track, patch_ids=["p1"], version=1),
+                        "patches": [dict(id="p1", filename="p1.patch", content=delta, size=len(delta), sha256=checksum)]}
+            if path.endswith("/known"):
+                return {}
+            if path.endswith("/discovered"):
+                submitted.append(payload)
+                return {"added_patches": 1}
+            self.assertEqual(path, "/api/builder/jobs/1/result")
+            results.append(payload)
+            return {"result": "ok"}
+        args = ["driver", "work", "--plan", str(self.root/"base"), "--proof", str(self.root/"proof"),
+                "--controller", str(self.root/"worker"), "--cache", str(self.root), "--work-dir", str(self.root), "--fetch"]
+        fetch = self.root/"git"
+        fetch.write_text('#!/bin/sh\n[ "$GIT_ALLOW_PROTOCOL" = https ] && '
+                         '[ "$*" = "-C repo fetch --tags origin +refs/heads/*:refs/remotes/origin/*" ]\n')
+        fetch.chmod(0o755)
+        with patch.dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}"), \
+                patch.object(sys, "argv", args), patch.object(nb, "prepare", side_effect=prepare), \
+                patch.object(nb, "git", return_value=ni.SALSA), patch.object(nb, "Controller") as client, \
+                patch.object(nb, "compile_module", side_effect=compile_module) as build:
+            client.return_value.request.side_effect = request
+            with patch.dict(pin, sha256="0"*64), self.assertRaisesRegex(ValueError, "reviewed collection failed"):
+                nb.main()
+            self.assertEqual((compiled, submitted), ([], []))
+            build.side_effect = ValueError("trial failed")
+            with self.assertRaisesRegex(ValueError, "reviewed collection failed"):
+                nb.main()
+            self.assertEqual(submitted, [])
+            build.side_effect = compile_module
+            nb.main()
+            nb.main()
+        self.assertEqual(compiled, ["trial", "build"])
+        self.assertEqual(submitted[0]["reviewed_base"], base)
+        self.assertEqual(submitted[0]["patches"][0]["title"], pin["title"])
+        self.assertEqual(results[0]["distribution_proof"], base)
+        self.assertTrue(results[0]["success"])
+
     def test_git_packaging_trials_and_job_transport(self):
         for d, r, suite, abi, version in CASES:
             with self.subTest(d=d, r=r):

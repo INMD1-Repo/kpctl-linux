@@ -24,7 +24,7 @@ sys.argv.pop(0)
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name="__main__")
 ' "$DRIVER" work --plan "$dir/base.json" --proof "$dir/base-proof.json" \
-      --cache "$ROOT_DIR/cache" --work-dir "$ROOT_DIR/work" --controller "$WORKER"; then
+      --cache "$ROOT_DIR/cache" --work-dir "$ROOT_DIR/work" --controller "$WORKER" --fetch; then
     echo "!! ${dir##*/}: 네이티브 빌드 작업 실패" >&2
     status=1
   fi

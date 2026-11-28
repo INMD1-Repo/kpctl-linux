@@ -3,13 +3,13 @@
 #
 # 빌더 호스트는 대상과 같은 배포판·릴리스의 전용 VM 입니다. 이 스크립트는 그 VM 에
 #   배포판 공식 빌드 도구 → (Debian 12·Rocky 9) 고정 kpatch → 전용 계정·디렉터리 → 공식 패키징 Git
-#   → 대상 커널마다 discover 계획(base.json)·prepare 영수증(base-proof.json) → worker.json·토큰·CA
+#   → 대상 커널마다 릴리스 계획(base.json)·prepare 영수증(base-proof.json) → worker.json·토큰·CA
 #   → kpctl-native-builder.timer (kpctl-native-builder.py work 를 1분마다, flock 직렬화, systemd 샌드박스)
 # 를 준비합니다. 다시 실행해도 안전해야 합니다 (기존 계정·Git·캐시·설정 재사용).
 #
 # 하지 않는 것 (보안 경계, docs/operations/distribution-kernels.md):
 #   - 컨트롤러 승인 핀(distribution-proofs/<track>.json) 작성: 빌더와 독립된 환경에서 운영자가 합니다.
-#   - 수정 후보 수집(collect): 사람이 경로·제목·CVE 를 검토해 실행합니다.
+#   - 후보 경로와 CVE 선정: 독립 검토자가 승인 핀을 등록하면 타이머가 수집·시험 컴파일합니다.
 #
 # 설치 경로
 #   /opt/kpctl/native-builder/             kpctl-native-builder.py, native_inputs.py, kpctl-native-work.sh (root 0755)
@@ -20,7 +20,7 @@
 #   /var/lib/kpctl-native/                 <계정> 0700
 #     inputs/<debian-linux|rocky-kernel>   공식 패키징 Git (--no-checkout, 태그·원격 브랜치 포함, shallow 금지)
 #     cache/  work/                        서명 인덱스·패키지 캐시, 작업마다 새 하위 디렉터리
-#     tracks/<track>/base.json             대상 커널 계획 (discover 결과 중 abi·version 이 맞는 한 줄)
+#     tracks/<track>/base.json             대상 ABI·패키지 버전·Git 커밋을 고정한 계획
 #     tracks/<track>/base-proof.json       prepare --fetch 영수증 (track 에 실행 커널 build ID 포함)
 #   /etc/systemd/system/kpctl-native-builder.{service,timer}
 set -euo pipefail
@@ -198,7 +198,7 @@ APT
     "${apt[@]}" -y --no-install-recommends build-dep linux
     return
   fi
-  local repos=baseos,appstream,crb target version srpm signature
+  local repos=baseos,appstream,crb target version srpm signature specdir
   [[ $RELEASE != 10 ]] || repos+=,devel
   local dnf=(dnf -y '--disablerepo=*' "--enablerepo=$repos" --setopt=gpgcheck=1)
   "${dnf[@]}" install "${PACKAGES[@]}"
@@ -212,6 +212,13 @@ APT
     grep -Eiq 'signature.*: OK$' <<< "$signature" || fail "$version SRPM 의 Rocky 서명을 확인하지 못했습니다"
     [[ $(rpm --dbpath "$TEMP/rpmdb" -qp --qf '%{NAME}-%{VERSION}-%{RELEASE} %{SOURCEPACKAGE}' "$srpm") == "kernel-$version 1" ]] || fail "다른 버전의 SRPM 입니다: $version"
     "${dnf[@]}" builddep "$srpm"
+    # SRPM 헤더에는 배포판이 SRPM을 만들 때 활성화한 BuildRequires만 남습니다.
+    # 패키징 매크로 설치 후, 이 x86_64 빌더에서 %prep에 사용할 spec 조건도 풉니다.
+    specdir=$(mktemp -d "$TEMP/srpm.XXXXXX")
+    (cd "$specdir" && rpm2cpio "$srpm" | cpio --quiet -idm --no-absolute-filenames)
+    "${dnf[@]}" builddep --define "dist .${version##*.}" --define "_sourcedir $specdir" \
+      --define "_specdir $specdir" "$specdir/kernel.spec"
+    rm -rf "$specdir"
   done
 }
 
@@ -260,6 +267,9 @@ PYUSER
   install -d -m 0755 "$OPT_DIR" /usr/local/bin
   install -m 0755 "$HERE/kpctl-native-builder.py" "$HERE/native_inputs.py" "$HERE/kpctl-native-work.sh" "$OPT_DIR/"
   install -m 0755 "$HERE/kpctl-builder" /usr/local/bin/kpctl-builder
+  if [[ -x $HERE/kpctl ]]; then
+    install -m 0755 "$HERE/kpctl" /usr/local/bin/kpctl
+  fi
 }
 
 prepare_git() {
@@ -281,21 +291,32 @@ from pathlib import Path
 
 stage, root, tools = map(Path, sys.argv[1:4])
 distro, release, git, keyring, jobs, *targets = sys.argv[4:]
+def write_plan(index, plan):
+    dest = stage / str(index)
+    dest.mkdir()
+    (dest / "base.json").write_text(json.dumps(dict(plan, jobs=int(jobs)), indent=2) + "\n")
+
+if distro == "rocky":
+    # ABI에 NVR이 있으므로 요청한 태그만 해석합니다. prepare에서 태그·조상·서명과 %prep을 검사합니다.
+    for index, target in enumerate(targets):
+        abi = target.partition("=")[0]
+        version = abi.removesuffix(".x86_64")
+        tag = f"patched/r{release}/kernel-{version}"
+        rev = subprocess.run(["git", "-C", git, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+                             stdout=subprocess.PIPE, text=True)
+        if rev.returncode == 1:
+            sys.exit(f"!! {abi}: 공식 Git 태그를 찾지 못했습니다 ({tag})")
+        rev.check_returncode()
+        write_plan(index, dict(distro=distro, release=release, suite="BaseOS", git=git, keyring=keyring,
+                               abi=abi, version=version, revision=rev.stdout.strip()))
+    sys.exit(0)
+
 driver = [sys.executable, "-Es", str(tools / "kpctl-native-builder.py"), "discover",
           "--plan", str(stage / "suite.json"), "--cache", str(root / "cache"),
           "--work-dir", str(root / "work"), "--fetch"]
-if distro == "rocky":
-    prefix = f"patched/r{release}/kernel-"
-    tags = subprocess.check_output(["git", "-C", git, "tag", "--merged", f"refs/remotes/origin/r{release}",
-                                    "--sort=-version:refname", "-l", prefix + "*"], text=True).splitlines()
-    wanted = {prefix + t.partition("=")[0].removesuffix(".x86_64") for t in targets}
-    limit = max((i for i, tag in enumerate(tags, 1) if tag in wanted), default=0)
-    if not limit or limit > 100:
-        sys.exit("!! 공식 서명 릴리스·Git 태그를 찾지 못했습니다 (discover 가 검사하는 최근 100개 태그): " + ", ".join(sorted(wanted)))
-    driver.extend(["--limit", str(limit)])
 
 pending = dict(enumerate(targets))
-for suite in (["bookworm-security", "bookworm"] if distro == "debian" else ["BaseOS"]):
+for suite in ["bookworm-security", "bookworm"]:
     (stage / "suite.json").write_text(json.dumps(dict(distro=distro, release=release, suite=suite, git=git, keyring=keyring)))
     result = subprocess.run(driver, stdout=subprocess.PIPE, text=True)
     if result.returncode:
@@ -309,9 +330,7 @@ for suite in (["bookworm-security", "bookworm"] if distro == "debian" else ["Bas
             continue
         if len(matches) != 1:
             sys.exit(f"!! {abi}: 패키지 버전이 여럿입니다. 대상 호스트의 track 이 필요합니다")
-        dest = stage / str(index)
-        dest.mkdir()
-        (dest / "base.json").write_text(json.dumps(dict(matches[0], jobs=int(jobs)), indent=2) + "\n")
+        write_plan(index, matches[0])
         del pending[index]
     if not pending:
         break
@@ -332,12 +351,14 @@ ready = {}
 for index, target in enumerate(sys.argv[4:]):
     folder = stage / str(index)
     base, proof = folder / "base.json", folder / "base-proof.json"
-    with proof.open("w") as output:
-        subprocess.run([sys.executable, "-Es", str(tools / "kpctl-native-builder.py"), "prepare",
-                        "--plan", base, "--cache", root / "cache", "--work-dir", root / "work", "--fetch"],
-                       stdout=output, check=True)
-    track = json.loads(proof.read_text())["track"]
     abi, _, expected = target.partition("=")
+    with proof.open("w") as output:
+        result = subprocess.run([sys.executable, "-Es", str(tools / "kpctl-native-builder.py"), "prepare",
+                                 "--plan", base, "--cache", root / "cache", "--work-dir", root / "work", "--fetch"],
+                                stdout=output)
+        if result.returncode:
+            sys.exit(f"!! {abi}: 커널 준비 실패 (prepare 종료 코드 {result.returncode})")
+    track = json.loads(proof.read_text())["track"]
     plan = json.loads(base.read_text())
     prefix = "__".join(("native", plan["distro"], plan["release"], "amd64", abi, plan["version"].replace("~", "_t"), ""))
     if not re.fullmatch(re.escape(prefix) + "[0-9a-f]{40}", track) or "/" in track or len(track) > 200:

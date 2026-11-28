@@ -16,7 +16,7 @@
 | 승인용 고정·일회 VM 준비와 복구 | [VM 시험](test-vm.md#test-vm) |
 | 빌더 이전 | [빌더 이전](builder-migration.md#builder-migration) |
 | 격리 이미지·컴파일러·캐시 | [빌드 환경](build-environment.md#build-environment) |
-| 프로그램 갱신·복구 | [업그레이드](upgrade.md#upgrade) |
+| 프로그램 자동 업데이트·수동 갱신·복구 | [업그레이드](upgrade.md#upgrade) |
 | CVE 현황의 해석 | [CVE 점검](cve-coverage.md#cve-coverage) |
 | 관리자 화면 | [웹 운영](web.md#web) |
 

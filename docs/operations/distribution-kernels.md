@@ -54,12 +54,12 @@ sudo kpctl install-builder build-bookworm 6.1.0-57-amd64
 
 설치 직후 `kpctl-native-builder.timer`가 샌드박스 서비스에서 트랙별 작업을 조회한다. `-- --no-start`로 설치했다면 빌더에서 `sudo systemctl enable --now kpctl-native-builder.timer`로 시작한다. 재설치 전에는 진행 중인 작업을 확인하고 `-stop-running`을 사용한다. 이번에 지정하지 않은 기존 트랙은 계속 조회하므로 설치 경고를 확인한다.
 
-승인 핀은 운영자가 별도로 준비한다. 독립된 신뢰 환경에서 같은 계획과 정식 입력으로 `prepare`를 다시 실행하고 영수증의 track을 대상의 `kpctl-agent -identify` 결과와 대조한다. 독립 검증 영수증을 컨트롤러의 `data_dir/distribution-proofs/<track>.json`에 설치한다. [후보 검토와 작업 실행](#후보-검토와-작업-실행)에 따라 이후 릴리스의 승인 핀도 준비하고, 사람이 검토한 수정만 빌더에서 `collect`로 제출한다.
+승인 핀은 운영자가 별도로 준비한다. 독립된 신뢰 환경에서 같은 계획과 정식 입력으로 `prepare`를 다시 실행하고 영수증의 track을 대상의 `kpctl-agent -identify` 결과와 대조한다. 독립 검증 영수증을 컨트롤러의 `data_dir/distribution-proofs/<track>.json`에 설치한다. [후보 검토와 작업 실행](#후보-검토와-작업-실행)에 따라 이후 릴리스의 fixed-proof와 검토한 파일의 candidate-proof를 같은 컨트롤러에 등록한다.
 
 다음은 수동으로 같은 기준 입력을 준비할 때 사용하는 패키지와 Git 경로다.
 
 - Debian 빌드 이미지에는 배포판의 git, python3, dpkg-dev, gpgv, gcc, make, binutils, kmod, libelf-dev, libssl-dev, bc, bison, flex, cpio, xz-utils, zstd, dwarves 및 필요한 커널 build dependencies를 준비한다. 예시 GCC 버전은 bookworm `gcc-12 (Debian 12.2.0-14+deb12u1) 12.2.0`, trixie `x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0`이다.
-- Rocky 격리 이미지에서 공식 BaseOS/AppStream/CRB와 배포판 키를 사용해 rpm-build, rpmdevtools, cpio, git, gnupg2, gcc, make, elfutils-libelf-devel, kmod, 패키징 매크로와 정확한 SRPM의 BuildRequires를 준비한다. `dnf builddep /path/kernel-<NVR>.src.rpm`으로 의존성을 확인한다. Rocky 10 klp-build에는 patchutils(recountdiff), xxhash-libs와 xxhash-devel 0.8 이상이 필요했다. 두 xxhash 패키지는 Rocky 10 공식 devel 저장소의 서명된 0.8.2-11.el10이었다. 고정한 실제 GCC는 Rocky 9 11.5.0-17, Rocky 10 14.4.1-5였다.
+- Rocky 격리 이미지에서 공식 BaseOS/AppStream/CRB와 배포판 키를 사용해 rpm-build, rpmdevtools, cpio, git, gnupg2, gcc, make, elfutils-libelf-devel, kmod, 패키징 매크로와 정확한 SRPM의 BuildRequires를 준비한다. 설치 스크립트는 서명을 확인한 SRPM으로 기본 빌드 의존성을 설치한 뒤, 같은 SRPM에서 꺼낸 `kernel.spec`에 대상 버전의 `%dist`를 지정해 `dnf builddep`을 실행한다. 이 두 번째 단계에서 x86_64용 조건부 BuildRequires도 설치한다. Rocky 10 klp-build에는 patchutils(recountdiff), xxhash-libs와 xxhash-devel 0.8 이상이 필요했다. 두 xxhash 패키지는 Rocky 10 공식 devel 저장소의 서명된 0.8.2-11.el10이었다. 고정한 실제 GCC는 Rocky 9 11.5.0-17, Rocky 10 14.4.1-5였다.
 - `make dist`의 dist/builder/debian 또는 dist/builder/rocky에서 kpctl-builder를 PATH에 두고 두 Python 파일을 같은 디렉터리에 둔다. CONFIG_KLP_BUILD가 없는 경우에는 해당 환경에서 repo의 고정 kpatch `e0a8f7c681964e9128449446a34f7f3e631a8621`에 `bash kpctl-kpatch-fixes.sh /src/kpatch`를 실행하고 make로 빌드해서 kpatch-build와 helper를 설치한다. 정확한 컴파일러, 설정, 디버그/CRC, 참조 모듈 중 하나라도 없으면 작업 오류가 반환된다. Bookworm 전체 baseline 컴파일의 certs 단계는 패키징 전용 output/signing_key.pem을 요구했다. 빌더는 인증된 vmlinux의 __module_cert_start/end와 module_cert_size를 대조해 정확한 내장 공개 인증서만 복원한다. 실제 Bookworm 빌드에서 make certs/가 원래 모듈 서명 인증서 SHA256 `25afe670c0e5211989968deaf68c8ede93808d093ac146e5a102468dd942970d`를 재현했다. 기존 C 파일 변경을 모두 포함하는 디렉터리만 컴파일하는 `build_dirs`를 시험했다. 헤더·새 파일·삭제·rename 또는 다른 소스에서 include하는 C 파일이 있으면 전체 빌드가 필요하다. IBT를 거부한 trixie에서는 호환되는 빌드 도구를 검증할 때까지 공식 업데이트 커널로 전환한다. LIVEPATCH가 비활성인 정식 패키지는 설치 및 prepare 단계에서 차단된다.
 
 신뢰한 로컬 Git checkout에 다음 ref를 가져온다. shallow checkout에서는 ancestry 검사가 실패할 수 있다. 헤드의 후보를 먼저 읽고 배포한 버전 태그의 peeled commit을 계획에 적는다. 오프라인 작업에는 관련 태그, 커밋, blob까지 가져온 checkout을 사용한다.
@@ -100,7 +100,7 @@ Rocky 10의 위와 같은 BaseOS 계획에는 `release=10`, 기준 버전 `6.12.
 
 ## 후보 검토와 작업 실행
 
-`history`는 공식 Git 브랜치의 패키징 커밋, 제목 및 해당 태그를 나열한다. `changes`는 서명된 두 소스 트리의 C, 헤더, 어셈블리, Kconfig·Kbuild 차이를 열거한다. 커널 changelog, Debian quilt 또는 Rocky spec의 수정 내역을 확인하고 하나의 수정에 필요한 모든 파일을 선택한다. candidate는 선택한 C·헤더·어셈블리 파일의 추가·수정·삭제를 보존한다. Kbuild 및 Kconfig 변경은 별도 검토가 필요하다. 전체 tarball 업데이트에서 같은 파일에 섞인 수정과 다른 디렉터리의 의존성은 사람이 확인한다. 아래 명령은 Debian 12에서 검증한 시간 처리 코드 변경을 사용한다. `--cve`는 검토한 식별자마다 선택해서 준다. collect는 기존 활성 패치와 함께 시험 컴파일·검증한 뒤 해당 정식 트랙으로 보낸다. 같은 패키징 commit의 별도 후보는 diff SHA256으로 식별한다.
+`history`는 공식 Git 브랜치의 패키징 커밋, 제목 및 해당 태그를 나열한다. `changes`는 서명된 두 소스 트리의 C, 헤더, 어셈블리, Kconfig·Kbuild 차이를 열거한다. 커널 changelog, Debian quilt 또는 Rocky spec의 수정 내역을 확인하고 하나의 수정에 필요한 모든 파일을 선택한다. candidate는 선택한 C·헤더·어셈블리 파일의 추가·수정·삭제를 보존한다. Kbuild 및 Kconfig 변경은 별도 검토가 필요하다. 전체 tarball 업데이트에서 같은 파일에 섞인 수정과 다른 디렉터리의 의존성은 사람이 확인한다. 아래 명령은 Debian 12의 시간 처리 변경을 수동으로 재현하는 예다. 타이머를 쓰는 설치에서는 후보 영수증 등록 후 collect와 work를 자동 실행한다. `--cve`는 검토한 식별자마다 선택해서 준다. collect는 기존 활성 패치와 함께 시험 컴파일·검증한 뒤 해당 정식 트랙으로 보낸다. 같은 패키징 commit의 별도 후보는 diff SHA256으로 식별한다.
 
 ```sh
 umask 077
@@ -148,7 +148,7 @@ modified        fs/ext4/mballoc.c
 독립 검토 환경에서 base·fixed에 더해 선택한 파일 집합의 `candidate-proof`를 만든다. 기존 prepare와 fixed-proof도 함께 필요하다. 서명 출처, 대상 트랙, 수정 릴리스, 경로, diff SHA256, 후보 ID, 검토한 CVE 목록과 증분 선행 후보 ID를 확인한다. CLI 패치 목록과 웹의 패치 출처 열에서 후보 ID와 배포판 서명 키 지문을 대조한다.
 
 ```sh
-python3 "$driver" candidate-proof "${args[@]}" --fixed fixed.json --path fs/ext4/mballoc.c > candidate.json
+python3 "$driver" candidate-proof "${args[@]}" --fixed fixed.json --path fs/ext4/mballoc.c --title '검토한 ext4 변경' > candidate.json
 track=$(jq -r .base.track candidate.json)
 rev=$(jq -r .fixed.revision candidate.json)
 sha=$(jq -r .sha256 candidate.json)
@@ -159,6 +159,12 @@ install -m 0640 candidate.json "$DATA/distribution-proofs/$track/$rev/$sha.json"
 ```
 
 `$DATA`는 컨트롤러 데이터 디렉터리다. 승인 핀은 독립 검토자가 인증한 통로로 전달하며 builder 토큰으로 쓸 수 없다. 제출된 본문의 SHA256은 후보 ID에 들어간다. 컨트롤러는 작업을 배정할 때 보존한 파일을 재검사한다. 승인 직전과 서명·VM 검사 후 배포를 게시하기 직전에 각 파일의 SHA256과 경로, 계통, CVE, 선행 후보를 독립 핀과 대조한다. 키 교체로 이전 누적본을 새로 서명하는 경우에도 그 버전의 핀이 필요하다. 같은 릴리스의 서로 다른 diff는 개별 핀을 갖는다. 기존 릴리스 핀만 남은 과거 작업은 본문을 독립 검토하고 새 누적본을 승인해야 새 호스트가 받는다. 이미 로드된 보호는 유지된다.
+
+컨트롤러와 빌더를 이 기능이 포함된 버전으로 갱신하면 `kpctl-native-builder.timer`가 다음 순서로 실행한다.
+
+1. 대기 중인 누적 빌드를 먼저 처리한다. 큐가 비면 컨트롤러에서 이 트랙의 기준·수정 릴리스·후보 영수증이 모두 갖춰진 새 후보를 받는다. 증분 후보는 선행 후보가 해당 파일 집합에 활성화된 뒤에 받는다.
+2. 빌더가 공식 Git을 갱신하고 서명 패키지에서 변경을 다시 만든다. 기준 빌드 ID, 릴리스, 경로, CVE, 선행 후보와 diff SHA256을 검토 영수증에 대조한 후 기존 활성 패치와 함께 시험 컴파일한다. `candidate-proof --title`로 기록한 제목이 없으면 수정 패키지 버전과 경로를 표시한다.
+3. 시험에 성공하면 컨트롤러에 후보를 제출해 누적 빌드를 예약한다. 다음 작업 조회에서 누적 모듈을 빌드·검증하고 결과를 제출한다. 이미 수집한 후보는 건너뛴다. 실패 원인은 빌더의 `journalctl -u kpctl-native-builder.service`에서 확인한다. 서명·VM 시험·배포 승인은 기존 컨트롤러 절차를 따른다.
 
 컴파일된 커널 모듈이 검토한 소스와 diff에서 만들어졌다는 보증은 지정한 빌더의 격리와 무결성에 의존한다. 컨트롤러의 독립 핀과 CMS 검증은 바이너리를 재현 빌드하지 않는다. 운영에서는 빌더 토큰과 배포판별 빌드 환경을 그 신뢰 경계 안에서 관리한다.
 

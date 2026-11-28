@@ -2,7 +2,9 @@
 
 <a id="commands"></a>
 
-`KPCTL_URL`, `KPCTL_TOKEN`, 선택적인 `KPCTL_CA`를 사용합니다. 비어 있는 변수는 `/etc/kpctl/kpctl.env`에서 채우며 `KPCTL_ENV`로 파일을 바꿀 수 있습니다. 관리자는 개인별 토큰을 쓰면 감사 기록에 각 이름이 남습니다.
+`kpctl`은 `KPCTL_URL`, `KPCTL_TOKEN`, 선택적인 `KPCTL_CA`를 사용합니다. 비어 있는 변수는 `/etc/kpctl/kpctl.env`에서 채우며 `KPCTL_ENV`로 파일 경로를 바꿀 수 있습니다. 관리자는 개인별 토큰을 쓰면 감사 기록에 각 이름이 남습니다. (`kpctl update`와 `kpctl signing init-key`는 API 토큰 없이 로컬에서 동작합니다.)
+
+## 상태 조회
 
 <a id="inspect"></a>
 
@@ -15,6 +17,8 @@ kpctl patches -kernel 6.8.0-85-generic
 kpctl signing list
 kpctl auto
 ```
+
+## 패치 제출·빌드·승인·롤백
 
 <a id="patch-rollout"></a>
 
@@ -30,9 +34,11 @@ kpctl promote -kernel 6.8.0-85-generic -ring 2
 kpctl rollback -kernel 6.8.0-85-generic -version 2
 ```
 
-패치 활성 상태 변경만으로 기존 모듈은 바뀌지 않습니다. 새 누적 빌드·승인이 필요합니다. `promote -force`는 관찰·호스트 건강 문제를 무시하는 관리자 조작이므로 문제를 검토한 경우에만 사용합니다. 서명·아티팩트 자격 조건은 호스트별로 계속 적용됩니다. `rollback -version 0`은 모든 링의 kpctl 패치를 제거하도록 지시합니다.
+- 패치 활성 상태 변경만으로 기존 모듈은 바뀌지 않으며, 새 누적 빌드·승인이 필요합니다.
+- `promote -force`는 관찰·호스트 건강 문제를 무시하는 관리자 조작이므로 문제를 검토한 경우에만 사용합니다. 서명·아티팩트 자격 조건은 호스트별로 계속 적용됩니다.
+- `rollback -version 0`은 모든 링의 kpctl 패치를 제거하도록 지시합니다.
 
-출시 전 작업은 정식 버전과 별도의 음수 버전입니다. 승인에는 켜진 VM 시험과 명시적인 옵션이 필요합니다. 승급·출시 전 버전으로의 롤백에도 옵션을 붙입니다.
+출시 전 작업은 정식 버전과 별도의 음수 버전입니다. 승인에는 켜진 VM 시험과 명시적인 옵션이 필요하며, 승급·출시 전 버전 롤백에도 같은 옵션을 붙입니다.
 
 ```sh
 kpctl build -kernel 6.8.0-85-generic --prerelease
@@ -42,6 +48,8 @@ kpctl rollback -kernel 6.8.0-85-generic -version -1 --prerelease
 ```
 
 정식 버전으로 되돌릴 때는 일반 양수 버전 롤백을 사용합니다. 출시 전 배포 중에는 자동 승인·자동 승급과 호스트의 즉시 업데이트가 제한됩니다.
+
+## 호스트·재부팅·MOK 관리
 
 <a id="hosts"></a>
 
@@ -68,6 +76,8 @@ kpctl hosts mok-password node-01
 
 `host delete`는 컨트롤러 등록을 삭제하는 명령입니다. 원격 에이전트 제거는 `uninstall`을 사용합니다. MOK 예약과 재부팅 승인은 서로 별개입니다.
 
+## 자동화·원격 설치·SSH·DHCP
+
 <a id="automation-install"></a>
 
 ```sh
@@ -89,10 +99,27 @@ kpctl ssh-key list
 kpctl ssh-key show -cloud-init > kpctl-client.yaml
 ```
 
-기본 `uninstall`은 적용 중인 라이브패치를 보존합니다. `-remove-patches`를 붙이면 패치 제거도 요청합니다. `install`과 `install-builder`를 터미널에서 인자 없이 실행하면 필요한 값을 하나씩 묻는 질문형 설치가 됩니다. 인자를 주거나 스크립트·타이머에서 실행하면 질문하지 않습니다.
+- 기본 `uninstall`은 적용 중인 라이브패치를 보존하며, `-remove-patches`를 붙이면 패치 제거도 요청합니다.
+- `install`과 `install-builder`를 터미널에서 인자 없이 실행하면 필요한 값을 하나씩 묻는 질문형 설치가 됩니다. 인자를 주거나 스크립트·타이머에서 실행하면 질문하지 않습니다.
+- `install-builder`는 SSH로 빌드 서버의 OS를 확인합니다. Ubuntu에서는 같은 시리즈의 등록 GA 커널을 고르고 `setup-builder.sh`를 실행합니다. Debian 12·Rocky 9·10 AMD64 전용 VM에서는 `setup-native-builder.sh`가 같은 릴리스의 커널·빌드 ID를 대조하고 타이머를 설치합니다. 커널을 생략하면 식별된 등록 호스트에서 고르며, 네이티브 빌더에는 `--` 뒤에 `--jobs N`, `--no-start`를 줄 수 있습니다. [네이티브 빌더 설치 및 승인 절차](distribution-kernels.md#빌더-준비와-입력-고정)
+- SSH 접속 계정은 `-ssh-user`, 빌드 서비스 계정은 `-build-user`로 고릅니다. 실행 중인 빌더는 `-stop-running` 없이는 바꾸지 않습니다. `install -h`, `install-builder -h`, `autoenroll -h`, `bootstrap -h`로 상세 옵션을 확인하세요.
+- `bootstrap` 출력에는 등록 토큰이 있으므로 권한을 제한한 파일로 저장합니다. `ssh-key show -cloud-init`은 컨트롤러 공개키만 넣는 새 VM용 user-data를 출력하므로 템플릿에 둬도 됩니다.
 
-`install-builder`는 SSH로 빌드 서버의 OS를 확인합니다. Ubuntu에서는 같은 시리즈의 등록 GA 커널을 고르고 `setup-builder.sh`를 실행합니다. Debian 12·Rocky 9·10 AMD64 전용 VM에서는 `setup-native-builder.sh`가 같은 릴리스의 커널·빌드 ID를 대조하고 타이머를 설치합니다. 커널을 생략하면 식별된 등록 호스트에서 고릅니다. 네이티브 빌더에는 `--` 뒤에 `--jobs N`, `--no-start`를 줄 수 있습니다. 컨트롤러 승인 핀과 수정 후보 제출은 운영자가 맡습니다. [네이티브 빌더 설치 및 승인 절차](distribution-kernels.md#빌더-준비와-입력-고정)
+## 자동 업데이트 (`kpctl update`)
 
-SSH 접속 계정은 `-ssh-user`, 빌드 서비스 계정은 `-build-user`로 고릅니다. 실행 중인 빌더는 `-stop-running` 없이는 바꾸지 않습니다. `install -h`, `install-builder -h`, `autoenroll -h`, `bootstrap -h`로 SSH·토큰·묶음 관련 선택지를 확인합니다. `bootstrap` 출력에는 등록 토큰이 있으므로 권한을 제한한 파일로 저장합니다. `ssh-key show -cloud-init`은 컨트롤러 공개키만 넣는 새 VM용 user-data를 출력합니다. 토큰이 없어 템플릿에 둬도 되며, 설치는 자동 등록이 SSH로 합니다.
+<a id="update"></a>
 
-근거: [명령 등록](../../cmd/kpctl/main.go), [배포·호스트 명령](../../cmd/kpctl/commands.go), [서명 명령](../../cmd/kpctl/signing.go), [설치 명령](../../cmd/kpctl/install.go), [빌더 설치 명령](../../cmd/kpctl/install_builder.go), [질문형 설치](../../cmd/kpctl/wizard.go).
+컨트롤러나 빌더 서버에서 현재 설치된 역할(컨트롤러, Ubuntu 빌더, Debian·Rocky 네이티브 빌더)을 자동 감지해 바이너리·도우미·systemd 유닛을 갱신하고 서비스를 재시작합니다. 상세 동작과 보존 항목은 [업그레이드와 복구](upgrade.md#git-update)를 참고하세요.
+
+| 명령 | 동작 |
+| --- | --- |
+| `kpctl update -check` | 현재 설치 버전, 감지된 역할, 원격 새 커밋만 확인 (변경 없음) |
+| `sudo kpctl update` | 릴리즈 버전(`origin/main`) 기준으로 pull·빌드·재시작 |
+| `sudo kpctl update -dev` | 개발 버전(`origin/Dev`) 기준으로 pull·빌드·재시작 |
+| `sudo kpctl update now` | 현재 체크아웃된 자기 브랜치의 최신 커밋으로 업데이트 (`-now`와 동일) |
+| `kpctl update -install-hook` | 저장소에 `post-merge` 훅 설치 (이후 `git pull` 시 자동 업데이트) |
+| `kpctl update -uninstall-hook` | 설치한 `post-merge` 훅 제거 |
+
+자주 쓰는 추가 옵션: `-role auto|controller|builder|native-builder`, `-branch <이름>`, `-repo <경로>`, `-web`(관리자 웹 재빌드), `-force`(강제 재설치), `-no-restart`(재시작 생략), `-no-hook`(훅 자동 설치 생략).
+
+근거: [명령 등록](../../cmd/kpctl/main.go), [배포·호스트 명령](../../cmd/kpctl/commands.go), [서명 명령](../../cmd/kpctl/signing.go), [설치 명령](../../cmd/kpctl/install.go), [빌더 설치 명령](../../cmd/kpctl/install_builder.go), [질문형 설치](../../cmd/kpctl/wizard.go), [자동 업데이트 명령](../../cmd/kpctl/update.go).

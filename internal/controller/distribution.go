@@ -3,6 +3,7 @@ package controller
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,17 +14,108 @@ import (
 	"kpctl/internal/model"
 )
 
-type candidatePin struct {
-	CVEs        []string                `json:"cves,omitempty"`
-	Base        model.DistributionProof `json:"base"`
-	Fixed       model.FixedRelease      `json:"fixed"`
-	Paths       []string                `json:"paths"`
-	SHA256      string                  `json:"sha256"`
-	CandidateID string                  `json:"candidate_id"`
-	Parent      string                  `json:"parent_candidate,omitempty"`
+var candidatePath = regexp.MustCompile(`^[a-zA-Z0-9_./-]+\.[chS]$`)
+var reviewedID = regexp.MustCompile(`^[0-9a-f]{40}/[0-9a-f]{64}$`)
+
+func readProofFile(path string, dest any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, dest); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
 }
 
-var candidatePath = regexp.MustCompile(`^[a-zA-Z0-9_./-]+\.[chS]$`)
+// Only independent receipts installed by the controller operator can trigger collection.
+func (s *Server) reviewedCandidates(st *State, kernel model.DistributionKernel) ([]model.ReviewedCandidate, error) {
+	track := kernel.Track()
+	dir := filepath.Join(s.cfg.DataDir, "distribution-proofs", track)
+	var base model.DistributionProof
+	if err := readProofFile(dir+".json", &base); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !base.Valid(track) {
+		return nil, fmt.Errorf("invalid independent base receipt for %s", track)
+	}
+	known := map[string]bool{}
+	for _, id := range st.knownCommits(track) {
+		known[id] = true
+	}
+	latest := map[string]string{}
+	for _, p := range st.activePatches(track) {
+		paths := p.Paths
+		if len(paths) == 0 && p.CandidateID != "" {
+			body, err := os.ReadFile(s.patchFile(p.ID))
+			if err != nil {
+				return nil, err
+			}
+			paths, err = verifiedCandidatePaths(p, body)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, path := range paths {
+			latest[path] = p.CandidateID
+		}
+	}
+	files, err := filepath.Glob(filepath.Join(dir, "*", "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var pending []model.ReviewedCandidate
+	for _, path := range files {
+		rev := filepath.Base(filepath.Dir(path))
+		sum := strings.TrimSuffix(filepath.Base(path), ".json")
+		id := rev + "/" + sum
+		if !reviewedID.MatchString(id) || known[id] || known[rev] {
+			continue
+		}
+		var item model.ReviewedCandidate
+		pin := &item.Pin
+		if err := readProofFile(path, pin); err != nil {
+			return nil, err
+		}
+		if pin.CandidateID != id || pin.SHA256 != sum || pin.Base != base || !pin.Fixed.ValidFor(kernel, rev) || len(pin.Paths) == 0 {
+			return nil, fmt.Errorf("invalid independent candidate receipt: %s", path)
+		}
+		if pin.CVEs == nil {
+			pin.CVEs = []string{}
+		}
+		var fixed model.FixedRelease
+		if err := readProofFile(filepath.Join(dir, rev+".json"), &fixed); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		if fixed != pin.Fixed {
+			return nil, fmt.Errorf("independent fixed receipt differs: %s", rev)
+		}
+		if checkParent(latest, pin.Paths, pin.Parent) != nil {
+			continue
+		}
+		if pin.Parent != "" {
+			if !reviewedID.MatchString(pin.Parent) {
+				return nil, fmt.Errorf("invalid parent candidate: %s", path)
+			}
+			var previous model.DistributionCandidateProof
+			if err := readProofFile(filepath.Join(dir, pin.Parent+".json"), &previous); err != nil {
+				return nil, err
+			}
+			if previous.CandidateID != pin.Parent || previous.Base != base || !slices.Equal(previous.Paths, pin.Paths) {
+				return nil, fmt.Errorf("independent parent receipt differs: %s", path)
+			}
+			item.Previous = &previous
+		}
+		pending = append(pending, item)
+	}
+	return pending, nil
+}
 
 func candidatePaths(body []byte) ([]string, error) {
 	var paths []string
@@ -110,7 +202,7 @@ func (s *Server) checkDistributionProof(st *State, j *model.Job) error {
 			latest[path] = p.CandidateID
 		}
 		pinPath := filepath.Join(dir, j.Kernel, p.Commit, sum+".json")
-		var pin candidatePin
+		var pin model.DistributionCandidateProof
 		data, err := os.ReadFile(pinPath)
 		if err != nil {
 			return fmt.Errorf("independent candidate-proof required for %s: %w", id, err)

@@ -40,7 +40,7 @@ func installCandidateReceipt(t *testing.T, dir string, base model.DistributionPr
 		t.Fatal(err)
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(content))
-	pin := candidatePin{Base: base, Fixed: fixed, Paths: paths, SHA256: sum, CandidateID: fixed.Revision + "/" + sum, Parent: parent}
+	pin := model.DistributionCandidateProof{Base: base, Fixed: fixed, Paths: paths, SHA256: sum, CandidateID: fixed.Revision + "/" + sum, Parent: parent}
 	data, _ := json.Marshal(pin)
 	folder := filepath.Join(dir, base.Track, fixed.Revision)
 	if err := os.MkdirAll(folder, 0700); err != nil {
@@ -434,4 +434,68 @@ func TestIncrementalCandidateConcurrencyAndIndependentPaths(t *testing.T) {
 			t.Fatal("lost or duplicated released candidate")
 		}
 	})
+}
+
+func TestReviewedCandidatePolling(t *testing.T) {
+	s := newAutoServer(t, AutoRollout{})
+	k := model.DistributionKernel{Distro: "rocky", Release: "10", Arch: "amd64", ABI: "6.12.0-1.el10.x86_64", Version: "6.12.0-1.el10", BuildID: strings.Repeat("1", 40)}
+	track := k.Track()
+	base := model.DistributionProof{Track: track, Revision: strings.Repeat("2", 40), SourceSHA256: strings.Repeat("3", 64), PackageSHA256: strings.Repeat("4", 64), Signer: "FC226859C0860BF0DDB95B085B106C736FEDFC85"}
+	fixed := model.FixedRelease{ABI: "6.12.0-2.el10.x86_64", Version: "6.12.0-2.el10", Revision: strings.Repeat("a", 40), SourceSHA256: strings.Repeat("5", 64), PackageSHA256: strings.Repeat("6", 64), Signer: base.Signer}
+	delta := "diff --git a/fs/x.c b/fs/x.c\n--- a/fs/x.c\n+++ b/fs/x.c\n@@ -1 +1 @@\n-old\n+new\n"
+	id := fmt.Sprintf("%s/%x", fixed.Revision, sha256.Sum256([]byte(delta)))
+	dir := filepath.Join(s.cfg.DataDir, "distribution-proofs")
+	installCandidateReceipt(t, dir, base, fixed, []byte(delta), "")
+	poll := func(capable bool, status int) model.BuildTask {
+		t.Helper()
+		req := model.NextJobRequest{Builder: "native", NativeTrack: track, CanCollectReviewed: capable}
+		data, _ := json.Marshal(req)
+		result := callBuilderAPI(t, s, "POST", "/api/builder/next", string(data), status)
+		var task model.BuildTask
+		if status == 200 {
+			if err := json.Unmarshal([]byte(result), &task); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return task
+	}
+	poll(true, 204)
+	data, _ := json.Marshal(base)
+	if err := os.WriteFile(filepath.Join(dir, track+".json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	poll(true, 204)
+	installFixedReceipt(t, dir, track, &fixed)
+	child := fixed
+	child.Revision = strings.Repeat("b", 40)
+	child.Version, child.ABI = "6.12.0-3.el10", "6.12.0-3.el10.x86_64"
+	installFixedReceipt(t, dir, track, &child)
+	installCandidateReceipt(t, dir, base, child, []byte(strings.ReplaceAll(delta, "+new", "+newer")), id)
+	poll(false, 204)
+	task := poll(true, 200)
+	if len(task.ReviewedCandidates) != 1 || task.ReviewedCandidates[0].Pin.CandidateID != id {
+		t.Fatal(task)
+	}
+	post := func(status int) {
+		t.Helper()
+		req := model.DiscoveredRequest{ReviewedBase: &base, ExpectedActive: []string{}, Patches: []model.DiscoveredPatch{{Commit: fixed.Revision, FixedRelease: &fixed, Content: delta, Title: "test"}}}
+		data, _ := json.Marshal(req)
+		callBuilderAPI(t, s, "POST", "/api/builder/kernels/"+track+"/discovered", string(data), status)
+	}
+	if err := os.Remove(filepath.Join(dir, track, id+".json")); err != nil {
+		t.Fatal(err)
+	}
+	post(409)
+	installCandidateReceipt(t, dir, base, fixed, []byte(delta), "")
+	post(200)
+	post(200) // retry after a lost submission response
+	task = poll(true, 200)
+	if task.Job.ID != 1 || len(task.Patches) != 1 || len(task.ReviewedCandidates) != 0 {
+		t.Fatalf("expected queued cumulative build first: %+v", task)
+	}
+	task = poll(true, 200)
+	if len(task.ReviewedCandidates) != 1 || task.ReviewedCandidates[0].Pin.Fixed != child ||
+		task.ReviewedCandidates[0].Previous == nil || task.ReviewedCandidates[0].Previous.CandidateID != id {
+		t.Fatalf("expected incremental candidate with active parent: %+v", task)
+	}
 }

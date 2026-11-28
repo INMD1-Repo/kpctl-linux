@@ -17,7 +17,7 @@ import tempfile
 import threading
 import urllib.request
 
-from native_inputs import discover, DEBIAN, ROCKY, SALSA, NoRedirect, public_module_cert, git, native_environment, prepare, require, run
+from native_inputs import discover, DEBIAN, KEYS, ROCKY, SALSA, NoRedirect, public_module_cert, git, native_environment, prepare, require, run
 
 
 def require_build_target(plan):
@@ -259,13 +259,18 @@ def heartbeat(client, claim, job, stop):
             print("builder heartbeat:", err, file=sys.stderr)
 
 
-def work_once(client, plan, inputs, name, work, prepare_target=None):
+def work_once(client, plan, inputs, name, work, prepare_target=None, can_collect=False):
     require_build_target(plan)
     track = inputs["proof"]["track"]
     claim = {"builder": name, "series": plan["distro"] + plan["release"], "native_track": track, "kernels": [track]}
+    if can_collect:
+        claim["can_collect_reviewed"] = True
     task = client.request("/api/builder/next", claim)
     if not task:
         return
+    if task.get("reviewed_candidates"):
+        require(can_collect and not task["job"].get("id"), "unexpected collection task")
+        return task["reviewed_candidates"]
     job = task["job"]
     result = {"builder": name, "job_started_at": job["started_at"]}
     stop = threading.Event()
@@ -295,6 +300,123 @@ def newer_version(distro, previous, fixed):
         return subprocess.run(["dpkg", "--compare-versions", previous, "lt", fixed]).returncode == 0
     expression = '%{lua:print(rpm.vercmp("' + previous + '","' + fixed + '"))}'
     return run("rpm", "--eval", expression) == "-1"
+
+
+def process_release(action, plan, base, fixed, *, work, cache, fetch, paths, cves, title,
+                    prior=None, parent=None, client=None, reviewed=None):
+    distro = plan["distro"]
+    preview = action in ("candidate", "changes", "fixed-proof")
+    inputs = {"source": base[0]} if preview else base
+    require(all(fixed[k] == plan[k] for k in ("distro", "release", "git")) and fixed["revision"] != plan["revision"], "wrong fixed release")
+    git(plan, "merge-base", "--is-ancestor", plan["revision"], fixed["revision"])
+    tree, proof = prepare(fixed, work / "fixed", cache, fetch, source_only=True)
+    require(newer_version(distro, plan["version"], fixed["version"]), "fixed package must be newer than target")
+    fixed_receipt = {**proof, "abi": fixed["abi"], "version": fixed["version"]}
+    if action == "fixed-proof":
+        print(json.dumps(fixed_receipt, indent=2))
+        return
+    if action == "changes":
+        for state, path in changed_sources(inputs["source"], tree):
+            print(state, path, sep="\t")
+        return
+    parent_id = ""
+    start = inputs["source"]
+    require(bool(prior) == bool(parent), "incremental delta requires previous release and parent pin")
+    if prior:
+        require(all(prior[k] == plan[k] for k in ("distro", "release", "git"))
+                and prior["revision"] not in (plan["revision"], fixed["revision"]), "invalid predecessor")
+        git(plan, "merge-base", "--is-ancestor", plan["revision"], prior["revision"])
+        git(plan, "merge-base", "--is-ancestor", prior["revision"], fixed["revision"])
+        start, receipt = prepare(prior, work / "previous", cache, fetch, source_only=True)
+        prior_release = dict(receipt, abi=prior["abi"], version=prior["version"])
+        require(parent["fixed"] == prior_release and sorted(set(paths)) == parent["paths"],
+                "previous signed release or paths differ from parent pin")
+        if preview:
+            # Source-only review has authenticated every base field except the live image build ID.
+            expected_base = dict(base[1], track=parent["base"]["track"])
+        else:
+            expected_base = inputs["proof"]
+        require(parent["base"] == expected_base, "parent base mismatch")
+        require(newer_version(distro, plan["version"], prior["version"])
+                and newer_version(distro, prior["version"], fixed["version"]),
+                "previous package must be newer than base and older than fixed")
+        parent_id = parent["candidate_id"]
+        require(re.fullmatch(re.escape(prior["revision"]) + r"/[0-9a-f]{64}", parent_id)
+                and parent_id.endswith("/" + parent["sha256"]), "invalid parent candidate ID")
+    patch = candidate(start, tree, paths)
+    checksum = hashlib.sha256(patch.encode()).hexdigest()
+    candidate_id = fixed["revision"] + "/" + checksum
+    require(all(re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", c) for c in cves), "invalid reviewed CVE")
+    if action == "candidate-proof" or reviewed is not None:
+        receipt = dict(base=inputs["proof"], fixed=fixed_receipt, paths=sorted(set(paths)),
+                       cves=sorted(set(cves)), parent_candidate=parent_id, sha256=checksum, candidate_id=candidate_id)
+        if action == "candidate-proof":
+            if title:
+                receipt["title"] = title
+            print(json.dumps(receipt, indent=2))
+            return
+        require(all(receipt[k] == reviewed[k] for k in receipt), "reconstructed candidate differs from independent review")
+    if action == "candidate":
+        sys.stdout.write(patch)
+        return
+    require(title, "reviewed title required")
+    path = "/api/builder/kernels/" + inputs["proof"]["track"]
+    known = client.request(path + "/known")
+    active_rows=known.get("active_patches") or []
+    if candidate_id in (known.get("commits") or []) or fixed["revision"] in (known.get("commits") or []):
+        return
+    active_ids=[]
+    for row in active_rows:
+        expected=row["commit"]+"/"+hashlib.sha256(row["content"].encode()).hexdigest()
+        require(expected==row.get("candidate_id"), "active candidate hash mismatch or missing legacy receipt")
+        active_ids.append(expected)
+    if parent_id:
+        require(parent_id in active_ids, "parent is no longer active")
+    active = [p["content"].encode() for p in active_rows]
+    compile_module(plan, inputs, 1, active + [patch.encode()], work / "trial")
+    added = dict(parent_candidate=parent_id, fixed_release=fixed_receipt, commit=fixed["revision"], title=title, cves=cves, content=patch)
+    request = {"expected_active": active_ids, "patches": [added]}
+    if reviewed is not None:
+        request["reviewed_base"] = inputs["proof"]
+    print(json.dumps(client.request(path + "/discovered", request)))
+
+
+def reviewed_plan(base, fixed):
+    suite = "BaseOS"
+    if base["distro"] == "debian":
+        stable = DEBIAN[base["release"]][0]
+        suite = next((s for s in (stable, stable + "-security") if fixed["signer"] in KEYS[s]), None)
+        require(suite, "no matching Debian suite for the reviewed signer")
+    require(re.fullmatch(r"[0-9a-f]{40}", fixed["revision"]), "invalid fixed revision")
+    return dict(base, suite=suite, **{k: fixed[k] for k in ("version", "abi", "revision")})
+
+
+def collect_reviewed(client, plan, base_proof, items, cache, work):
+    origin = SALSA if plan["distro"] == "debian" else ROCKY
+    require(git(plan, "remote", "get-url", "origin") == origin, "wrong packaging Git origin")
+    subprocess.run(["git", "-C", plan["git"], "fetch", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                   env={**os.environ, "GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}, check=True)
+    failures = []
+    for item in items:
+        pin = item["pin"]
+        try:
+            require(pin["base"] == base_proof, "independent base receipt differs from installed track")
+            parent = item.get("previous")
+            require((parent["candidate_id"] if parent else "") == pin["parent_candidate"], "wrong reviewed predecessor")
+            fixed = reviewed_plan(plan, pin["fixed"])
+            prior = reviewed_plan(plan, parent["fixed"]) if parent else None
+            with tempfile.TemporaryDirectory(dir=work) as tmp:
+                scratch = Path(tmp)
+                base = prepare(plan, scratch / "base", cache, True)
+                title = pin.get("title") or f"{fixed['version']} ({', '.join(pin['paths'])})"
+                process_release("collect", plan, base, fixed, work=scratch, cache=cache, fetch=True,
+                                paths=pin["paths"], cves=pin["cves"], title=title, prior=prior, parent=parent,
+                                client=client, reviewed=pin)
+            break  # Give the resulting cumulative job priority on the next poll.
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
+            print(f"{pin['candidate_id']}: {err}", file=sys.stderr)
+            failures.append(pin["candidate_id"])
+    require(not failures, "reviewed collection failed: " + ", ".join(failures))
 
 
 def main():
@@ -352,84 +474,26 @@ def main():
             if opts.proof:
                 receipt = json.loads(opts.proof.read_text())
                 require(receipt["revision"] == plan["revision"], "wrong polling receipt for plan")
-                work_once(Controller(config), plan, {"proof": receipt}, config["builder"], work / "build", target_inputs)
+                client = Controller(config)
+                items = work_once(client, plan, {"proof": receipt}, config["builder"], work / "build", target_inputs,
+                                  can_collect=opts.fetch)
+                if items:
+                    collect_reviewed(client, plan, receipt, items, opts.cache.resolve(), work)
             else:
                 work_once(Controller(config), plan, target_inputs(), config["builder"], work / "build")
             return
         base = target_inputs()
-        inputs = {"source": base[0]} if preview else base
         if opts.action in ("inspect","prepare"):
-            print(json.dumps(inputs["proof"], indent=2))
+            print(json.dumps(base["proof"], indent=2))
             return
         require(opts.fixed and (opts.action in ("changes", "fixed-proof") or opts.path), "supply a later signed --fixed plan and every reviewed --path")
         fixed = json.loads(opts.fixed.read_text())
-        require(all(fixed[k] == plan[k] for k in ("distro", "release", "git")) and fixed["revision"] != plan["revision"], "wrong fixed release")
-        git(plan, "merge-base", "--is-ancestor", plan["revision"], fixed["revision"])
-        tree, proof = prepare(fixed, work / "fixed", opts.cache.resolve(), opts.fetch, source_only=True)
-        require(newer_version(distro, plan["version"], fixed["version"]), "fixed package must be newer than target")
-        fixed_receipt = {**proof, "abi": fixed["abi"], "version": fixed["version"]}
-        if opts.action == "fixed-proof":
-            print(json.dumps(fixed_receipt, indent=2))
-            return
-        if opts.action == "changes":
-            for state, path in changed_sources(inputs["source"], tree):
-                print(state, path, sep="\t")
-            return
-        parent_id = ""
-        start = inputs["source"]
-        require(bool(opts.previous) == bool(opts.parent_pin), "incremental delta requires --previous and --parent-pin")
-        if opts.previous:
-            prior = json.loads(opts.previous.read_text())
-            parent = json.loads(opts.parent_pin.read_text())
-            require(all(prior[k] == plan[k] for k in ("distro", "release", "git"))
-                    and prior["revision"] not in (plan["revision"], fixed["revision"]), "invalid predecessor")
-            git(plan, "merge-base", "--is-ancestor", plan["revision"], prior["revision"])
-            git(plan, "merge-base", "--is-ancestor", prior["revision"], fixed["revision"])
-            start, receipt = prepare(prior, work / "previous", opts.cache.resolve(), opts.fetch, source_only=True)
-            prior_release = dict(receipt, abi=prior["abi"], version=prior["version"])
-            require(parent["fixed"] == prior_release and sorted(set(opts.path)) == parent["paths"],
-                    "previous signed release or paths differ from parent pin")
-            if preview:
-                # Source-only review has authenticated every base field except the live image build ID.
-                expected_base = dict(base[1], track=parent["base"]["track"])
-            else:
-                expected_base = inputs["proof"]
-            require(parent["base"] == expected_base, "parent base mismatch")
-            require(newer_version(distro, plan["version"], prior["version"])
-                    and newer_version(distro, prior["version"], fixed["version"]),
-                    "previous package must be newer than base and older than fixed")
-            parent_id = parent["candidate_id"]
-            require(re.fullmatch(re.escape(prior["revision"]) + r"/[0-9a-f]{64}", parent_id)
-                    and parent_id.endswith("/" + parent["sha256"]), "invalid parent candidate ID")
-        patch = candidate(start, tree, opts.path)
-        checksum = hashlib.sha256(patch.encode()).hexdigest()
-        candidate_id = fixed["revision"] + "/" + checksum
-        require(all(re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", c) for c in opts.cve), "invalid reviewed CVE")
-        if opts.action == "candidate-proof":
-            print(json.dumps(dict(base=inputs["proof"],fixed=fixed_receipt,paths=sorted(set(opts.path)),
-                                  cves=sorted(set(opts.cve)),parent_candidate=parent_id,sha256=checksum,candidate_id=candidate_id),indent=2))
-            return
-        if opts.action == "candidate":
-            sys.stdout.write(patch)
-            return
-        require(opts.title, "reviewed title required")
-        client = Controller(json.loads(opts.controller.read_text()))
-        path = "/api/builder/kernels/" + inputs["proof"]["track"]
-        known = client.request(path + "/known")
-        active_rows=known.get("active_patches") or []
-        if candidate_id in (known.get("commits") or []) or fixed["revision"] in (known.get("commits") or []):
-            return
-        active_ids=[]
-        for row in active_rows:
-            expected=row["commit"]+"/"+hashlib.sha256(row["content"].encode()).hexdigest()
-            require(expected==row.get("candidate_id"), "active candidate hash mismatch or missing legacy receipt")
-            active_ids.append(expected)
-        if parent_id:
-            require(parent_id in active_ids, "parent is no longer active")
-        active = [p["content"].encode() for p in active_rows]
-        compile_module(plan, inputs, 1, active + [patch.encode()], work / "trial")
-        added = dict(parent_candidate=parent_id, fixed_release=fixed_receipt, commit=fixed["revision"], title=opts.title, cves=opts.cve, content=patch)
-        print(json.dumps(client.request(path + "/discovered", {"expected_active":active_ids, "patches": [added]})))
+        client = Controller(json.loads(opts.controller.read_text())) if opts.action == "collect" else None
+        prior = json.loads(opts.previous.read_text()) if opts.previous else None
+        parent = json.loads(opts.parent_pin.read_text()) if opts.parent_pin else None
+        process_release(opts.action, plan, base, fixed, work=work, cache=opts.cache.resolve(), fetch=opts.fetch,
+                        paths=opts.path, cves=opts.cve, title=opts.title, prior=prior, parent=parent, client=client)
+
 
 
 if __name__ == "__main__":

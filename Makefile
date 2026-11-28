@@ -3,7 +3,11 @@
 # make web      → React 관리자 화면 빌드 (Node.js/npm 필요)
 # make dist     → 웹 재빌드 후 배포용 묶음 (Node.js/npm 필요)
 
-GOFLAGS := -trimpath -ldflags="-s -w"
+GIT_COMMIT  ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+GIT_BRANCH  ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+VERSION_LDFLAGS := -X kpctl/internal/version.Version=$(GIT_VERSION) -X kpctl/internal/version.Commit=$(GIT_COMMIT) -X kpctl/internal/version.Branch=$(GIT_BRANCH)
+GOFLAGS := -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)"
 export CGO_ENABLED=0
 GO_TEST_FLAGS ?=
 
@@ -64,12 +68,12 @@ dist: web
 	# 맨 위 kpctl-builder 는 컨트롤러가 빌드 서버 자동 업데이트에 쓰는 사본입니다 (builder_binary 기본값).
 	mkdir -p dist/builder/ubuntu dist/builder/debian dist/builder/rocky
 	cp bin/kpctl-builder dist/builder/
-	cp bin/kpctl-builder deploy/setup-builder.sh deploy/kpctl-kernel-debug.sh deploy/systemd/kpctl-builder.service configs/builder.example.json \
+	cp bin/kpctl-builder bin/kpctl deploy/setup-builder.sh deploy/kpctl-kernel-debug.sh deploy/systemd/kpctl-builder.service configs/builder.example.json \
 	   deploy/kpctl-kernel-inputs.py deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py \
 	   deploy/setup-build-environment.sh deploy/kpctl-build-environment.py dist/builder/ubuntu/
 	cp -R deploy/kpatch-fixes deploy/build-environment dist/builder/ubuntu/
 	for d in debian rocky; do \
-	  cp bin/kpctl-builder deploy/setup-native-builder.sh deploy/kpctl-native-builder.py deploy/native_inputs.py deploy/kpctl-native-work.sh \
+	  cp bin/kpctl-builder bin/kpctl deploy/setup-native-builder.sh deploy/kpctl-native-builder.py deploy/native_inputs.py deploy/kpctl-native-work.sh \
 	     deploy/systemd/kpctl-native-builder.service deploy/systemd/kpctl-native-builder.timer \
 	     deploy/kpctl-kpatch-fixes.sh deploy/kpctl-kpatch-cold-test.py dist/builder/$$d/ && \
 	  cp -R deploy/kpatch-fixes dist/builder/$$d/ || exit 1; \

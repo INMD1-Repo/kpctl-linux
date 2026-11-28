@@ -359,9 +359,10 @@ type RebootClaim struct {
 // --- 빌드 서버 ---
 
 type NextJobRequest struct {
-	NativeTrack   string `json:"native_track,omitempty"`
-	CanPrerelease bool   `json:"can_prerelease,omitempty"` // 음수 버전·출시 전 모듈 이름을 처리하는 빌더만 수신
-	Builder       string `json:"builder"`
+	CanCollectReviewed bool   `json:"can_collect_reviewed,omitempty"`
+	NativeTrack        string `json:"native_track,omitempty"`
+	CanPrerelease      bool   `json:"can_prerelease,omitempty"` // 음수 버전·출시 전 모듈 이름을 처리하는 빌더만 수신
+	Builder            string `json:"builder"`
 	// Series: 빌드 서버의 Ubuntu 시리즈 (예: noble). 컨트롤러는 이 시리즈의 커널 작업만 줍니다.
 	// 비어 있으면 아무 작업이나 줍니다 (시리즈를 정하지 않은 예전 방식).
 	Series string `json:"series,omitempty"`
@@ -417,9 +418,10 @@ type BuildKernelInfo struct {
 }
 
 type BuildTask struct {
-	Job        Job              `json:"job"`
-	Patches    []TaskPatch      `json:"patches"` // 이 순서대로 적용
-	KernelInfo *BuildKernelInfo `json:"kernel_info,omitempty"`
+	ReviewedCandidates []ReviewedCandidate `json:"reviewed_candidates,omitempty"`
+	Job                Job                 `json:"job"`
+	Patches            []TaskPatch         `json:"patches"` // 이 순서대로 적용
+	KernelInfo         *BuildKernelInfo    `json:"kernel_info,omitempty"`
 	// Refresh: 빌드할 작업은 없지만 관리자가 "빌드"를 눌러 바로 수집을 요청한 커널 (Job.ID 는 0)
 	Refresh []string `json:"refresh,omitempty"`
 	// Purge: 관리자가 웹에서 빌드 서버 자료 삭제를 요청한 범위 밖 커널
@@ -581,10 +583,11 @@ type DiscoveredPatch struct {
 }
 
 type DiscoveredRequest struct {
-	ExpectedActive []string          `json:"expected_active"`
-	Prerelease     bool              `json:"prerelease,omitempty"`
-	Patches        []DiscoveredPatch `json:"patches"`
-	Unpatchable    []Unpatchable     `json:"unpatchable"`
+	ReviewedBase   *DistributionProof `json:"reviewed_base,omitempty"`
+	ExpectedActive []string           `json:"expected_active"`
+	Prerelease     bool               `json:"prerelease,omitempty"`
+	Patches        []DiscoveredPatch  `json:"patches"`
+	Unpatchable    []Unpatchable      `json:"unpatchable"`
 	// LatestTag: 이번에 이 태그까지의 CVE 수정을 수집함 (새 빌드 작업이 "어디까지 반영"했는지 기록)
 	LatestTag string `json:"latest_tag,omitempty"`
 }

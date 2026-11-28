@@ -57,6 +57,18 @@ func (s *Server) handleBuilderNext(w http.ResponseWriter, r *http.Request) {
 
 		j := nextQueuedJob(st, req)
 		if j == nil {
+			if req.CanCollectReviewed {
+				if k, ok := model.DistributionTrack(req.NativeTrack); ok {
+					candidates, err := s.reviewedCandidates(st, k)
+					if err != nil {
+						return err
+					}
+					if len(candidates) > 0 {
+						task = &model.BuildTask{ReviewedCandidates: candidates}
+						return nil
+					}
+				}
+			}
 			// 빌드할 작업이 없으면, 관리자가 바로 수집을 요청한 커널을 넘김
 			var refresh []string
 			for kernel, u := range st.Upstream {
@@ -519,6 +531,21 @@ func (s *Server) handleDiscovered(w http.ResponseWriter, r *http.Request) {
 				}
 				if err = checkParent(latest, paths, dp.ParentCandidate); err != nil {
 					return fail(409, "%v", err)
+				}
+				if req.ReviewedBase != nil {
+					k, _ := model.DistributionTrack(kernel)
+					pending, err := s.reviewedCandidates(st, k)
+					if err != nil {
+						return err
+					}
+					if !slices.ContainsFunc(pending, func(item model.ReviewedCandidate) bool {
+						p := item.Pin
+						return p.CandidateID == candidateID && p.Base == *req.ReviewedBase && p.Fixed == *dp.FixedRelease &&
+							p.Parent == dp.ParentCandidate && slices.Equal(p.Paths, paths) && slices.Equal(p.CVEs, dp.CVEs) &&
+							(p.Title == "" || p.Title == dp.Title)
+					}) {
+						return fail(409, "candidate review changed during trial: %s", candidateID)
+					}
 				}
 			}
 			id := "p" + leftPad(st.NextPatchID+1)

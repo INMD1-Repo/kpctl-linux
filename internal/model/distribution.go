@@ -252,3 +252,19 @@ func NativeBuilderRelease(distro, release string) (ok bool, reason string) {
 func NativeBuilderNeedsKpatch(distro, release string) bool {
 	return distro+release == "debian12" || distro+release == "rocky9"
 }
+
+type DistributionCandidateProof struct {
+	Title       string            `json:"title,omitempty"`
+	CVEs        []string          `json:"cves"`
+	Base        DistributionProof `json:"base"`
+	Fixed       FixedRelease      `json:"fixed"`
+	Paths       []string          `json:"paths"`
+	SHA256      string            `json:"sha256"`
+	CandidateID string            `json:"candidate_id"`
+	Parent      string            `json:"parent_candidate"`
+}
+
+type ReviewedCandidate struct {
+	Pin      DistributionCandidateProof  `json:"pin"`
+	Previous *DistributionCandidateProof `json:"previous,omitempty"`
+}
